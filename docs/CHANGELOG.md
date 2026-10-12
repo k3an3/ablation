@@ -2,6 +2,28 @@
 
 ---
 
+## v2.76.0
+
+**BinaryContext — native AArch64 PLT, call graph and string xrefs; ARM64FuncStartScanner.**
+
+On AArch64 ELF, `BinaryContext` fell through to its x86-64 paths: PLT stubs were decoded as
+`jmp [rip+disp]`, the call graph scanned for `0xe8`, and string xrefs used a RIP-displacement
+scan. On a stripped 108-import AArch64 `.so` this produced 0 PLT entries, 0 call edges (against
+40,580 `BL` instructions) and 11 coincidental string xrefs. Every downstream `callers_of()` /
+`funcs_referencing_string()` query on arm64 returned nothing.
+
+Native paths, same binary afterwards: 140 PLT entries, 43,949 call edges, 680 string xrefs.
+
+- PLT: `[bti c;] adrp x16 / ldr x17, [x16,#off]` stub decode (16- and 24-byte BTI/PAC layouts).
+- Call graph: numpy `BL` scan, plus `B` tail calls that leave the owning function.
+- String xrefs: `ADR`, `ADRP`+`ADD`, `ADRP`+`LDR` through RELATIVE/ABS64 pointer slots.
+- `ARM64FuncStartScanner` (new): function starts for arm64 ELF without `.eh_frame` from BL
+  targets, `paciasp`/`bti c`, and STP frame prologues; 92–98% precision, ~58% recall against
+  `.eh_frame`. Runs automatically when `.eh_frame` has no FDEs.
+- Cache: arm64 contexts cached before this release are rebuilt (`cache_version` 3).
+
+---
+
 ## v2.75.0
 
 **WorkflowDocument + StageCommitment — schema-validated RE session pipeline.**

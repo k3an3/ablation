@@ -76,6 +76,17 @@ def _va_arr_to_i64(vas) -> "np.ndarray":
     return np.array(list(vas), dtype=np.uint64).view(np.int64)
 
 
+def _a64_adr_imm(w: int) -> int:
+    """Signed 21-bit immhi:immlo field of an AArch64 ADR/ADRP word."""
+    imm = (((w >> 5) & 0x7FFFF) << 2) | ((w >> 29) & 0x3)
+    return imm - (1 << 21) if imm & (1 << 20) else imm
+
+
+def _a64_adrp_page(w: int, va: int) -> int:
+    """Page address an AArch64 ADRP at va computes."""
+    return ((va & ~0xFFF) + (_a64_adr_imm(w) << 12)) & 0xFFFFFFFFFFFFFFFF
+
+
 def _cache_path(binary_sha256: str, binary_name: str) -> Path:
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
     slug = f"{binary_sha256[:16]}_{Path(binary_name).name}"
@@ -286,7 +297,7 @@ class BinaryContext:
         return [(sva, s) for sva, s in self.strings.items() if lo <= sva <= hi]
 
     def string_xrefs(self, string_va: int) -> List[int]:
-        """Return code VAs (instruction-level) that RIP-relatively reference string_va.
+        """Return code VAs (instruction-level) that PC-relatively reference string_va.
 
         Uses the numpy displacement scan built during _build(). Empty if the index was
         not populated (old cache format): call build_xref_index(path) to populate.
@@ -294,7 +305,7 @@ class BinaryContext:
         return list(self._str_xref_idx.get(string_va, []))
 
     def funcs_referencing_string(self, string_va: int) -> List[int]:
-        """Return function start VAs that contain a RIP-relative reference to string_va."""
+        """Return function start VAs that contain a PC-relative reference to string_va."""
         code_vas = self._str_xref_idx.get(string_va, [])
         funcs: Set[int] = set()
         for cva in code_vas:
@@ -304,7 +315,7 @@ class BinaryContext:
         return sorted(funcs)
 
     def strings_in_func(self, func_va: int) -> List[Tuple[int, str]]:
-        """Return (string_va, content) for all strings RIP-relatively referenced by func_va."""
+        """Return (string_va, content) for all strings PC-relatively referenced by func_va."""
         svas = self._func_str_idx.get(func_va, [])
         return [(sva, self.strings[sva]) for sva in svas if sva in self.strings]
 
@@ -515,6 +526,10 @@ class BinaryContext:
                 pass
             return
 
+        if self.arch == 'arm64':
+            self._extract_plt_arm64(binary, got_to_sym)
+            return
+
         import capstone
         cs = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
         _ENDBR64 = bytes([0xf3, 0x0f, 0x1e, 0xfa])
@@ -543,6 +558,40 @@ class BinaryContext:
                     got_va = stub_va + start + 6 + disp
                     if got_va in got_to_sym:
                         self.plt[stub_va] = got_to_sym[got_va]
+
+    def _extract_plt_arm64(self, binary, got_to_sym: Dict[int, str]) -> None:
+        """AArch64 PLT: decode stubs by bit pattern, map stub VA -> GOT slot -> name.
+
+        Stub: [bti c;] adrp x16, page ; ldr x17, [x16, #off] ; add x16, x16, #off ;
+              [autia1716;] br x17   (16 bytes, or 24 with BTI/PAC padding)
+        GOT slot = ADRP page + LDR imm12 * 8. PLT[0] resolves to .got.plt+16, which
+        has no JUMP_SLOT relocation, so it drops out on the got_to_sym lookup.
+        """
+        for sec_name in (".plt", ".plt.sec", ".iplt"):
+            try:
+                sec = binary.get_section(sec_name)
+            except Exception:
+                sec = None
+            if not sec:
+                continue
+            sec_data = bytes(sec.content)
+            sec_va = int(sec.virtual_address)
+            n = len(sec_data) // 4
+            words = struct.unpack_from(f"<{n}I", sec_data, 0)
+            for i in range(n - 1):
+                w0, w1 = words[i], words[i + 1]
+                if (w0 & 0x9F00001F) != 0x90000010:      # ADRP x16
+                    continue
+                if (w1 & 0xFFC003FF) != 0xF9400211:      # LDR x17, [x16, #imm12*8]
+                    continue
+                stub_va = sec_va + i * 4
+                got_va = _a64_adrp_page(w0, stub_va) + ((w1 >> 10) & 0xFFF) * 8
+                name = got_to_sym.get(got_va)
+                if not name:
+                    continue
+                if i > 0 and words[i - 1] == 0xD503245F:  # BTI c landing pad
+                    stub_va -= 4
+                self.plt[stub_va] = name
 
     def _extract_plt_arm32(self, binary) -> None:
         # Parse .rel.plt (8-byte entries: r_offset:u32 + r_info:u32)
@@ -638,6 +687,7 @@ class BinaryContext:
     def _extract_func_starts(self, path: str, binary) -> None:
         starts: Set[int] = set()
         thumb: Set[int] = set()
+        fde_count = 0
         if path:
             try:
                 from elftools.elf.elffile import ELFFile
@@ -656,6 +706,7 @@ class BinaryContext:
                                         va &= ~1
                                         thumb.add(va)
                                     starts.add(va)
+                                    fde_count += 1
             except Exception:
                 pass
         # Augment from exports (already LSB-stripped)
@@ -721,6 +772,14 @@ class BinaryContext:
                     starts.add(va)
             except Exception:
                 pass
+        # ARM64: no .eh_frame (stripped, or -fno-asynchronous-unwind-tables) leaves
+        # only exports; recover the rest from BL targets + PACIASP/BTI/STP prologues.
+        if self.arch == 'arm64' and fde_count == 0:
+            try:
+                from ablation.analyzers.arm64_func_start_scanner import ARM64FuncStartScanner
+                starts.update(ARM64FuncStartScanner.from_lief(binary).scan())
+            except Exception:
+                pass
         self.func_starts = sorted(starts)
         self.thumb_funcs = thumb
 
@@ -729,11 +788,18 @@ class BinaryContext:
 
         x86_64: scan .text for 0xe8 (CALL rel32); target = site+5+disp32.
         arm32:  scan .text for BL words (byte[3]==0xEB); target = site+8+imm24*4.
+        arm64:  scan code for BL (and tail-call B) words; target = site+imm26*4.
         Falls back to sequential capstone if NumPy is unavailable.
         """
         if self.arch == 'arm32':
             if _NUMPY_OK:
                 self._build_call_graph_arm32(data, binary)
+            else:
+                self._build_call_graph_sequential(data, binary)
+            return
+        if self.arch == 'arm64':
+            if _NUMPY_OK:
+                self._build_call_graph_arm64(data, binary)
             else:
                 self._build_call_graph_sequential(data, binary)
             return
@@ -910,6 +976,65 @@ class BinaryContext:
 
         self.call_edges = edges
 
+    def _build_call_graph_arm64(self, data: bytes, binary) -> None:
+        """AArch64 call graph via numpy BL / B scan over executable sections.
+
+        BL imm26 : (w & 0xFC000000) == 0x94000000
+        B  imm26 : (w & 0xFC000000) == 0x14000000  (tail call: `b system@plt`)
+        Target   : insn_va + sign_extend(imm26) * 4  (no pipeline offset on A64)
+
+        BL edges keep any target that is a PLT stub or function start. B edges are
+        kept only when they leave the owning function, so in-function branches that
+        happen to hit a function start (loop back to entry) are not reported.
+        """
+        from ablation.analyzers.arm64_func_start_scanner import code_regions
+
+        plt_arr  = _va_arr_to_i64(sorted(self.plt.keys())) if self.plt         else np.empty(0, np.int64)
+        func_arr = _va_arr_to_i64(self.func_starts)         if self.func_starts else np.empty(0, np.int64)
+        va_to_export: Dict[int, str] = {va: nm for nm, va in self.exports.items()}
+        edges: List[Tuple[int, int, str]] = []
+
+        for sec_va, sec_data in code_regions(binary):
+            n = len(sec_data) // 4
+            if n == 0:
+                continue
+            words = np.frombuffer(sec_data[: n * 4], dtype='<u4')
+            op = words & np.uint32(0xFC000000)
+            is_bl = op == np.uint32(0x94000000)
+            is_b  = op == np.uint32(0x14000000)
+            idx = np.where(is_bl | is_b)[0]
+            if len(idx) == 0:
+                continue
+
+            imm = (words[idx] & np.uint32(0x3FFFFFF)).astype(np.int64)
+            imm -= (imm & np.int64(0x2000000)) << 1
+            site_vas   = _va_to_i64(sec_va) + idx.astype(np.int64) * 4
+            target_vas = site_vas + imm * 4
+            tail = is_b[idx]
+
+            in_plt  = np.zeros(len(target_vas), dtype=bool)
+            in_func = np.zeros(len(target_vas), dtype=bool)
+            if len(plt_arr):
+                hi = np.minimum(np.searchsorted(plt_arr, target_vas), len(plt_arr) - 1)
+                in_plt = plt_arr[hi] == target_vas
+            if len(func_arr):
+                hi = np.minimum(np.searchsorted(func_arr, target_vas), len(func_arr) - 1)
+                in_func = func_arr[hi] == target_vas
+
+            if len(func_arr):
+                owner_idx = np.maximum(np.searchsorted(func_arr, site_vas, side='right') - 1, 0)
+                owner_vas = func_arr[owner_idx]
+            else:
+                owner_vas = site_vas
+
+            valid = (in_plt | in_func) & (~tail | in_plt | (owner_vas != target_vas))
+            for owner_va, target_va in zip(owner_vas[valid].tolist(), target_vas[valid].tolist()):
+                target_va &= 0xFFFFFFFFFFFFFFFF
+                label = self.plt.get(target_va, "") or va_to_export.get(target_va, "")
+                edges.append((int(owner_va) & 0xFFFFFFFFFFFFFFFF, target_va, label))
+
+        self.call_edges = edges
+
     def _build_call_graph_sequential(self, data: bytes, binary) -> None:
         """Sequential capstone fallback for _build_call_graph (NumPy unavailable)."""
         import capstone
@@ -924,6 +1049,11 @@ class BinaryContext:
         if self.arch == 'arm32':
             cs = capstone.Cs(capstone.CS_ARCH_ARM, capstone.CS_MODE_ARM)
             call_mnems = {'bl', 'blx'}
+        elif self.arch == 'arm64':
+            a64 = getattr(capstone, 'CS_ARCH_AARCH64', None) or getattr(capstone, 'CS_ARCH_ARM64')
+            cs = capstone.Cs(a64, capstone.CS_MODE_ARM)
+            cs.skipdata = True
+            call_mnems = {'bl'}
         else:
             cs = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
             call_mnems = {'call'}
@@ -948,12 +1078,16 @@ class BinaryContext:
     def _build_string_xref_index(self, data: bytes, binary) -> None:
         """Build string xref index.
 
-        x86_64/arm64: vectorized RIP/PC-relative displacement scan.
+        x86_64: vectorized RIP-relative displacement scan.
         x86_32 (i386): vectorized absolute 4-byte LE immediate scan.
         arm32: capstone LDR [PC, #off] literal pool scan per function.
+        arm64: ADRP+ADD / ADRP+LDR pair resolution and ADR.
         """
         if self.arch == 'arm32':
             self._build_string_xref_index_arm32(data, binary)
+            return
+        if self.arch == 'arm64':
+            self._build_string_xref_index_arm64(data, binary)
             return
         if self.arch == 'x86_32':
             self._build_string_xref_index_x86_32()
@@ -1014,6 +1148,117 @@ class BinaryContext:
             func_str.setdefault(fva, []).append(sva)
 
         # Deduplicate per-func string lists
+        self._str_xref_idx = str_xref
+        self._func_str_idx = {k: list(dict.fromkeys(v)) for k, v in func_str.items()}
+
+    # ADRP base register stays live for at most this many following instructions.
+    _A64_ADRP_WINDOW = 16
+
+    def _build_string_xref_index_arm64(self, data: bytes, binary) -> None:
+        """AArch64 string xref via ADRP page + low-12 completion.
+
+        Forms resolved (site recorded = the instruction that completes the address):
+          adr  xD, str                                  -> str
+          adrp xB, page ; add  xD, xB, #lo12            -> page + lo12   (== str)
+          adrp xB, page ; ldr  xD, [xB, #lo12]          -> *(page + lo12) (== str)
+        The ADD/LDR may be scheduled away from the ADRP, and one ADRP may feed
+        several completions, so up to _A64_ADRP_WINDOW following words are scanned.
+        The scan for one ADRP stops once xB is overwritten (completion with xD == xB,
+        another ADR/ADRP to xB), at B/BR/RET, and at BL/BLR when xB is caller-saved.
+        """
+        from ablation.analyzers.arm64_func_start_scanner import code_regions
+
+        if not self.strings:
+            return
+        strings = self.strings
+        slot_cache: Dict[int, Optional[int]] = {}
+        rel_ptrs: Optional[Dict[int, int]] = None
+
+        def _slot_ptr(slot: int) -> Optional[int]:
+            nonlocal rel_ptrs
+            if slot in slot_cache:
+                return slot_cache[slot]
+            if rel_ptrs is None:
+                # PIE/.so: pointer slots are zero on disk and filled by RELATIVE/ABS64 relocs
+                rel_ptrs = {}
+                try:
+                    for rel in binary.relocations:
+                        rtype = str(getattr(rel, 'type', ''))
+                        if 'RELATIVE' in rtype:
+                            rel_ptrs[int(rel.address)] = int(rel.addend)
+                        elif ('ABS64' in rtype or 'GLOB_DAT' in rtype) and rel.has_symbol:
+                            sv = int(rel.symbol.value)
+                            if sv:
+                                rel_ptrs[int(rel.address)] = sv + int(rel.addend)
+                except Exception:
+                    pass
+            ptr = rel_ptrs.get(slot)
+            if ptr is None:
+                try:
+                    raw = bytes(binary.get_content_from_virtual_address(slot, 8))
+                    ptr = struct.unpack('<Q', raw)[0] if len(raw) == 8 else None
+                except Exception:
+                    ptr = None
+            slot_cache[slot] = ptr
+            return ptr
+
+        str_xref: Dict[int, List[int]] = {}
+        func_str: Dict[int, List[int]] = {}
+
+        def _record(sva: int, site: int) -> None:
+            fva = self.func_containing(site)
+            if fva is None:
+                return
+            str_xref.setdefault(sva, []).append(site)
+            func_str.setdefault(fva, []).append(sva)
+
+        window = self._A64_ADRP_WINDOW
+        for sec_va, sec_data in code_regions(binary):
+            n = len(sec_data) // 4
+            if n == 0:
+                continue
+            words = struct.unpack_from(f"<{n}I", sec_data, 0)
+            for i, w in enumerate(words):
+                op = w & 0x9F000000
+                if op == 0x10000000:                                  # ADR
+                    va = sec_va + i * 4
+                    t = (va + _a64_adr_imm(w)) & 0xFFFFFFFFFFFFFFFF
+                    if t in strings:
+                        _record(t, va)
+                    continue
+                if op != 0x90000000:                                  # ADRP
+                    continue
+                base = w & 0x1F
+                page = _a64_adrp_page(w, sec_va + i * 4)
+                for j in range(i + 1, min(i + 1 + window, n)):
+                    x = words[j]
+                    rd = x & 0x1F
+                    rn = (x >> 5) & 0x1F
+                    if (x & 0xFF800000) == 0x91000000 and rn == base:  # ADD Xd, Xb, #imm{,lsl 12}
+                        imm = ((x >> 10) & 0xFFF) << (12 if (x >> 22) & 1 else 0)
+                        t = page + imm
+                        if t in strings:
+                            _record(t, sec_va + j * 4)
+                        if rd == base:
+                            break
+                    elif (x & 0xFFC00000) == 0xF9400000 and rn == base:  # LDR Xt, [Xb, #imm*8]
+                        ptr = _slot_ptr(page + ((x >> 10) & 0xFFF) * 8)
+                        if ptr is not None and ptr in strings:
+                            _record(ptr, sec_va + j * 4)
+                        if rd == base:
+                            break
+                    elif (x & 0x1F000000) == 0x10000000 and rd == base:  # ADR/ADRP to Xb
+                        break
+                    elif ((x & 0xFC000000) == 0x14000000                  # B
+                          or (x & 0xFFFFFC1F) == 0xD61F0000               # BR
+                          or (x & 0xFFFFFC1F) == 0xD65F0000               # RET
+                          or (x & 0xFFFFFBFF) == 0xD65F0BFF):             # RETAA/RETAB
+                        break
+                    elif ((x & 0xFC000000) == 0x94000000                  # BL
+                          or (x & 0xFFFFFC1F) == 0xD63F0000):             # BLR
+                        if base <= 18:
+                            break
+
         self._str_xref_idx = str_xref
         self._func_str_idx = {k: list(dict.fromkeys(v)) for k, v in func_str.items()}
 
@@ -1975,7 +2220,7 @@ class BinaryContext:
 
     def _save_json(self, path: Path) -> None:
         payload = {
-            "cache_version": 2,
+            "cache_version": 3,
             "path": self.path,
             "sha256": self.sha256,
             "base_va": self.base_va,
@@ -1996,6 +2241,8 @@ class BinaryContext:
         payload = json.loads(path.read_text())
         if payload.get("cache_version", 1) < 2:
             raise ValueError("stale cache: cache_version < 2 (pre-multi-r2); rebuild required")
+        if payload.get("arch") == "arm64" and payload["cache_version"] < 3:
+            raise ValueError("stale cache: arm64 built before native AArch64 PLT/BL/ADRP paths")
         ctx = cls()
         ctx.path = orig_path or payload.get("path", "")
         ctx.sha256 = payload["sha256"]

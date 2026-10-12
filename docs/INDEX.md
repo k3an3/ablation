@@ -61,7 +61,7 @@ Audit any large codebase for security vulnerabilities, faster than reading it li
 
 | Document | Covers |
 |---|---|
-| [Core Analyzers](module-reference/core.md) | BinaryContext, XRefGraph, CFGBuilder, TaintTracker, ARM64TaintTracker, PathSolver, CrossBinaryTaintTracker; StaticELF32FuncStartScanner (x86_32 stripped static func_starts); I386AbsoluteXrefScanner (x86_32 absolute-address string xref: 26× improvement over RIP-relative scanner) |
+| [Core Analyzers](module-reference/core.md) | BinaryContext, XRefGraph, CFGBuilder, TaintTracker, ARM64TaintTracker, PathSolver, CrossBinaryTaintTracker; StaticELF32FuncStartScanner (x86_32 stripped static func_starts); I386AbsoluteXrefScanner (x86_32 absolute-address string xref: 26× improvement over RIP-relative scanner); [ARM64FuncStartScanner](module-reference/arm64-func-start-scanner.md) (arm64 stripped func_starts; BinaryContext arm64 PLT/BL/ADRP paths) |
 | [Encoding DAG](module-reference/encoding-dag.md) | EncodingDAG: ISA-agnostic bitfield template framework; round-trip encode/decode between raw bytes (RGB-integer packing), Encoding DAG (named fields), and Semantic DAG (SemanticOp/SemanticBlock/DataflowEdge); ISA-24 bundled 24-bit toy ISA |
 | [PPC32 Taint Tracker](module-reference/ppc32-taint-tracker.md) | PPC32TaintTracker: GOT2 PIC (Huawei/embedded Linux), crclr ABI, per-function r30 map, Huawei secure-string sinks |
 | [x86-32 Taint Tracker](module-reference/x86-32-taint-tracker.md) | X86_32TaintTracker: i386 CDECL32; PIC+non-PIC PLT stub resolution; push-based call-site arg tracking; Acronis rescue env: asamba, product.bin |

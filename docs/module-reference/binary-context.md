@@ -31,6 +31,7 @@ Named function VAs are tracked in the overlay (`ctx.set_name(va, name)`) and per
 | Format | Arch support | func_starts source |
 |---|---|---|
 | ELF | x86_64, x86_32, arm64, arm32, ppc64, ppc32, mips64, mips32, riscv64, riscv32, loongarch64 | DWARF `.eh_frame` + exports + dynamic symbols |
+| ELF arm64 (no `.eh_frame`) | arm64 | exports + `ARM64FuncStartScanner` (BL targets, PACIASP/BTI, STP prologues) |
 | Windows PE / `.sys` | x86_64, x86_32 (arm64/arm32 no-op, safe) | Exports + prologue scan |
 
 ---
