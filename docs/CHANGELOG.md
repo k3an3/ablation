@@ -2,6 +2,24 @@
 
 ---
 
+## v2.84.0
+
+**ARM64BssTaintTracker, ARM64VtableDispatchScanner; x86 BssTaintTracker crash fixes.**
+
+ARM64 ports of the last two x86-only scanners.
+
+- `ARM64BssTaintTracker`: finds loops walking `[start, end)` from adjacent BSS pointer globals
+  (initrd decrypt loops). Same input/report as the x86 tracker. `adrp`+`ldr`/`ldp` constants
+  flow across the CFG; taint follows stack spills; pairs may be loaded in different blocks.
+  `bss_symbols_from_elf()` falls back to 8-byte `.bss` slots for stripped images.
+- `ARM64VtableDispatchScanner`: live / dead vtable slots from `ldr xT, [xV, #slot]` +
+  `blr`/`br`/`blraa(z)` through xT. Same API as `VtableDispatchScanner`.
+- Fixes (x86): `BssTaintTracker` raised `TypeError` on every real pair (unhashable
+  `BSSSymbol` in sets), and `build_function` raised `AttributeError` (`.addr` instead of
+  `.address`). `VtableDispatchScanner.from_context` read a non-existent `ctx.binary_path`.
+
+---
+
 ## v2.83.0
 
 **ARM64HeapScanner — use-after-free, double free, off-by-one allocation, heap overflow.**

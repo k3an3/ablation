@@ -14,6 +14,11 @@ from .arm32_function_scanner import ARM32FunctionScanner
 from .arm64_reg_annotator import ARM64RegAnnotator
 from .arm64_func_start_scanner import ARM64FuncStartScanner
 from .intoverflow_scanner_arm64 import ARM64IntOverflowScanner, IntOverflowFinding64
+from .format_string_scanner_arm64 import ARM64FormatStringScanner
+from .length_underflow_arm64 import ARM64LengthUnderflowScanner, UnderflowFinding64
+from .heap_scanner_arm64 import ARM64HeapScanner
+from .bss_taint_tracker_arm64 import ARM64BssTaintTracker
+from .vtable_dispatch_arm64 import ARM64VtableDispatchScanner
 from .taint_tracker_arm64 import ARM64TaintTracker, TaintFindingARM64
 from .arm64_fgets_fd_discriminator import ARM64FgetsFdDiscriminator, FgetsClassifiedFinding
 from .version_delta import VersionTracker, diff_functions
@@ -157,6 +162,8 @@ __all__ = [
     "ARM64RegAnnotator",
     "ARM64FuncStartScanner",
     "ARM64IntOverflowScanner", "IntOverflowFinding64",
+    "ARM64FormatStringScanner", "ARM64LengthUnderflowScanner", "UnderflowFinding64",
+    "ARM64HeapScanner", "ARM64BssTaintTracker", "ARM64VtableDispatchScanner",
     "ARM64TaintTracker", "TaintFindingARM64",
     "ARM64FgetsFdDiscriminator", "FgetsClassifiedFinding",
     "VersionTracker", "diff_functions",

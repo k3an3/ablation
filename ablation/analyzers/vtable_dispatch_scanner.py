@@ -73,7 +73,7 @@ class VtableDispatchScanner:
 
     @classmethod
     def from_context(cls, ctx) -> 'VtableDispatchScanner':
-        return cls(ctx.binary_path)
+        return cls(getattr(ctx, 'binary_path', None) or ctx.path)
 
     def _parse_exec_sections(self) -> None:
         data = self._data

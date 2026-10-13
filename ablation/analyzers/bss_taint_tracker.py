@@ -43,7 +43,7 @@ COND_JUMPS = frozenset([
 ]) if HAS_CAPSTONE else frozenset()
 
 
-@dataclass
+@dataclass(unsafe_hash=True)      # stored in taint sets
 class BSSSymbol:
     addr: int
     size: int
@@ -94,7 +94,7 @@ def build_function(data: bytes, fn_va: int, fn_size: int) -> Function:
         return fn
 
     # Pass 1: split into blocks at every control-flow instruction.
-    bb = BasicBlock(start=insns[0].addr, end=insns[0].addr)
+    bb = BasicBlock(start=insns[0].address, end=insns[0].address)
     for insn in insns:
         bb.instrs.append(Instr(insn.address, insn.size, insn))
         bb.end = insn.address + insn.size
