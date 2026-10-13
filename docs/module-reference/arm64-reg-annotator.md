@@ -76,15 +76,13 @@ ra.annotate_calls(callee_va, entry_regs=call_site.args)
 Measured on a stripped 7.2k-function AArch64 `.so`: all functions profiled in 12.5s
 (~1.7 ms per function), with no failures.
 
----
-
 Works on PE (Windows) ARM64 too: IAT slots resolve to import names, and code is read through
 PE sections. The pass stops at a PLT stub or import thunk, so a window that runs past the end
 of the last function does not pick up stub branches.
+
+---
 
 ## Limits
 
 - Linear pass: values set on only one side of a branch can be wrong at a join.
 - No stack-slot tracking: a value spilled with `str` and reloaded is reported as `mem`.
-- `BinaryContext.call_edges` still has no edges for `blr` through the GOT. Only the
-  annotator resolves those.
