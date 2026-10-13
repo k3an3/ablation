@@ -10,8 +10,14 @@ Key AArch64 semantics:
   - ldp/stp pair instructions; pre/post-index writeback.
   - Linux arm64 syscall: x8=nr, x0-x5=args, x0=result; read/recvfrom taints buffer.
 
-Sources: recv/read/readv and Linux svc (read/recvfrom syscalls)
-Sinks:   system/execve/strcpy/sprintf/memcpy and other dangerous libc functions
+Sources: read/recv/recvfrom taint *x1, fgets/gets/fread taint *x0 (the buffer filled),
+         x0 carries the call's result; Linux svc read/recvfrom taint *x1 likewise.
+Sinks:   system/execve/strcpy/sprintf/memcpy and other dangerous libc functions; an arg
+         counts when its register or the memory it points at is tainted ("*x0").
+
+Pointer / alias state (parity with the ARM32 labeled tracker): frame_ptrs and spilled
+mem_ptrs keep "register holds address base+k"; eq alias classes over registers and stack
+slots share a buffer region between copies of a pointer; ra_regs follows the return address.
 
 AAPCS64: x0-x7 args, x0-x1 return, x19-x28 callee-saved, x30=lr, x29=fp.
 """
@@ -46,6 +52,30 @@ _SINK_NAMES: frozenset = frozenset({
     "memcpy", "memmove", "gets",
 })
 _PLT_TOL = 16
+
+# Sources that fill a caller buffer: name -> (buffer arg, length arg or None)
+_SOURCE_BUFFERS: Dict[str, Tuple[str, Optional[str]]] = {
+    "read": ("x1", "x2"), "recv": ("x1", "x2"), "recvfrom": ("x1", "x2"),
+    "fread": ("x0", None), "fgets": ("x0", "x1"), "gets": ("x0", None),
+}
+# Sink args whose pointee (not the register) carries the attacker data
+_SINK_POINTER_ARGS: Dict[str, Tuple[str, ...]] = {
+    "system": ("x0",), "popen": ("x0",),
+    "execve": ("x0", "x1"), "execl": ("x0", "x1", "x2"), "execvp": ("x0", "x1"),
+    "execle": ("x0", "x1", "x2"), "execvpe": ("x0", "x1"),
+    "strcpy": ("x1",), "strcat": ("x1",), "memcpy": ("x1",), "memmove": ("x1",),
+    "sprintf": tuple(f"x{i}" for i in range(1, 8)), "vsprintf": ("x1", "x2"),
+    "snprintf": tuple(f"x{i}" for i in range(2, 8)), "vsnprintf": ("x2", "x3"),
+}
+# Copies: dst pointee takes the src args' (pointee) taint
+_COPY_FUNCS: Dict[str, Tuple[str, Tuple[str, ...], Optional[str]]] = {
+    "strcpy": ("x0", ("x1",), None), "strncpy": ("x0", ("x1",), "x2"),
+    "strcat": ("x0", ("x1",), None), "strncat": ("x0", ("x1",), "x2"),
+    "memcpy": ("x0", ("x1",), "x2"), "memmove": ("x0", ("x1",), "x2"),
+    "sprintf": ("x0", tuple(f"x{i}" for i in range(1, 8)), None),
+    "snprintf": ("x0", tuple(f"x{i}" for i in range(2, 8)), "x1"),
+}
+_EXEC_SINKS = frozenset({"system", "execve", "execl", "execvp", "popen"})
 
 
 # ---------------------------------------------------------------------------
@@ -109,14 +139,34 @@ class Finding:
 # Taint state
 # ---------------------------------------------------------------------------
 
+Loc = object   # a register name (str) or a memory slot (base, offset)
+
+
 @dataclass
 class TaintState:
+    """
+    regs       register -> Taint
+    mem        (base, off) -> Taint for exact slots; ranges: tainted byte ranges
+    consts     register -> known constant
+    frame_ptrs register -> (base, k): register holds the address base+k, where base is
+               a frame register (sp/x29) or a buffer region ("@buf<va>", "@arg_x1")
+    mem_ptrs   (base, off) -> (base', k): slot holds a pointer (spilled frame_ptrs fact)
+    mem_consts (base, off) -> (nbytes, value): slot holds a known constant (spilled consts)
+    eq         alias classes over registers and 64-bit slots holding the same value;
+               lets a buffer filled through one copy of a pointer be seen through all
+    lr_slots   frame slots holding the return address
+    ra_regs    registers holding the return address (x30, its copies, reloads)
+    """
     regs:       Dict[str, Taint] = field(default_factory=dict)
     mem:        Dict[Tuple[str, int], Taint] = field(default_factory=dict)
     ranges:     List[Tuple[str, int, int, Taint]] = field(default_factory=list)
     consts:     Dict[str, int] = field(default_factory=dict)
     frame_ptrs: Dict[str, Tuple[str, int]] = field(default_factory=dict)
     lr_slots:   Set[Tuple[str, int]] = field(default_factory=set)
+    mem_ptrs:   Dict[Tuple[str, int], Tuple[str, int]] = field(default_factory=dict)
+    eq:         Dict[Loc, Set[Loc]] = field(default_factory=dict)
+    ra_regs:    Set[str] = field(default_factory=lambda: {LINK_REG})
+    mem_consts: Dict[Tuple[str, int], Tuple[int, int]] = field(default_factory=dict)
 
     def get(self, r: Optional[str]) -> Taint:
         if r is None or r == "xzr":
@@ -132,6 +182,8 @@ class TaintState:
             self.regs.pop(r, None)
         self.consts.pop(r, None)
         self.frame_ptrs.pop(r, None)
+        self.unalias(r)
+        self.ra_regs.discard(r)
         if r in FRAME_BASES:
             self.invalidate_base(r)
 
@@ -152,20 +204,78 @@ class TaintState:
                 t = Taint(t.labels | rt.labels, None)
         return t
 
-    def mem_set(self, base: str, off: int, t: Taint) -> None:
+    def mem_set(self, base: str, off: int, t: Taint, ptr: Optional[Tuple[str, int]] = None) -> None:
         if t.tainted:
             self.mem[(base, off)] = t
         else:
             self.mem.pop((base, off), None)
+        if ptr is not None:
+            self.mem_ptrs[(base, off)] = ptr
+        else:
+            self.mem_ptrs.pop((base, off), None)
+        self.mem_consts.pop((base, off), None)
+        self.unalias((base, off))
 
-    def taint_range(self, base: str, lo: int, hi: int, label: str) -> None:
-        self.ranges.append((base, lo, hi, Taint(frozenset({label}), None)))
+    def taint_range(self, base: str, lo: int, hi: int, label) -> None:
+        labels = frozenset({label}) if isinstance(label, str) else frozenset(label)
+        self.ranges.append((base, lo, hi, Taint(labels, None)))
+
+    def pointee(self, r: Optional[str]) -> Taint:
+        """Taint of the memory r points at (r's own taint not included)."""
+        if r is None:
+            return CLEAN
+        loc = self.frame_ptrs.get(r) or (("sp", 0) if r == "sp" else None)
+        return self.mem_get(*loc) if loc is not None else CLEAN
+
+    # ---- alias classes -------------------------------------------------------
+
+    def unalias(self, loc: Loc) -> None:
+        g = self.eq.pop(loc, None)
+        if g is not None:
+            g.discard(loc)
+
+    def alias(self, dst: Loc, src: Loc) -> None:
+        if dst == src:
+            return
+        self.unalias(dst)
+        g = self.eq.setdefault(src, {src})
+        g.add(dst)
+        self.eq[dst] = g
+
+    def aliases(self, loc: Loc) -> Set[Loc]:
+        return set(self.eq.get(loc, {loc}))
+
+    def point_at(self, loc: Loc, region: str, k: int = 0) -> None:
+        """Every alias of loc now holds the address region+k."""
+        for m in self.aliases(loc):
+            if isinstance(m, tuple):
+                self.mem_ptrs[m] = (region, k)
+            else:
+                self.frame_ptrs[m] = (region, k)
+
+    def _map_eq(self, f) -> None:
+        """Rewrite / drop slot members of eq (f returns the new loc or None)."""
+        out: Dict[Loc, Set[Loc]] = {}
+        for g in {id(g): g for g in self.eq.values()}.values():
+            ng = {m2 for m2 in (f(m) for m in g) if m2 is not None}
+            if len(ng) > 1:
+                for m in ng:
+                    out[m] = ng
+        self.eq = out
+
+    # ---- frame moves ---------------------------------------------------------
 
     def rebase(self, reg: str, delta: int) -> None:
-        self.mem = {((b, o - delta) if b == reg else (b, o)): t for (b, o), t in self.mem.items()}
+        def rk(k):
+            b, o = k
+            return (b, o - delta) if b == reg else k
+        self.mem = {rk(k): t for k, t in self.mem.items()}
         self.ranges = [((b, lo - delta, hi - delta, t) if b == reg else (b, lo, hi, t)) for (b, lo, hi, t) in self.ranges]
-        self.lr_slots = {((b, o - delta) if b == reg else (b, o)) for (b, o) in self.lr_slots}
-        self.frame_ptrs = {r: ((b, k - delta) if b == reg else (b, k)) for r, (b, k) in self.frame_ptrs.items()}
+        self.lr_slots = {rk(k) for k in self.lr_slots}
+        self.frame_ptrs = {r: rk(v) for r, v in self.frame_ptrs.items()}
+        self.mem_ptrs = {rk(k): rk(v) for k, v in self.mem_ptrs.items()}
+        self.mem_consts = {rk(k): v for k, v in self.mem_consts.items()}
+        self._map_eq(lambda m: rk(m) if isinstance(m, tuple) else m)
         if reg in self.consts:
             self.consts[reg] = (self.consts[reg] + delta) & MASK64
 
@@ -174,16 +284,36 @@ class TaintState:
         self.ranges = [r for r in self.ranges if r[0] != reg]
         self.lr_slots = {k for k in self.lr_slots if k[0] != reg}
         self.frame_ptrs = {r: v for r, v in self.frame_ptrs.items() if v[0] != reg}
+        self.mem_ptrs = {k: v for k, v in self.mem_ptrs.items() if k[0] != reg and v[0] != reg}
+        self.mem_consts = {k: v for k, v in self.mem_consts.items() if k[0] != reg}
+        self._map_eq(lambda m: None if isinstance(m, tuple) and m[0] == reg else m)
+
+    def drop_below_sp(self) -> None:
+        """A call may overwrite everything below sp."""
+        below = lambda k: k[0] == "sp" and k[1] < 0
+        self.mem = {k: v for k, v in self.mem.items() if not below(k)}
+        self.mem_ptrs = {k: v for k, v in self.mem_ptrs.items() if not below(k)}
+        self.mem_consts = {k: v for k, v in self.mem_consts.items() if not below(k)}
+        self._map_eq(lambda m: None if isinstance(m, tuple) and below(m) else m)
 
     def snapshot(self) -> Dict[str, str]:
         return {r: str(t) for r, t in sorted(self.regs.items())}
 
+    def _eq_groups(self) -> FrozenSet[FrozenSet]:
+        return frozenset(frozenset(g) for g in self.eq.values() if len(g) > 1)
+
     # lattice ops (CFG fixpoint) ------------------------------------------
     def copy(self) -> "TaintState":
-        return TaintState(
+        out = TaintState(
             dict(self.regs), dict(self.mem), list(self.ranges),
             dict(self.consts), dict(self.frame_ptrs), set(self.lr_slots),
+            dict(self.mem_ptrs), {}, set(self.ra_regs), dict(self.mem_consts),
         )
+        for g in {id(g): g for g in self.eq.values()}.values():
+            ng = set(g)
+            for m in ng:
+                out.eq[m] = ng
+        return out
 
     def join(self, other: "TaintState", widen: bool = False) -> "TaintState":
         """Least upper bound for a control-flow merge."""
@@ -212,7 +342,18 @@ class TaintState:
                 out.ranges.append(rng)
         out.consts = {r: v for r, v in self.consts.items() if other.consts.get(r) == v}
         out.frame_ptrs = {r: v for r, v in self.frame_ptrs.items() if other.frame_ptrs.get(r) == v}
+        out.mem_ptrs = {k: v for k, v in self.mem_ptrs.items() if other.mem_ptrs.get(k) == v}
+        out.mem_consts = {k: v for k, v in self.mem_consts.items() if other.mem_consts.get(k) == v}
         out.lr_slots = self.lr_slots | other.lr_slots
+        out.ra_regs = self.ra_regs | other.ra_regs
+        # alias classes: meet of the two partitions (aliased on both paths)
+        parts: Dict[Tuple[int, int], Set[Loc]] = {}
+        for m in set(self.eq) & set(other.eq):
+            parts.setdefault((id(self.eq[m]), id(other.eq[m])), set()).add(m)
+        for g in parts.values():
+            if len(g) > 1:
+                for m in g:
+                    out.eq[m] = g
         return out
 
     def same_as(self, other: "TaintState") -> bool:
@@ -220,7 +361,9 @@ class TaintState:
             self.regs == other.regs and self.mem == other.mem
             and sorted(map(repr, self.ranges)) == sorted(map(repr, other.ranges))
             and self.consts == other.consts and self.frame_ptrs == other.frame_ptrs
-            and self.lr_slots == other.lr_slots
+            and self.lr_slots == other.lr_slots and self.mem_ptrs == other.mem_ptrs
+            and self.mem_consts == other.mem_consts
+            and self.ra_regs == other.ra_regs and self._eq_groups() == other._eq_groups()
         )
 
 
@@ -228,16 +371,25 @@ class TaintState:
 # Labeled-taint engine (listing / objdump / capstone path)
 # ---------------------------------------------------------------------------
 
+@dataclass
+class Policy:
+    """Opt-in finding classes (defaults match the ARM32 labeled tracker)."""
+    report_tainted_branch: bool = False   # "tainted-branch-condition" at b.cond/cbz/tbz
+    report_bounded: bool = False          # "bounded-tainted-*-address" for bounded indices
+
+
 class TaintEngine:
     """
     Forward labeled-taint tracker over a stream of AArch64 ``Insn`` objects.
 
-    Seed with ``taint_register(r, label)`` then call ``run(insns)``.
-    Findings accumulate in ``self.findings``; unknown mnemonics in ``self.unknown``.
+    Seed with ``taint_register(r, label)`` / ``taint_pointee(r, label)`` then call
+    ``run(insns)``. Findings accumulate in ``self.findings``; unknown mnemonics in
+    ``self.unknown``.
     """
 
-    def __init__(self):
+    def __init__(self, policy: Optional[Policy] = None):
         self.isa = ISA
+        self.policy = policy or Policy()
         self.state = TaintState()
         self.findings: List[Finding] = []
         self.unknown: Set[str] = set()
@@ -249,6 +401,20 @@ class TaintEngine:
 
     def taint_memory(self, base: str, offset: int, label: str) -> None:
         self.state.mem[(base, offset)] = Taint(frozenset({label}), None)
+
+    def taint_pointee(self, reg: str, label, length: int = 1 << 20) -> None:
+        """The buffer reg points at is attacker-controlled (reg itself stays clean)."""
+        self.taint_buffer(reg, length, label, region=f"@arg_{reg}")
+
+    def taint_buffer(self, reg: str, length: int, label, region: str) -> None:
+        """Taint length bytes at reg's pointee; an unknown pointee becomes `region`,
+        shared by every register / slot aliased to reg."""
+        st = self.state
+        loc = st.frame_ptrs.get(reg) or (("sp", 0) if reg == "sp" else None)
+        if loc is None:
+            st.point_at(reg, region, 0)
+            loc = (region, 0)
+        st.taint_range(loc[0], loc[1], loc[1] + length, label)
 
     def run(self, insns: Iterable[Insn]) -> List[Finding]:
         for insn in insns:
@@ -277,6 +443,9 @@ class TaintEngine:
         if not bt.tainted:
             return
         if bt.bound is not None:
+            if self.policy.report_bounded:
+                self._find(insn, "bounded-" + kind,
+                           f"{detail} (attacker contribution <= {bt.bound:#x})", bt.labels)
             return
         self._find(insn, kind, detail, bt.labels)
 
@@ -389,10 +558,15 @@ class TaintEngine:
         if rd.name == "sp" and fp is not None and fp[0] == "sp":
             st.rebase("sp", fp[1])
             return
+        was_ra = rs.name in st.ra_regs and rs.shift is None
         self._write(rd, self._src(rs))
         c = st.consts.get(rs.name)
         if c is not None and rd.bits == 64:
             st.consts[rd.name] = c
+        if rd.bits == 64 and rs.bits == 64 and rs.shift is None and rs.name != "sp":
+            st.alias(rd.name, rs.name)
+            if was_ra:
+                st.ra_regs.add(rd.name)
         # mov x29, sp records a live frame-pointer alias
         if rs.name in FRAME_BASES and rd.name != rs.name and rd.bits == 64:
             st.frame_ptrs[rd.name] = (rs.name, 0)
@@ -544,8 +718,10 @@ class TaintEngine:
         bt = st.get(mem.base)
         exact = mem.index is None
         if mem.index is not None:
-            it = self._src(mem.index)
-            bt = Taint(bt.labels | it.labels, None if it.tainted else None)
+            it = self._src(mem.index)      # bound already scaled by lsl / extend
+            # a clean base plus a bounded index stays bounded; a tainted base does not
+            bound = it.bound if it.tainted and not bt.tainted else None
+            bt = Taint(bt.labels | it.labels, bound)
         rb, roff = st.resolve(mem.base, mem.offset)
         return bt, rb, roff, exact
 
@@ -592,8 +768,27 @@ class TaintEngine:
         self._check_addr(insn, bt, "tainted-load-address", f"{insn.mnemonic} {rd} via {mem}")
         nbytes, signed = access_bytes(insn.mnemonic, rd.bits)
         self._write(rd, self._load_value(rb, roff, exact, bt, nbytes, signed))
+        self._reload_facts(rd, rb, roff, exact, nbytes)
         if mem.writeback == "post":
             self._writeback(mem)
+
+    def _reload_facts(self, rd: Optional[Reg], rb: Optional[str], off: int, exact: bool, nbytes: int) -> None:
+        """A 64-bit reload restores the slot's pointer fact, alias class and RA role."""
+        st = self.state
+        if rd is None or rb is None or not exact or rd.name == "xzr":
+            return
+        slot = (rb, off)
+        c = st.mem_consts.get(slot)
+        if c is not None and c[0] == nbytes:
+            st.consts[rd.name] = c[1]
+        if nbytes != 8:
+            return
+        ptr = st.mem_ptrs.get(slot)
+        if ptr is not None:
+            st.frame_ptrs[rd.name] = ptr
+        st.alias(rd.name, slot)
+        if slot in st.lr_slots:
+            st.ra_regs.add(rd.name)
 
     def _store(self, insn: Insn) -> None:
         rt = insn.reg(0)
@@ -616,8 +811,18 @@ class TaintEngine:
     def _store_slot(self, insn: Insn, rb: str, off: int, rt: Optional[Reg]) -> None:
         st = self.state
         val = self._src(rt) if rt is not None else CLEAN
-        st.mem_set(rb, off, val)
-        if rt is not None and rt.name == LINK_REG and rb in FRAME_BASES:
+        full = rt is not None and rt.bits == 64 and rt.name != "xzr"
+        ptr = None
+        if full:
+            ptr = st.frame_ptrs.get(rt.name) or (("sp", 0) if rt.name == "sp" else None)
+        st.mem_set(rb, off, val, ptr)
+        if rt is not None and rt.name in st.consts and not val.tainted:
+            st.mem_consts[(rb, off)] = (rt.bits // 8, st.consts[rt.name] & ((1 << rt.bits) - 1))
+        elif rt is not None and rt.name == "xzr":
+            st.mem_consts[(rb, off)] = (rt.bits // 8, 0)
+        if full and rt.name != "sp":
+            st.alias((rb, off), rt.name)
+        if full and rt.name in st.ra_regs and rb in FRAME_BASES:
             st.lr_slots.add((rb, off))
         elif (rb, off) in st.lr_slots:
             st.lr_slots.discard((rb, off))
@@ -642,6 +847,8 @@ class TaintEngine:
         if load:
             self._write(r1, self._load_value(rb, roff, exact, bt, nbytes, insn.mnemonic == "ldpsw"))
             self._write(r2, self._load_value(rb, roff + nbytes, exact, bt, nbytes, insn.mnemonic == "ldpsw"))
+            self._reload_facts(r1, rb, roff, exact, nbytes)
+            self._reload_facts(r2, rb, roff + nbytes, exact, nbytes)
         elif rb is not None and exact:
             self._store_slot(insn, rb, roff, r1)
             self._store_slot(insn, rb, roff + nbytes, r2)
@@ -668,7 +875,8 @@ class TaintEngine:
     # ---- control flow ------------------------------------------------------
 
     def _cond_branch(self, insn: Insn, t: Taint) -> None:
-        pass
+        if self.policy.report_tainted_branch and t.tainted:
+            self._find(insn, "tainted-branch-condition", str(insn).split(": ", 1)[-1], t.labels)
 
     def _call(self, insn: Insn) -> None:
         st = self.state
@@ -693,15 +901,17 @@ class TaintEngine:
         if arg_labels:
             for r in RET_REGS + VEC_RET_REGS:
                 st.set(r, Taint(arg_labels, None))
-        st.set(LINK_REG, CLEAN)
+        st.set(LINK_REG, CLEAN)      # also drops x30's return-address role
         st.consts[LINK_REG] = (insn.address + insn.size) & MASK64
-        st.mem = {k: v for k, v in st.mem.items() if not (k[0] == "sp" and k[1] < 0)}
+        st.drop_below_sp()
 
     def _indirect_jump(self, insn: Insn) -> None:
         rn = insn.reg(0)
         bt = self._src(rn)
         if bt.tainted:
-            self._find(insn, "tainted-indirect-jump", f"{insn.mnemonic} via {rn}", bt.labels)
+            ret = rn is not None and rn.name in self.state.ra_regs
+            self._find(insn, "tainted-return-address" if ret else "tainted-indirect-jump",
+                       f"{insn.mnemonic} via {rn}", bt.labels)
 
     def _ret(self, insn: Insn) -> None:
         rn = insn.reg(0)
@@ -721,14 +931,10 @@ class TaintEngine:
                 self._find(insn, "tainted-syscall-arg", f"{name}({r})", st.get(r).labels)
         if name in INPUT_SYSCALLS:
             label = f"{name}@{insn.address:#x}"
-            st.set(SYSCALL_RET_REG, Taint(frozenset({label}), None))
-            buf = st.frame_ptrs.get("x1")
             n = st.consts.get("x2")
-            if buf is not None:
-                b, k = buf
-                st.taint_range(b, k, k + (n if n is not None else 1 << 20), label)
-            else:
-                st.taint_range("x1", 0, n if n is not None else 1 << 20, label)
+            self.taint_buffer("x1", n if n is not None else 1 << 20, label,
+                              region=f"@buf{insn.address:x}")
+            st.set(SYSCALL_RET_REG, Taint(frozenset({label}), None))
         else:
             st.set(SYSCALL_RET_REG, CLEAN)
 
@@ -828,6 +1034,9 @@ class ARM64TaintTracker:
         self._syms        = symbols
         self._sink_names  = _SINK_NAMES | (custom_sinks or set())
         self._source_names = _SOURCE_NAMES | (custom_sources or set())
+        # name -> VA of functions defined here (a PLT call to one of them is followed)
+        self._local_funcs: Dict[str, int] = {
+            n: va for va, n in symbols.items() if text_start <= va < text_end}
 
     @classmethod
     def from_path(cls, path: str, custom_sinks: Optional[Set[str]] = None,
@@ -839,35 +1048,16 @@ class ARM64TaintTracker:
     def from_path_full(cls, path: str, custom_sinks: Optional[Set[str]] = None,
                        custom_sources: Optional[Set[str]] = None) -> "ARM64TaintTracker":
         """
-        Like from_path but augments symbols with:
-          - PLT stub VAs from .plt section disassembly (so BL targets resolve to sink names)
-          - Function starts from XRefGraph (.eh_frame + BL-target discovery) so all
-            internal functions are scanned, not just exports.
+        Like from_path but augments symbols from BinaryContext:
+          - PLT stub VAs (so BL targets resolve to sink / source names); handles
+            GNU ld and lld layouts and 16/24-byte BTI/PAC stubs
+          - Function starts (.eh_frame, or ARM64FuncStartScanner when stripped)
+            so all internal functions are scanned, not just exports.
 
         Use this instead of from_path for stripped ARM64 binaries.
         """
-        from .xref_graph import XRefGraph
-        import lief as _lief
-
-        data, base_va, text_start, text_end, syms = _load_elf(path)
-
-        try:
-            xg = XRefGraph.from_path(path)
-            xg.build()
-            # PLT stub VAs (in text-space, not GOT space)
-            got_threshold = text_end  # GOT is well above .text
-            for va, name in xg._plt.items():
-                if va < got_threshold:
-                    syms[va] = name
-            # Inject all eh_frame / BL-discovered func starts so _get_func_starts() covers
-            # all functions, not just dynamic symbol exports
-            for fva in xg._func_starts:
-                if text_start <= fva < text_end and fva not in syms:
-                    syms[fva] = f"fn_{fva:x}"
-        except Exception:
-            pass
-
-        return cls(data, base_va, text_start, text_end, syms, custom_sinks, custom_sources)
+        from .binary_context import BinaryContext
+        return cls.from_context(BinaryContext.load_or_build(path), custom_sinks, custom_sources)
 
     @classmethod
     def from_path_ko(cls, path: str, custom_sinks: Optional[Set[str]] = None,
@@ -913,17 +1103,16 @@ class ARM64TaintTracker:
         return cls(data, base_va, text_start, text_end, syms, custom_sinks, custom_sources)
 
     @classmethod
-    def from_context(cls, ctx) -> "ARM64TaintTracker":
-        data = Path(ctx.path).read_bytes() if hasattr(ctx, "path") else b""
-        base_va    = getattr(ctx, "base_va", 0)
-        text_start = getattr(ctx, "text_start", 0)
-        text_end   = getattr(ctx, "text_end", len(data))
-        syms: Dict[int, str] = {}
-        if hasattr(ctx, "plt"):
-            syms.update({v: k for k, v in ctx.plt.items()})
-        if hasattr(ctx, "exports"):
-            syms.update({v: k for k, v in ctx.exports.items()})
-        return cls(data, base_va, text_start, text_end, syms)
+    def from_context(cls, ctx, custom_sinks: Optional[Set[str]] = None,
+                     custom_sources: Optional[Set[str]] = None) -> "ARM64TaintTracker":
+        """Build from a BinaryContext: file layout from the ELF, names from ctx."""
+        data, base_va, text_start, text_end, syms = _load_elf(ctx.path)
+        syms.update(ctx.plt)                                   # stub VA -> import name
+        syms.update({va: name for name, va in ctx.exports.items()})
+        for fva in ctx.func_starts:
+            if text_start <= fva < text_end and fva not in syms:
+                syms[fva] = f"fn_{fva:x}"
+        return cls(data, base_va, text_start, text_end, syms, custom_sinks, custom_sources)
 
     # ---- listing / objdump entry points ------------------------------------
 
@@ -960,51 +1149,90 @@ class ARM64TaintTracker:
 
     def _scan_func_binary(self, func_va: int, func_end: int,
                           init_labels: Optional[Set[str]] = None) -> List[TaintFindingARM64]:
-        func_name = self._syms.get(func_va, f"fn_0x{func_va:x}")
+        return self._scan(func_va, func_end, set(init_labels or ()), {}, 0, None)
+
+    def _scan(
+        self,
+        fva: int,
+        fend: int,
+        reg_labels: Set[str],
+        ptr_seed: Dict[str, FrozenSet[str]],
+        depth: int,
+        enqueue,
+    ) -> List[TaintFindingARM64]:
+        """
+        Linear taint pass over one function.
+
+        reg_labels: labels seeded on every arg register (caller passed tainted values)
+        ptr_seed:   arg register -> labels of the buffer it points at
+        enqueue:    callback(callee_va, reg_labels, ptr_seed) for interprocedural runs
+        """
+        func_name = self._syms.get(fva, f"fn_0x{fva:x}")
         findings: List[TaintFindingARM64] = []
-
         eng = TaintEngine()
-        if init_labels:
-            for r in ARG_REGS:
-                for lbl in init_labels:
-                    eng.taint_register(r, lbl)
+        for r in ARG_REGS:
+            for lbl in reg_labels:
+                eng.taint_register(r, lbl)
+        for r, labels in ptr_seed.items():
+            eng.taint_pointee(r, labels)
 
-        insns = self._insns_for_func(func_va, func_end)
-        for insn in insns:
+        for insn in self._insns_for_func(fva, fend):
             m = insn.mnemonic
-            if m == "bl":
-                target = insn.imm(0)
-                callee_name = _name_at(self._syms, target) if target else None
-                st = eng.state
-
-                if callee_name in self._source_names:
-                    for r in CALLER_SAVED:
-                        st.set(r, CLEAN)
-                    for r in RET_REGS:
-                        st.set(r, Taint(frozenset({callee_name}), None))
-
-                elif callee_name in self._sink_names:
-                    tainted_args = [r for r in ARG_REGS if st.get(r).tainted]
-                    if tainted_args:
-                        labels = frozenset().union(*(st.get(r).labels for r in tainted_args))
-                        sev = "CRITICAL" if callee_name in (
-                            "system", "execve", "execl", "execvp", "popen") else "HIGH"
-                        findings.append(TaintFindingARM64(
-                            func_va=func_va, func_name=func_name,
-                            sink_va=insn.address, sink_name=callee_name,
-                            tainted_args=tainted_args,
-                            source_name=next(iter(sorted(labels)), "unknown"),
-                            severity=sev,
-                        ))
-                    eng._call_effects(insn, target)
-                else:
-                    eng._call_effects(insn, target)
-            elif m in ISA.ret_mnems:
-                break
+            target = insn.imm(0) if m in ("bl", "b") else None
+            if m == "b" and (target is None or fva <= target < fend):
+                eng.step(insn)          # intra-function branch
+                continue
+            if target is not None:
+                callee = _name_at(self._syms, target)
+                self._on_call(eng, insn, target, callee, fva, func_name, findings, depth, enqueue)
             else:
-                eng.step(insn)
-
+                eng.step(insn)          # ret is checked and the linear pass continues
         return findings
+
+    def _on_call(self, eng: TaintEngine, insn: Insn, target: int, callee: Optional[str],
+                 fva: int, func_name: str, findings: List[TaintFindingARM64],
+                 depth: int, enqueue) -> None:
+        """bl / tail-call b: sink check, copy + source modelling, callee queueing."""
+        st = eng.state
+        if callee in self._sink_names:
+            tainted = [r for r in ARG_REGS if st.get(r).tainted]
+            tainted += [f"*{r}" for r in _SINK_POINTER_ARGS.get(callee, ())
+                        if st.pointee(r).tainted and r not in tainted]
+            if tainted:
+                labels: Set[str] = set()
+                for a in tainted:
+                    labels |= (st.pointee(a[1:]) if a.startswith("*") else st.get(a)).labels
+                findings.append(TaintFindingARM64(
+                    func_va=fva, func_name=func_name, sink_va=insn.address, sink_name=callee,
+                    tainted_args=tainted, source_name=next(iter(sorted(labels)), "unknown"),
+                    severity="CRITICAL" if callee in _EXEC_SINKS else "HIGH",
+                ))
+
+        if callee in _COPY_FUNCS:
+            dst, srcs, nreg = _COPY_FUNCS[callee]
+            labels = frozenset().union(*(st.get(r).labels | st.pointee(r).labels for r in srcs))
+            if labels:
+                n = st.consts.get(nreg) if nreg else None
+                eng.taint_buffer(dst, n if n is not None else 1 << 12, labels,
+                                 region=f"@buf{insn.address:x}")
+        elif callee in self._source_names and callee in _SOURCE_BUFFERS:
+            buf, nreg = _SOURCE_BUFFERS[callee]
+            n = st.consts.get(nreg) if nreg else None
+            eng.taint_buffer(buf, n if n is not None else 1 << 20, callee,
+                             region=f"@buf{insn.address:x}")
+        elif callee not in self._sink_names and enqueue is not None and depth > 0:
+            reg_in = [r for r in ARG_REGS if st.get(r).tainted]
+            ptr_in = {r: st.pointee(r).labels for r in ARG_REGS if st.pointee(r).tainted}
+            if reg_in or ptr_in:
+                # -fPIC: a call to this binary's own export goes through its PLT stub
+                callee_va = self._local_funcs.get(callee, target) if callee else target
+                enqueue(callee_va, set().union(*(st.get(r).labels for r in reg_in)), ptr_in)
+
+        eng._call_effects(insn, target)
+        if callee in self._source_names:
+            # scalar result in x0 only: read/recv/fgetc/... do not return in x1
+            st.set("x1", CLEAN)
+            st.set("x0", Taint(frozenset({callee}), None))
 
     # ---- public API -------------------------------------------------------
 
@@ -1023,67 +1251,30 @@ class ARM64TaintTracker:
             func_end[fva] = starts[i + 1] if i + 1 < len(starts) else self._text_end
 
         findings: List[TaintFindingARM64] = []
-        queue:    List[Tuple[int, int, Set[str]]] = [(fva, depth, set()) for fva in starts]
-        visited:  Dict[Tuple, int] = {}
+        queue: List[Tuple[int, int, Set[str], Dict[str, FrozenSet[str]]]] = [
+            (fva, depth, set(), {}) for fva in starts]
+        visited: Dict[Tuple, int] = {}
 
         while queue:
-            fva, d, init_labels = queue.pop(0)
-            key = (fva,) + tuple(sorted(init_labels))
+            fva, d, reg_labels, ptr_seed = queue.pop(0)
+            key = (fva, tuple(sorted(reg_labels)),
+                   tuple(sorted((r, tuple(sorted(l))) for r, l in ptr_seed.items())))
             if visited.get(key, -1) >= d:
                 continue
             visited[key] = d
-            fend = func_end.get(fva, self._text_end)
-            func_name = self._syms.get(fva, f"fn_0x{fva:x}")
 
-            eng = TaintEngine()
-            for r in ARG_REGS:
-                for lbl in init_labels:
-                    eng.taint_register(r, lbl)
+            def enqueue(target: int, labels: Set[str], ptrs: Dict[str, FrozenSet[str]], _d=d) -> None:
+                c_va = target
+                for off in range(0, _PLT_TOL + 1, 4):
+                    if c_va + off in func_end:
+                        c_va += off; break
+                    if c_va - off in func_end and c_va - off > 0:
+                        c_va -= off; break
+                if c_va in func_end:
+                    queue.append((c_va, _d - 1, labels, ptrs))
 
-            for insn in self._insns_for_func(fva, fend):
-                m = insn.mnemonic
-                if m == "bl":
-                    target = insn.imm(0)
-                    callee_name = _name_at(self._syms, target) if target else None
-                    st = eng.state
-
-                    if callee_name in self._source_names:
-                        for r in CALLER_SAVED:
-                            st.set(r, CLEAN)
-                        for r in RET_REGS:
-                            st.set(r, Taint(frozenset({callee_name}), None))
-
-                    elif callee_name in self._sink_names:
-                        tainted_args = [r for r in ARG_REGS if st.get(r).tainted]
-                        if tainted_args:
-                            labels = frozenset().union(*(st.get(r).labels for r in tainted_args))
-                            sev = "CRITICAL" if callee_name in (
-                                "system", "execve", "execl", "execvp", "popen") else "HIGH"
-                            findings.append(TaintFindingARM64(
-                                func_va=fva, func_name=func_name,
-                                sink_va=insn.address, sink_name=callee_name,
-                                tainted_args=tainted_args,
-                                source_name=next(iter(sorted(labels)), "unknown"),
-                                severity=sev,
-                            ))
-                        eng._call_effects(insn, target)
-                    else:
-                        tainted_into = [r for r in ARG_REGS if st.get(r).tainted]
-                        if d > 0 and tainted_into:
-                            callee_labels = set().union(*(st.get(r).labels for r in tainted_into))
-                            c_va = target or 0
-                            for off in range(0, _PLT_TOL + 1, 4):
-                                if c_va + off in func_end:
-                                    c_va += off; break
-                                if c_va - off in func_end and c_va - off > 0:
-                                    c_va -= off; break
-                            if c_va in func_end:
-                                queue.append((c_va, d - 1, callee_labels))
-                        eng._call_effects(insn, target)
-                elif m in ISA.ret_mnems:
-                    break
-                else:
-                    eng.step(insn)
+            findings.extend(self._scan(fva, func_end.get(fva, self._text_end),
+                                       reg_labels, ptr_seed, d, enqueue))
 
         seen: Set[Tuple] = set()
         unique: List[TaintFindingARM64] = []

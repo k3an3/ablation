@@ -32,7 +32,7 @@ Task-to-tool lookup. For constructor patterns and key methods, see `docs/module-
 | "ARM32: find function starts in stripped ELF without .eh_frame" | `ARM32FunctionScanner.from_path(elf).inject_into_context(ctx)` |
 | "ARM64: find function starts in stripped ELF without .eh_frame" | automatic in `BinaryContext`; standalone `ARM64FuncStartScanner.from_path(elf).scan_full()` |
 | "ARM32: find MUL before malloc without bounds check" | `ARM32IntOverflowScanner.from_context(ctx).scan()` |
-| "ARM64: trace recv to malloc/strcpy/system" | `ARM64TaintTracker.from_path_full(elf).run_interprocedural()` |
+| "ARM64: trace recv to malloc/strcpy/system" | `ARM64TaintTracker.from_path_full(elf).run_interprocedural()` (buffer sources, `*x0` pointee sinks, alias / spill tracking) |
 | "MIPS32: trace recv to system/strcpy/sprintf" | `MIPS32TaintTracker.from_path(elf).run_interprocedural()` |
 | "MIPS32: big-endian RouterOS or little-endian CPE" | `MIPS32TaintTracker.from_path(elf, endian='big')` |
 | "MIPS64: trace recv (Cisco IOS/OCTEON big-endian)" | `MIPS64TaintTracker.from_path(elf, endian='big').run_interprocedural()` |

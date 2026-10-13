@@ -2,6 +2,36 @@
 
 ---
 
+## v2.79.0
+
+**ARM64TaintTracker — pointer spills, alias classes, return-address copies; buffer sources.**
+
+Parity with the ARM32 / MIPS / x86 labeled trackers, plus fixes that made the binary path find
+the flows those features exist for. Previously `read(fd, buf, n); system(buf)` gave no finding at
+`-O0` or `-O2`, and lld-linked binaries resolved no PLT names at all.
+
+- `TaintState.mem_ptrs` / `mem_consts`: pointer and constant facts survive stack spills.
+- `TaintState.eq`: alias classes over registers and 64-bit slots. A buffer filled through
+  `x1` is seen through `x19` or a reloaded slot. Joined as a partition meet in `analysis_arm64`.
+- `TaintState.ra_regs`: return address followed through copies and reloads (`mov x9, x30;
+  br x9` -> `tainted-return-address`; spilled copies mark LR slots).
+- `Policy(report_tainted_branch, report_bounded)`: opt-in `tainted-branch-condition` and
+  `bounded-tainted-*-address` findings.
+- Binary path: `read`/`recv`/`recvfrom` taint `*x1` and `fgets`/`gets`/`fread` taint `*x0`;
+  sinks check pointee taint (reported as `*x0`); `strcpy`/`memcpy`/`sprintf` copy taint into
+  the destination; tail-call `b` handled; scan continues past early `ret`; a PLT call to a local
+  export is followed interprocedurally with pointee taint seeded.
+- Fixes: `from_path_full` dropped every PLT name when `.plt` follows `.text` (lld);
+  `from_context` inverted `ctx.plt` and treated VAs as file offsets (both now use
+  `BinaryContext`); sources tainted `x1` as well as `x0` (stale-`x1` false positives);
+  register-indexed addresses lost the index bound.
+
+Fixture results (clang `-O0` and `-O2`): every true flow found (stack buffer, heap buffer via
+spill or alias, helper via PLT, strcpy chain, fgets) and no false positives on the controls.
+Known anomalies ARM64-KA-006..009 resolved; KA-010 (compare-and-branch bounds) documented.
+
+---
+
 ## v2.78.0
 
 **ARM64PathSolver — Z3 path feasibility and input models for AArch64.**

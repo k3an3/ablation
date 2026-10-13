@@ -177,6 +177,30 @@ for f in findings:
     print(f)
 ```
 
+### ARM64: buffers, pointers and aliases
+
+`ARM64TaintTracker` follows attacker data *through memory*, not just registers:
+
+- **Buffer-filling sources.** `read`/`recv`/`recvfrom` taint `*x1`, and `fgets`/`gets`/`fread`
+  taint `*x0`. The length comes from the constant length argument (constants survive stack
+  spills), otherwise 1 MB.
+- **Pointee sinks.** `system(buf)` fires when the bytes `x0` points at are tainted, even though
+  the pointer itself is clean. The finding lists such args as `*x0`. `strcpy`/`memcpy`/`sprintf`
+  copy taint into their destination buffer.
+- **Pointer and alias state.** `mem_ptrs` keeps pointer facts across `str`/`ldr` spills.
+  `eq` alias classes over registers and stack slots let a buffer filled through `x1` be seen
+  through `x19` or a reloaded slot. `ra_regs` follows the return address through copies and
+  reloads, so `mov x9, x30; br x9` with taint reports `tainted-return-address`.
+- **Calls.** Tail calls (`b system@plt`) are checked as calls. A PLT call to the binary's own
+  export enters that function with the pointee taint seeded. The scan continues past early
+  `ret`s.
+- **Opt-in findings.** `TaintEngine(Policy(report_tainted_branch=True, report_bounded=True))`
+  adds `tainted-branch-condition` and `bounded-tainted-*-address`.
+
+```
+[CRITICAL] 0x104c4 (stack_buf): tainted {*x0} -> system @ 0x104ec (source: read)
+```
+
 For x86-64 with a pre-built context and custom sinks:
 
 ```python

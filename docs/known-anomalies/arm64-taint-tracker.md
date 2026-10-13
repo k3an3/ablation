@@ -1,7 +1,7 @@
 # Known Anomalies: ARM64TaintTracker
 
 **Module:** `ablation/analyzers/taint_tracker_arm64.py`  
-**Tracker version:** v2.57.0  
+**Tracker version:** v2.79.0  
 **Format:** ISO 26262 Part 8 / TASKING qualification kit (see `ABLATION-STANDARDS.md` §2.3)
 
 An anomaly is a condition under which `ARM64TaintTracker` is known to produce an incorrect
@@ -26,9 +26,9 @@ binary analysed with `from_path()` produces significantly fewer findings than a 
 their start VAs are unknown to the tracker.
 
 **Workaround:**  
-Use `ARM64TaintTracker.from_path_full()`. It injects function starts from `.eh_frame` FDE
-records and BL-target discovery on top of symbol-table entries. This recovers most functions
-even in heavily stripped binaries.
+Use `ARM64TaintTracker.from_path_full()`. It injects function starts from `BinaryContext`
+(`.eh_frame` FDE records, or `ARM64FuncStartScanner` when `.eh_frame` is absent) on top of
+symbol-table entries. This recovers most functions even in heavily stripped binaries.
 
 **Resolved in version:** Mitigated by `from_path_full()`. Residual gap: leaf functions with
 no `.eh_frame` entry and never called by a BL-discovered site remain unseen.
@@ -130,3 +130,80 @@ Always use `from_path_full()` for kernel modules. It performs relocation patchin
 injects BTF func_info when the `.BTF` section is present.
 
 **Resolved in version:** Mitigated by `from_path_full()`.
+
+---
+
+## ARM64-KA-006: Source buffers were not tainted
+
+**Description:**
+`read`/`recv`/`fgets`-style sources tainted only the return registers (`x0` and `x1`), never the
+buffer they fill. `read(fd, buf, n); system(buf)` produced no finding. Tainting `x1` also flagged
+any later sink that happened to take a stale `x1`.
+
+**Impact:** False negatives on every buffer-based source-to-sink flow, plus false positives from
+the stale `x1`.
+
+**Resolved in version:** v2.79.0. The buffer argument's pointee is tainted (shared through alias
+classes and spilled pointer slots), sinks check pointee taint (`*x0`), and only `x0` carries the
+source's return value.
+
+---
+
+## ARM64-KA-007: from_path_full lost all PLT names on lld-linked binaries
+
+**Description:**
+`from_path_full` kept only PLT VAs below `.text`'s end, assuming GNU ld's layout. lld places
+`.plt` after `.text`, so no `bl` resolved to a source or sink name and the tracker reported
+nothing. `from_context` inverted `ctx.plt` (name -> VA) and treated VAs as file offsets.
+
+**Impact:** No findings on lld-linked binaries (Android, many modern toolchains).
+
+**Resolved in version:** v2.79.0. Both constructors take PLT names and function starts from
+`BinaryContext`, and file layout from the ELF.
+
+---
+
+## ARM64-KA-008: Linear scan stopped at the first ret; tail calls ignored
+
+**Description:**
+The binary scan stopped at the first `ret`, so code laid out after an early return was never
+visited. Tail calls (`b system@plt`) were not treated as calls.
+
+**Impact:** False negatives in optimised code.
+
+**Resolved in version:** v2.79.0. The scan continues past `ret` (linear-pass state carries over,
+as in `ARM64RegAnnotator`), and a `b` that leaves the function is handled as a call.
+
+---
+
+## ARM64-KA-009: Register-indexed addresses lost the index bound
+
+**Description:**
+`[xB, xI]` addressing discarded `xI`'s bound, so `and x1, x0, #0xff; ldr x2, [x3, x1]` reported
+an unbounded `tainted-load-address`.
+
+**Impact:** False positive on bounds-masked table lookups.
+
+**Resolved in version:** v2.79.0. A clean base with a bounded index stays bounded: silent by
+default, or reported as `bounded-*` with `Policy(report_bounded=True)`.
+
+---
+
+## ARM64-KA-010: Bounds established by compare-and-branch are not used
+
+**Description:**
+A length checked by `cmp x0, #0x21; b.hs fail` before `memcpy(dst, src, x0)` is still treated
+as unbounded. The linear pass does not turn branch conditions into bounds.
+
+**Triggering conditions:** Any bounds check implemented as a compare plus a branch rather than a
+mask (`and`) or a narrowing load/extend.
+
+**Impact:** True taint flows that are adequately guarded are reported (e.g. Rust `read` ->
+`Vec::extend_from_slice` copies on a stripped arm64 `.so`).
+
+**Workaround:** Check reachability and the solvable lengths with
+`ARM64PathSolver.from_context(ctx, func_va).solve_first_sat(sink_va)`, adding a constraint on the
+length register in a `struct_seed` or a listing.
+
+**Resolved in version:** Open
+

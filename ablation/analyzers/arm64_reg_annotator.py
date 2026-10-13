@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from .binary_context import BinaryContext, PointerSlots
-from .insn_arm64 import Imm, Insn, Mem, Reg, make_insn
+from .insn_arm64 import Imm, Insn, Reg, make_insn
 from .isa_arm64 import ARG_REGS, CALLER_SAVED
 from .reg_annotator import AnnotationResult, CallSite, RegVal
 
