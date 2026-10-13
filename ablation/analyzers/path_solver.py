@@ -165,6 +165,7 @@ class PathResult:
     clauses: int                     # Z3 clauses added
     note: str = ""                   # "timeout", "unsat", etc.
     seeded_fields: List[str] = field(default_factory=list)  # struct fields that constrained the path
+    fields: Dict[str, int] = field(default_factory=dict)    # concrete seeded-field values (if sat)
 
     def __str__(self) -> str:
         path_str = " -> ".join(hex(v) for v in self.path)
@@ -172,6 +173,8 @@ class PathResult:
             return f"[{self.note or 'UNSAT'}] path={path_str} clauses={self.clauses}"
         regs = ", ".join(f"{k}={hex(v)}" for k, v in self.model.items() if v != 0)
         fields = f" seeded={self.seeded_fields}" if self.seeded_fields else ""
+        if self.fields:
+            fields += " fields=(" + ", ".join(f"{k}={hex(v)}" for k, v in self.fields.items()) + ")"
         return f"[SAT] path={path_str} clauses={self.clauses} model=({regs}){fields}"
 
 
@@ -638,7 +641,19 @@ class PathSolver:
 
         return PathResult(sat=sat, path=path, model=model_dict,
                           clauses=clauses, note=note,
-                          seeded_fields=sorted(self._seeded_fields_used))
+                          seeded_fields=sorted(self._seeded_fields_used),
+                          fields=self._field_values(solver) if sat else {})
+
+    def _field_values(self, solver: z3.Solver) -> Dict[str, int]:
+        """Concrete values of the struct-seed symbols read on this path."""
+        m = solver.model()
+        out: Dict[str, int] = {}
+        for key, sym in self._mem_cache.items():
+            mc = self.struct_seed.get(key)
+            val = m.eval(sym, model_completion=True)
+            if mc is not None and z3.is_bv_value(val):
+                out[mc.name] = val.as_long()
+        return dict(sorted(out.items()))
 
 
 # ── convenience wrapper ───────────────────────────────────────────────────────

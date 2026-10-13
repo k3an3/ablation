@@ -350,26 +350,38 @@ for f in findings:
 
 ## PathSolver
 
-**File:** `ablation/analyzers/path_solver.py`
+**File:** `ablation/analyzers/path_solver.py` (x86-64), `ablation/analyzers/path_solver_arm64.py` (AArch64)
+**Requires:** `z3-solver` (`pip install -e '.[full]'`)
 
-Constraint-based path feasibility checker. Given a CFG and a target basic block (e.g., a
-memcpy call site), PathSolver determines whether a path exists from the function entry that
-satisfies the branch conditions leading to that block.
+Bounded symbolic execution + Z3. Enumerates simple CFG paths from the function entry to a
+target, executes each symbolically (entry registers are free 64-bit symbols), adds one
+constraint per conditional branch on the path, and asks Z3 for a model. A SAT model gives
+concrete entry register values (and seeded struct-field values) that drive execution to the
+target. UNSAT on every path means the target is unreachable under the modelled semantics.
 
 ```python
-from ablation.analyzers.path_solver import PathSolver
+# x86-64: caller supplies bytes, CFG and capstone handle
+import capstone
 from ablation.analyzers.cfg_builder import CFGBuilder
+from ablation.analyzers.path_solver import PathSolver, MemoryConstraint
 
-builder = CFGBuilder('/path/to/binary.so', xref=xg)
-cfg = builder.build_function(0x1000)
+cfg = CFGBuilder('/path/to/binary.so').build_function(func_va)
+md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64); md.detail = True
+ps = PathSolver(func_bytes, func_va, func_end_va, ctx.plt, cfg, md)
+r = ps.solve_first_sat(target_block_va)      # or ps.solve(...) for every path
+print(r)   # [SAT] path=0x1030 -> ... model=(rcx=0x5a50, rdx=0x4, rsi=0x40, rdi=0x1337)
 
-solver = PathSolver(cfg)
-result = solver.is_reachable(target_bb_va=0x1050)
-print(result.feasible, result.path)
+# AArch64: build from a BinaryContext; target may be any instruction (e.g. the sink call)
+from ablation.analyzers.path_solver_arm64 import ARM64PathSolver
+ps = ARM64PathSolver.from_context(ctx, func_va)
+r = ps.solve_first_sat(sink_call_va)
 ```
 
-TaintTracker uses PathSolver to eliminate false positives where the tainted path is unreachable
-due to contradictory branch constraints.
+`struct_seed={(base_reg, offset): MemoryConstraint(name, width, lo, hi, exact)}` names
+memory reads and bounds them. A SAT result reports the solved values in `r.fields`.
+
+See [path-solver-arm64.md](path-solver-arm64.md) for AArch64 semantics (exact NZCV flags,
+cbz/tbz, csel, stack-spill forwarding).
 
 ---
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ablation"
-version = "2.77.0"
+version = "2.78.0"
 description = "Semantic function matching for stripped firmware. No symbols. No source. No setup."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -29,6 +29,7 @@ full = [
     "anthropic>=0.30.0",
     "angr>=9.2.90",
     "bitstring<4.0",
+    "z3-solver>=4.12",
 ]
 
 [project.scripts]

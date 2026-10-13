@@ -2,6 +2,33 @@
 
 ---
 
+## v2.78.0
+
+**ARM64PathSolver — Z3 path feasibility and input models for AArch64.**
+
+`PathSolver` only decoded x86-64, so arm64 had no "confirm feasibility" step. The new
+`ARM64PathSolver` subclasses it and keeps path enumeration, `PathResult` and struct seeds.
+It runs over `cfg_arm64` / `insn_arm64` with AArch64 semantics:
+
+- Exact NZCV flags for `cmp`/`cmn`/`tst`/`subs`/`adds`/`ands`/`ccmp`/`ccmn`, so `b.cond`,
+  `csel`/`cset`/`cinc`... and clang's unsigned range idioms solve correctly.
+- `cbz`/`cbnz`/`tbz`/`tbnz` constrain the register directly.
+- Store-to-load forwarding on the path (`str`/`stp` -> `ldr`/`ldp`), so `-O0` argument
+  spills keep their constraints.
+- The target may be any instruction (e.g. the sink call), not only a block start.
+- `from_context(ctx, func_va)` and `from_listing(text)` constructors.
+
+Validated on clang-built code at `-O0`/`-O1`/`-O2`/`-Os`: every model satisfies the source
+predicate, and a dead sink is UNSAT.
+
+- `PathResult.fields`: Z3's values for seeded struct fields (both solvers). Previously only
+  their names were reported.
+- `z3-solver` added to the `full` extra; both path solvers need it.
+- Docs: the PathSolver section in `core.md` described a non-existent `PathSolver(cfg)
+  .is_reachable()` API; rewritten for the real one.
+
+---
+
 ## v2.77.0
 
 **ARM64RegAnnotator — AAPCS64 call-site argument values for FuncProfiler and IPRegAnnotator.**

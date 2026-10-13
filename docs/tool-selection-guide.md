@@ -165,7 +165,8 @@ Task-to-tool lookup. For constructor patterns and key methods, see `docs/module-
 | "Check if function is safe to run in sandbox" | `LeafFunctionChecker.from_path(elf).is_leaf(va, ctx)` |
 | "Score evidence for a hypothesis" | `EvidenceScorer().score(hypothesis, evidence_items)` |
 | "Rank analysis probes by expected information gain" | `ProbeRanker().plan_report(hypotheses, top_n=5)` |
-| "Confirm taint path is reachable" | `PathSolver.solve_path(func_va, target_va)` |
+| "Confirm taint path is reachable" | x86-64: `PathSolver(data, func_va, end_va, plt, cfg, md).solve_first_sat(target_block_va)` |
+| "ARM64: is this sink reachable, and with what inputs?" | `ARM64PathSolver.from_context(ctx, func_va).solve_first_sat(sink_call_va)` |
 | "Trace an arg across 3 library hops" | `IPRegAnnotator.annotate_chain(va, max_hops=3)` |
 | "Which library exports this symbol?" | `LibGraph.defined_in('symbol')` |
 | "Is this the same function as in v7.4?" | `DTWMatcher.score_functions(va_a, va_b)` |
