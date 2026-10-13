@@ -53,6 +53,9 @@ _DEFAULT_SINKS: Dict[str, str] = {
     'sprintf':  'buffer-overflow',
     'vsprintf': 'buffer-overflow',
     'gets':     'buffer-overflow',
+    'sscanf':   'buffer-overflow',     # %s / %[ without a width
+    'scanf':    'buffer-overflow',
+    'fscanf':   'buffer-overflow',
     # command execution
     'system':   'cmd-exec',
     'popen':    'cmd-exec',

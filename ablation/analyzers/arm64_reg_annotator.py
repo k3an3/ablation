@@ -234,7 +234,7 @@ class ARM64RegAnnotator:
             if bval is not None and bval.kind == 'const':
                 val = self._const_or_string((bval.int_val + imm) & _MASK64)
             elif base in ('sp', 'x29'):
-                val = RegVal.mem(f"{base}+0x{imm:x}" if imm >= 0 else f"{base}-0x{-imm:x}")
+                val = RegVal.stack_addr(f"{base}+0x{imm:x}" if imm >= 0 else f"{base}-0x{-imm:x}")
             elif rd.name == 'sp':
                 return
 
@@ -266,7 +266,7 @@ class ARM64RegAnnotator:
         if src.name == 'xzr':
             return RegVal.zero()
         if src.name == 'sp':
-            return RegVal.mem('sp')
+            return RegVal.stack_addr('sp')
         sv = regs.get(src.name)
         if sv is None or sv.kind == 'unknown':
             return RegVal.unknown()

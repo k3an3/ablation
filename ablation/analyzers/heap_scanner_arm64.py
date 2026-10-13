@@ -102,6 +102,9 @@ class ARM64HeapScanner(ARM64TaintTracker):
         super().__init__(*args, **kw)
         self._out: Dict[Tuple[str, int], HeapFinding] = {}
         self._allocs: Dict[str, _Alloc] = {}
+        self._report = True
+        self._grown: Set[str] = set()        # regions handed to realloc ("*": pointer unknown)
+        self._oob: List[Tuple[str, Tuple]] = []  # constant-offset OOB, kept unless region grew
 
     # ---- public API ---------------------------------------------------------
 
@@ -134,10 +137,14 @@ class ARM64HeapScanner(ARM64TaintTracker):
             cfg = build_cfg(insns, entry=fva)
         except ValueError:
             return
-        self._allocs = {}
+        self._allocs, self._grown, self._oob = {}, set(), []
         entry: Dict[int, _Flow] = {cfg.entry: _Flow(TaintState())}
         visits: Dict[int, int] = {}
         work = [cfg.entry]
+        # 1) fixpoint, silent: a pointer walked in a loop has a constant offset only on the
+        #    first trip; the loop-head join drops it. Reporting mid-iteration would flag
+        #    p[k] for a one-iteration offset (NUL-terminated walks, pre/post-indexed loads).
+        self._report = False
         while work:
             b = work.pop(0)
             if b not in cfg.blocks:
@@ -153,6 +160,15 @@ class ARM64HeapScanner(ARM64TaintTracker):
                     entry[s] = new
                     if s not in work:
                         work.append(s)
+        # 2) report from each block's final entry state
+        self._report = True
+        for b in sorted(entry):
+            if b in cfg.blocks:
+                self._exec_block(entry[b].copy(), cfg.blocks[b].insns, fva, fend)
+        # realloc growth: a region that may have been resized has no constant size
+        for region, args in self._oob:
+            if region not in self._grown and "*" not in self._grown:
+                self._add(*args)
 
     def _exec_block(self, flow: _Flow, insns: List[Insn], fva: int, fend: int) -> None:
         eng = TaintEngine()
@@ -180,6 +196,8 @@ class ARM64HeapScanner(ARM64TaintTracker):
 
     def _add(self, kind: str, fva: int, site: int, desc: str, sev: str,
              region: Optional[str] = None, freed_at: int = 0) -> None:
+        if not self._report:
+            return
         a = self._allocs.get(region or "")
         self._out.setdefault((kind, site), HeapFinding(
             kind=kind, func_va=fva, site_va=site, description=desc, severity=sev,
@@ -206,10 +224,11 @@ class ARM64HeapScanner(ARM64TaintTracker):
         pair = insn.mnemonic.startswith(("stp", "ldp", "stnp", "ldnp"))
         width = {"b": 1, "h": 2}.get(insn.mnemonic[-1], (regs[0].bits // 8) if regs else 8)
         end = k + width * (2 if pair else 1)
-        if k < 0 or end > a.size:
-            self._add("heap_overflow", fva, insn.address,
-                      f"{rw} of bytes [{k}, {end}) of {a.size}-byte {a.sym}@0x{a.va:x}",
-                      "HIGH" if rw == "write" else "MEDIUM", region)
+        if (k < 0 or end > a.size) and self._report:
+            self._oob.append((region, (
+                "heap_overflow", fva, insn.address,
+                f"{rw} of bytes [{k}, {end}) of {a.size}-byte {a.sym}@0x{a.va:x}",
+                "HIGH" if rw == "write" else "MEDIUM", region)))
 
     def _alloc_desc(self, region: str) -> str:
         a = self._allocs.get(region)
@@ -224,6 +243,8 @@ class ARM64HeapScanner(ARM64TaintTracker):
         freed_reg = "x0" if callee in _FREES else _ALLOCS.get(callee or "", ((), None))[1]
         if freed_reg:
             region = self._region(st, freed_reg)
+            if callee not in _FREES:
+                self._grown.add(region or "*")
             if region is not None:
                 if region in flow.freed:
                     kind = "double_free" if callee in _FREES else "uaf"

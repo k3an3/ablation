@@ -152,7 +152,8 @@ class FmtStringFinding:
     def fmt(self) -> str:
         return (
             f"  {self.severity:6s}  fmt_string  0x{self.func_va:x}+{(self.call_va-self.func_va)&0xFFFF:#x}"
-            f"  {self.callee}({self.fmt_reg}=user?)  {self.description}"
+            f"  {self.callee}({self.fmt_reg}={'stack' if self.provenance == 'unbounded_s' else 'user?'})"
+            f"  {self.description}"
         )
 
 

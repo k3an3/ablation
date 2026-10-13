@@ -36,8 +36,34 @@ covering tail calls and GOT calls.
 |---|---|
 | string literal / `.rodata` address | not reported |
 | `tainted` (register or pointee holds recv/read data) | HIGH |
-| `arg_passthrough` (caller's argument, also via `-O0` spills) | HIGH |
 | `stack_load`, `memory_load`, `call_result`, `register`, `unknown` | MEDIUM |
+| `unbounded_s` (see below) | HIGH / MEDIUM |
+
+**Wrappers.** A format that is the function's own argument (also through `-O0` spills) makes
+the function a printf wrapper. The bug, if any, is at the caller, so the verdict comes from
+the wrapper's call sites in the binary, following nested wrappers (`log_mid(lvl, f)` →
+`log_any(f)` → `printf(f)`):
+
+| Callers | Result |
+|---|---|
+| a caller passes recv/read data (register or pointee) | HIGH `tainted`; that caller and site are named |
+| a caller passes a non-literal | MEDIUM `arg_passthrough`; that caller's provenance |
+| no caller in the binary (exported API) | LOW `arg_passthrough` |
+| every caller passes a literal | not reported |
+
+**Unbounded `%s`.** For a literal format, `%s` with no precision (print family) or
+`%s` / `%[` with no width (scan family, skipping `%*s` and `%ms`) is checked. It is flagged
+when it writes into a stack buffer:
+
+| Call | Checked target | HIGH when |
+|---|---|---|
+| `sprintf`, `vsprintf` | `x0` on the stack | a `%s` source arg's pointee holds recv/read data |
+| `sscanf` (+ `__isoc99_`) | the `%s` / `%[` arg on the stack | the input string (`x0`) holds recv/read data |
+| `scanf` | same | always (stdin) |
+| `fscanf` | same | never (MEDIUM) |
+
+The other cases are MEDIUM. `__sprintf_chk` is not flagged, because it aborts on overflow.
+`unbounded_conversions(fmt, family)` exposes the parser.
 
 Covers printf / fprintf / sprintf / snprintf / dprintf / asprintf (+ `v*`), syslog, err / warn
 families, the `__*_chk` fortify variants, and printk / panic. `puts` is not a format function

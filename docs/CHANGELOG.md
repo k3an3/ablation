@@ -2,6 +2,34 @@
 
 ---
 
+## v2.86.0
+
+**ARM64 format-string wrappers judged by callers; unbounded `%s` into stack buffers; heap
+false positives from loop walks and realloc.**
+
+- `ARM64FormatStringScanner`:
+  - `arg_passthrough` is no longer HIGH by itself. A printf wrapper is judged by its call
+    sites, following nested wrappers:
+    - a caller passes recv/read data: HIGH `tainted`, naming the caller and site;
+    - a caller passes a non-literal: MEDIUM;
+    - no caller in the binary (exported): LOW;
+    - every caller passes a literal: not reported.
+  - New `unbounded_s` check: `%s` with no precision in `sprintf` / `vsprintf` writing into a
+    stack buffer, or `%s` / `%[` with no width in `sscanf` / `scanf` / `fscanf` (+
+    `__isoc99_`) targeting one. HIGH when the data is attacker-controlled: recv/read data, or
+    stdin for `scanf`.
+  - Short literal formats (`"%s"`) are read from the image, because they are below the
+    string table's minimum length.
+- `ARM64HeapScanner`:
+  - Findings are reported from the fixpoint state, so a pointer walked in a NUL-terminated
+    loop (pre/post-indexed loads) is no longer a "read past N-byte alloc".
+  - Objects passed to `realloc` lose their constant size.
+- `RegVal.stack_addr()` / `.is_stack_addr`: `ARM64RegAnnotator` now tells `add xD, sp, #k`
+  (an address) apart from `ldr xD, [sp, #k]` (a load). Both still display as `[sp+0xk]`.
+- `FuncProfiler`: `sscanf` / `scanf` / `fscanf` are tagged as buffer-overflow sinks.
+
+---
+
 ## v2.85.0
 
 **Raw (headerless) firmware images: `BinaryContext.from_raw` and `--raw/--base/--symbols`.**

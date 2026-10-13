@@ -78,3 +78,38 @@ def test_report_and_int_overflow_toggle(bins):
     s = ARM64HeapScanner.from_path_full(str(bins["O2"]))
     assert not any(f.kind == "int_overflow_before_alloc" for f in s.scan(include_int_overflow=False))
     assert s.report(s.scan()).startswith("ARM64 heap scan:")
+
+
+# ── loop walks and realloc growth are not overflows ──────────────────────────
+
+_WALK_SRC = r"""
+typedef unsigned long size_t;
+extern void *malloc(size_t); extern void *realloc(void *, size_t); extern void free(void *);
+extern long read(int, void *, size_t);
+int last_char(void) { char *s = malloc(2); read(0, s, 1); s[1] = 0;
+    char *p = s; while (*p) p++; int r = p[-1]; free(s); return r; }
+int walk_pre(void) { char *s = malloc(3); read(0, s, 2); s[2] = 0;
+    int n = 0; char *p = s - 1; while (*++p) n += *p; free(s); return n; }
+int unrolled(void) { unsigned char *s = malloc(2); read(0, s, 1); s[1] = 0; int n = 0;
+    for (unsigned char *p = s; *p; p += 2) { n += p[0]; if (!p[1]) break; n += p[1]; }
+    free(s); return n; }
+int grow(int fd) { char *b = malloc(4); size_t cap = 4, len = 0; char c;
+    while (read(fd, &c, 1) == 1) { if (len == cap) { cap *= 2; b = realloc(b, cap); } b[len++] = c; }
+    int r = b[5]; free(b); return r; }
+int grow_const(void) { char *b = malloc(4); b = realloc(b, 64); b[40] = 1; int r = b[40]; free(b); return r; }
+extern void use(char *);
+int real_oob(int i) { char *b = malloc(8); b[12] = (char)i; use(b); free(b); return 0; }
+"""
+
+
+@pytest.fixture(scope="module")
+def walk_bins(tmp_path_factory):
+    return build_variants(tmp_path_factory, src_text=_WALK_SRC,
+                          variants={"O0": ["-O0"], "O1": ["-O1"], "O2": ["-O2"]})
+
+
+@pytest.mark.parametrize("opt", ["O0", "O1", "O2"])
+def test_walks_and_realloc_not_overflows(walk_bins, opt):
+    s = ARM64HeapScanner.from_path_full(str(walk_bins[opt]))
+    got = {(s._syms.get(f.func_va), f.kind) for f in s.scan(include_int_overflow=False)}
+    assert got == {("real_oob", "heap_overflow")}

@@ -52,6 +52,16 @@ controls stay silent: an error-path free, reassignment after free, an alloc/free
 
 ---
 
+**Fixpoint reporting.** Findings are reported from each block's final dataflow state, not
+while the dataflow is still iterating. A pointer walked in a loop (`while (*p) p++`,
+`ldrb w8, [x0, #1]!`) has a constant offset only on the first trip; the loop-head join drops
+it. So a NUL-terminated walk over a small buffer is not reported as a "read past N-byte
+alloc".
+
+**realloc growth.** An object passed to `realloc` (or any object, when the pointer handed to
+`realloc` is unknown) has no constant size afterwards. Constant-offset accesses to it are not
+reported.
+
 ## Limits
 
 - Intraprocedural for UAF / double-free (like the x86 scanners): a pointer freed in a callee

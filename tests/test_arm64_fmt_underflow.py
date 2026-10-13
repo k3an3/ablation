@@ -49,10 +49,65 @@ def test_format_string_verdicts(fmt_bins, opt):
     s = ARM64FormatStringScanner.from_path_full(str(fmt_bins[opt]))
     got = {s._syms.get(f.func_va): (f.callee, f.provenance, f.severity) for f in s.scan()}
     assert got == {
-        "passthru": ("printf", "arg_passthrough", "HIGH"),   # -O0: through a stack spill
+        "passthru": ("printf", "arg_passthrough", "LOW"),    # exported wrapper, no caller here
         "wire": ("syslog", "tainted", "HIGH"),
         "viaret": ("printf", "call_result", "MEDIUM"),
     }
+
+
+_WRAP_SRC = r"""
+typedef unsigned long size_t;
+extern long recv(int, void *, size_t, int);
+extern int printf(const char *, ...);
+extern int sprintf(char *, const char *, ...);
+extern int vsprintf(char *, const char *, __builtin_va_list);
+extern int sscanf(const char *, const char *, ...);
+extern int scanf(const char *, ...);
+extern void sink(char *);
+__attribute__((noinline)) static void log_lit(const char *fmt) { printf(fmt); }
+__attribute__((noinline)) static void log_any(const char *fmt) { printf(fmt); }
+__attribute__((noinline)) static void log_mid(int lvl, const char *f) { log_any(f); }
+void log_api(const char *fmt) { printf(fmt); }
+void use_lit(void) { log_lit("hello\n"); log_lit("bye\n"); }
+void use_wire(int fd) { char b[64]; recv(fd, b, 63, 0); b[63] = 0; log_mid(1, b); }
+void sp_name(const char *user) { char o[32]; sprintf(o, "user=%s", user); sink(o); }
+void sp_bounded(const char *user) { char o[32]; sprintf(o, "user=%.16s", user); sink(o); }
+void sp_wire(int fd) { char b[128]; char o[32]; recv(fd, b, 127, 0); b[127] = 0; sprintf(o, "%d:%s", 5, b); sink(o); }
+void ss_wire(int fd) { char b[128]; char n[16]; int x; recv(fd, b, 127, 0); b[127] = 0; sscanf(b, "%d %s", &x, n); sink(n); }
+void ss_width(int fd) { char b[128]; char n[16]; recv(fd, b, 127, 0); b[127] = 0; sscanf(b, "%15s", n); sink(n); }
+void sc_stdin(void) { char n[16]; scanf("%*d %[^\n]", n); sink(n); }
+void vs(char *d, const char *f, __builtin_va_list ap) { char o[16]; vsprintf(o, "%s", ap); sink(o); }
+"""
+
+
+@pytest.fixture(scope="module")
+def wrap_bins(tmp_path_factory):
+    return build_variants(tmp_path_factory, src_text=_WRAP_SRC, variants=_OPTS)
+
+
+@pytest.mark.parametrize("opt", ["O0", "O2"])
+def test_wrappers_judged_by_callers_and_unbounded_s(wrap_bins, opt):
+    s = ARM64FormatStringScanner.from_path_full(str(wrap_bins[opt]))
+    got = {s._syms.get(f.func_va): (f.callee, f.provenance, f.severity) for f in s.scan()}
+    assert got == {
+        "log_api": ("printf", "arg_passthrough", "LOW"),      # exported, no caller in binary
+        "log_any": ("printf", "tainted", "HIGH"),             # recv data via log_mid
+        "sp_name": ("sprintf", "unbounded_s", "MEDIUM"),
+        "sp_wire": ("sprintf", "unbounded_s", "HIGH"),
+        "ss_wire": ("sscanf", "unbounded_s", "HIGH"),
+        "sc_stdin": ("scanf", "unbounded_s", "HIGH"),
+        "vs": ("vsprintf", "unbounded_s", "MEDIUM"),
+    }                                                         # log_lit, sp_bounded, ss_width: silent
+
+
+def test_unbounded_conversions():
+    from ablation.analyzers.format_string_scanner_arm64 import unbounded_conversions as uc
+    assert uc("%d %s", "print") == [(1, "%s")]
+    assert uc("%.16s %*s %.*s %s", "print") == [(2, "%*s"), (5, "%s")]   # "*" consumes an arg
+    assert uc("100%% %ls", "print") == [(0, "%ls")]
+    assert uc("%d %s", "scan") == [(1, "%s")]
+    assert uc("%15s %*s %ms %[a-z] %3[^]x]", "scan") == [(2, "%[a-z]")]
+    assert uc("%[]x]", "scan") == [(0, "%[]x]")]
 
 
 def test_format_string_needs_context(fmt_bins):

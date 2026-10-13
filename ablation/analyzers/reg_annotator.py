@@ -84,7 +84,8 @@ class RegVal:
       copy   : copied from another register (value.str = source reg, chain = source's RegVal)
       ret    : return value from a call (value.str = callee name)
       zero   : explicitly zeroed (xor reg, reg)
-      mem    : loaded from memory (value.str = description)
+      mem    : loaded from memory (value.str = description); value.int = 1 marks a
+               stack address itself (add xD, sp, #k), not a load from it
       unknown: clobbered/untracked
     """
     kind: str
@@ -142,6 +143,14 @@ class RegVal:
     @staticmethod
     def mem(desc: str) -> "RegVal":
         return RegVal(kind='mem', str_val=desc)
+
+    @staticmethod
+    def stack_addr(desc: str) -> "RegVal":
+        return RegVal(kind='mem', int_val=1, str_val=desc)
+
+    @property
+    def is_stack_addr(self) -> bool:
+        return self.kind == 'mem' and self.int_val == 1
 
     @staticmethod
     def unknown() -> "RegVal":
