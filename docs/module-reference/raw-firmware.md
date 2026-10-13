@@ -79,13 +79,43 @@ symbols file act as call targets, as PLT names do in an ELF.
 
 ---
 
+## Loader hygiene (v2.87.0)
+
+- **Symbols files** (`raw_image.SYMBOL_FORMATS`, also in `--help`). Accepted formats:
+  - `VA name`, `name VA`, `name = VA`;
+  - `VA size name`;
+  - `nm` output (code types only);
+  - `readelf -sW` output (`FUNC` only);
+  - `VA file func line`. Here the VA can be anywhere inside the function, for example a
+    log-call site harvested from a logging helper's arguments. The name goes to the
+    function containing it (majority vote when sites disagree).
+
+  `ctx.raw["symbols_stats"]`, the summary and the CLI report `loaded N, attached M (k by
+  containing function), outside image X`. A file where no line parses is an error that lists
+  the formats. `attached 0` warns to check `--base`.
+- **Code ranges.** Inferred from exact `RET` / frame-push / PAC / BTI density in 4 KB
+  windows (Thumb: `bx lr` / `pop {pc}` with `push {lr}`). Each range ends at its last `RET`.
+  `--code-range LO-HI[,LO-HI]` overrides the inference. BL, ADRP, literal-pool and MOVW/MOVT
+  scans and function starts only use code ranges, so data words do not invent call sites.
+- **Entry filtering.** `ARM64FuncStartScanner(strict=True)` is used for raw images. A BL
+  target or prologue counts as a function start only if:
+  - the word before it ends the previous function (`ret` / `b` / `br` / `brk` / `udf` /
+    padding), or
+  - it opens with a landing pad or frame push.
+
+  A `bl` before it does not count, because every return site follows one. This stops
+  data-derived targets from splitting a 600-byte function into a 24-byte stub.
+- `--base` / `--symbols` / `--code-range` without `--raw` is an error.
+- `--sink-map sinks.json` (`{"0x419a44e0": "sprintf"}`, ELF or raw) and
+  `LibcRoleInferer` (see [libc-roles.md](libc-roles.md)) name sinks when no symbols exist.
+
 ## Limits
 
 - One region only. Images with code at several load addresses (e.g. code copied to RAM at
   boot) need one context per region.
-- Without a symbols file, nothing names `memcpy` / `recv`, so name-based sinks and sources
-  do not fire. Find them first (`SemanticSearcher`, `PatternLibrary`), then
-  `ctx.set_name(va, 'memcpy')`, or write a symbols file and rebuild.
+- Without a symbols file, `LibcRoleInferer` names the libc-shaped sinks (arm64). Sources
+  (`recv`, framework accessors) cannot be inferred: pass `--sources`. The engines warn when
+  no sink or source resolves.
 - An uncalled function with no prologue the scanner knows is not found (dead code,
   functions reached only through a table).
 - arm64 without `base`: base 0. ADRP-relative xrefs still resolve for any page-aligned base.

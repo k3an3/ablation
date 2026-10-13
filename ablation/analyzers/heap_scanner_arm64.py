@@ -59,6 +59,8 @@ _ALLOCS: Dict[str, Tuple[Tuple[str, ...], Optional[str]]] = {
 _FREES = frozenset({"free", "kfree", "vfree", "kvfree", "g_free", "kfree_sensitive",
                     "_ZdlPv", "_ZdaPv", "_ZdlPvm", "_ZdaPvm"})
 _STRLENS = frozenset({"strlen", "strnlen", "wcslen"})
+_CXX_NEW = frozenset({"_Znwm", "_Znam", "_ZnwmRKSt9nothrow_t", "_ZnamRKSt9nothrow_t",
+                      "_ZnwmSt11align_val_t", "_ZnamSt11align_val_t"})
 _STR_COPIES = frozenset({"strcpy", "strcat", "stpcpy", "sprintf", "vsprintf"})   # dst = x0
 # copy-like: callee -> (dst reg, length reg)
 _SIZED_COPIES: Dict[str, Tuple[str, str]] = {
@@ -254,6 +256,15 @@ class ARM64HeapScanner(ARM64TaintTracker):
                               "HIGH", region, flow.freed[region])
                 else:
                     flow.freed[region] = insn.address
+
+        # C++: an operator-new object handed to C++ code (constructor `this`, std::string /
+        # vector members) has its storage managed there (grown, re-allocated): no constant size
+        if callee not in _FREES and callee not in _ALLOCS:
+            for r in ARG_REGS:
+                region = self._region(st, r)
+                a = self._allocs.get(region or "")
+                if a is not None and (a.sym in _CXX_NEW or (callee or "").startswith("_Z")):
+                    self._grown.add(region)
 
         # freed pointer handed to any other call
         if callee not in _FREES:

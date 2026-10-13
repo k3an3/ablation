@@ -34,6 +34,10 @@ Task-to-tool lookup. For constructor patterns and key methods, see `docs/module-
 | "ARM32: find MUL before malloc without bounds check" | `ARM32IntOverflowScanner.from_context(ctx).scan()` |
 | "ARM64: find wire-controlled multiply feeding malloc / new / kmalloc" | `ARM64IntOverflowScanner.from_path_full(elf).scan()` (or `ablation overflow <bin>`) |
 | "ARM64: non-literal / attacker format strings in printf, syslog, err" | `ARM64FormatStringScanner.from_path_full(elf).scan()` (or `ablation fmtstr <bin>`) |
+| "Stripped / static / raw image: which function is memcpy, sprintf, sscanf?" | `LibcRoleInferer(ctx).infer()` (automatic in the CLI when no sink resolves; `--sink-map` to name by hand) |
+| "ARM64: length checked signed / masked / byte-wide but used wider" | `ARM64ConversionLengthScanner.from_context(ctx).scan()` (or `ablation lengths <bin> --libc musl`) |
+| "Taint through an embedded HTTP / MQTT framework (recv is too deep)" | `tracker.add_sources(['http_get_param', '0xVA:xN'])` (or `ablation taint --sources ... --summarise-opaque`) |
+| "Read a pointer table with relocations applied (ABS64 / RELATIVE / GLOB_DAT)" | `ctx.read_ptr(va)`; `ctx.reloc_stats` |
 | "ARM64: unbounded %s / %[ (sprintf, vsprintf, sscanf, scanf) into a stack buffer" | `ARM64FormatStringScanner.from_path_full(elf).scan()`: provenance `unbounded_s` |
 | "ARM64: len - header_size underflow reaching memcpy / parser call" | `ARM64LengthUnderflowScanner.from_path_full(elf).scan_unguarded()` |
 | "ARM64: use-after-free, double free, strlen off-by-one, heap overflow" | `ARM64HeapScanner.from_path_full(elf).scan()` (or `ablation heap <bin>`) |

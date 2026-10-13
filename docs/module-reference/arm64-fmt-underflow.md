@@ -36,6 +36,7 @@ covering tail calls and GOT calls.
 |---|---|
 | string literal / `.rodata` address | not reported |
 | `tainted` (register or pointee holds recv/read data) | HIGH |
+| `runtime_buffer`: format is a stack buffer (e.g. `sprintf`'d) or `std::string::c_str()` / `data()` | MEDIUM |
 | `stack_load`, `memory_load`, `call_result`, `register`, `unknown` | MEDIUM |
 | `unbounded_s` (see below) | HIGH / MEDIUM |
 

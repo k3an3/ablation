@@ -327,3 +327,48 @@ def test_cli_lengths(conv_bins):
     r = _cli("lengths", conv_bins["O2"], "--libc", "musl")
     assert "sext_signed_check" in r.stdout and "masked_check" in r.stdout
     assert "byte_counter_loop" in r.stdout
+
+
+# ── finding quality: runtime-built formats, C++ heap shapes ──────────────────
+
+_CXX_SRC = r'''
+typedef unsigned long size_t;
+extern int printf(const char *, ...);
+extern int sprintf(char *, const char *, ...);
+extern void *malloc(size_t);
+extern void free(void *);
+extern void use(void *);
+extern void *op_new(size_t) __asm__("_Znwm");
+extern void op_delete(void *) __asm__("_ZdlPv");
+extern void obj_ctor(void *) __asm__("_ZN3ObjC1Ev");
+extern void str_append(void *, const char *) __asm__("_ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE6appendEPKc");
+extern const char *str_c_str(void *) __asm__("_ZNKSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE5c_strEv");
+void fmt_runtime(const char *user) { char f[64]; sprintf(f, "%s:%%d", user); printf(f, 1); }
+void fmt_string(void *s) { printf(str_c_str(s)); }
+void fmt_lit(void) { printf("plain %d\n", 3); }
+int cxx_ctor(void) { char *b = op_new(16); obj_ctor(b); int r = b[24]; op_delete(b); return r; }
+int cxx_grow(void) { char *b = op_new(8); str_append(b, "x"); int r = b[12]; op_delete(b); return r; }
+int c_oob(void) { char *b = malloc(8); b[12] = 1; use(b); free(b); return 0; }
+'''
+
+
+@pytest.fixture(scope="module")
+def cxx_so(tmp_path_factory):
+    return build_variants(tmp_path_factory, src_text=_CXX_SRC, variants={"O2": ["-O2"]})["O2"]
+
+
+def test_runtime_format_buffers(cxx_so):
+    from ablation.analyzers.format_string_scanner_arm64 import ARM64FormatStringScanner
+    ctx = BinaryContext.load_or_build(str(cxx_so))
+    got = {ctx.name(f.func_va): (f.provenance, f.severity)
+           for f in ARM64FormatStringScanner.from_context(ctx).scan()}
+    assert got == {"fmt_runtime": ("runtime_buffer", "MEDIUM"),
+                   "fmt_string": ("runtime_buffer", "MEDIUM")}
+
+
+def test_cxx_objects_not_constant_size(cxx_so):
+    from ablation.analyzers.heap_scanner_arm64 import ARM64HeapScanner
+    ctx = BinaryContext.load_or_build(str(cxx_so))
+    got = {(ctx.name(f.func_va), f.kind) for f in
+           ARM64HeapScanner.from_context(ctx).scan(include_int_overflow=False)}
+    assert got == {("c_oob", "heap_overflow")}

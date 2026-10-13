@@ -196,6 +196,25 @@ for f in findings:
   `ret`s.
 - **Opt-in findings.** `TaintEngine(Policy(report_tainted_branch=True, report_bounded=True))`
   adds `tainted-branch-condition` and `bounded-tainted-*-address`.
+- **Framework sources.** A daemon that embeds its own HTTP / MQTT / RTSP server receives data
+  through the framework's accessors. The real `recv` is many frames below, past any `--depth`.
+  `tracker.add_sources(["http_get_param", "0x41a0c0:val", "http_read_body:x1"])` (CLI
+  `--sources`) makes them sources:
+  - `:ret` (the default) taints the result and what it points at;
+  - `:val` taints a scalar result;
+  - `:xN` fills the buffer at `xN`.
+  Names or addresses both work.
+- **Extra sinks.** `add_sinks(["log_write:x1", "0x41b000"])` (CLI `--sinks`).
+- **scanf family.** `sscanf` / `vsscanf` (+ `__isoc99_`) of attacker text is a MEDIUM finding
+  ("check %s width": `ablation fmtstr` shows which conversion is unbounded). Its stack
+  outputs carry the taint onwards, so `strcpy(t, field)` is HIGH.
+- **Header-field lengths.** A `read` / `recv` whose *length* argument is attacker data (a
+  parsed header field) is HIGH.
+- **Opaque calls.** `summarise_opaque = True` (CLI `--summarise-opaque`): a call with no model
+  that receives attacker data (value or pointee) taints its result. Example: `n = be16(pkt);
+  memcpy(d, s, n)`. Findings that depend only on such hops are one severity lower and noted
+  `via opaque call (lower confidence)`. Without it, taint that would need a callee's return
+  value stops silently.
 
 ```
 [CRITICAL] 0x104c4 (stack_buf): tainted {*x0} -> system @ 0x104ec (source: read)

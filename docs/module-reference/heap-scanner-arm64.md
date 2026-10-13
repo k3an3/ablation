@@ -62,6 +62,13 @@ alloc".
 `realloc` is unknown) has no constant size afterwards. Constant-offset accesses to it are not
 reported.
 
+**C++ objects.** Storage owned by C++ code has no constant size for the past-the-end check:
+- an `operator new` object passed to any call (a constructor's `this`), and
+- any object passed to a mangled (`_Z...`) callee such as `std::string` / vector members,
+  which may re-allocate it.
+
+This removes `_Znwm` noise from `std::string` / shared-pointer control blocks.
+
 ## Limits
 
 - Intraprocedural for UAF / double-free (like the x86 scanners): a pointer freed in a callee

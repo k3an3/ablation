@@ -11,6 +11,8 @@ including tail calls (`b printf`) and calls through a GOT slot:
   entry argument (x0..x7 at entry)     -> wrapper: judged by its callers (below)
   stack slot / memory load             -> MEDIUM  'stack_load' / 'memory_load'
   another call's return value          -> MEDIUM  'call_result'
+  a stack buffer / std::string c_str()  -> MEDIUM  'runtime_buffer' (format built at
+                                                    runtime, e.g. sprintf'd or a std::string)
   anything else                        -> MEDIUM  'register' / 'unknown'
 
 A format that is the function's own argument makes the function a printf wrapper; the
@@ -70,6 +72,8 @@ FMT_ARG: Dict[str, str] = {
     "log_printf": "x1", "debug_printf": "x0", "trace_printf": "x0",
 }
 _MAX_FUNC_BYTES = 4096
+# std::string / std::basic_string accessors (libstdc++ / libc++ mangled names)
+_STRING_ACCESSOR = __import__("re").compile(r"basic_string.*(c_str|data)|^_ZNKSs(5c_str|4data)Ev")
 
 
 def fmt_reg(name: str) -> Optional[str]:
@@ -394,6 +398,12 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
             return "register", "MEDIUM", f"format in {reg} is constant 0x{v.int_val:x} outside .rodata"
         if v.kind == "arg":
             return "arg_passthrough", "HIGH", f"format in {reg} is the caller's {v.display()}"
+        if getattr(v, "is_stack_addr", False):
+            return ("runtime_buffer", "MEDIUM",
+                    f"format in {reg} is a stack buffer {v.display()} built at runtime, not a literal")
+        if v.kind == "ret" and _STRING_ACCESSOR.search(v.str_val or ""):
+            return ("runtime_buffer", "MEDIUM",
+                    f"format in {reg} is a std::string's characters ({v.str_val}), built at runtime")
         if v.kind == "mem":
             if v.str_val.startswith(("sp", "x29")):
                 return "stack_load", "MEDIUM", f"format in {reg} loaded from stack [{v.str_val}]"

@@ -2,6 +2,50 @@
 
 ---
 
+## v2.87.0
+
+**Gaps from a multi-binary AArch64 firmware audit: sinks without imports, symbol dialects,
+framework taint sources, conversion-driven lengths, relocations, raw-image hygiene.**
+
+- **Sinks without imports.**
+  - `LibcRoleInferer` names memcpy / memset / strcpy / strlen by body shape, and printf /
+    sprintf / snprintf / sscanf / fprintf / `__fmt_x<k>` loggers by call-site arguments
+    (`ctx.roles`).
+  - CLI engines infer automatically on arm64 when no sink resolves (`--infer-sinks` /
+    `--no-infer-sinks`).
+  - They print `WARNING: 0 of N sink oracles resolved ... results are not meaningful` (and
+    the same for sources) instead of a silent "clean".
+  - `--sink-map sinks.json` / `ctx.apply_sink_map()`.
+- **`--symbols`.**
+  - Accepts `VA name`, `name VA`, `VA size name`, nm, `readelf -sW`, and `VA file func
+    line`. The last attaches names to the function containing the VA, for harvested
+    log-call sites.
+  - Reports `loaded N, attached M`.
+  - A file where no line parses is an error that lists the formats.
+- **Taint** (`ARM64TaintTracker`, CLI `taint` / `fmtstr` / `heap` / `overflow` / `lengths`):
+  - `--sources NAME|0xVA[:ret|:val|:xN]` for framework accessors, and `--sinks`.
+  - `sscanf` / `vsscanf` are sinks and propagate to their outputs.
+  - A `read` / `recv` with an attacker length is a finding.
+  - `--summarise-opaque` (lower-confidence findings through unmodelled calls).
+- **`ARM64ConversionLengthScanner`** (CLI `ablation lengths`): sign extension after a signed
+  check, masked check with a full-width use, byte loop counters, and narrow signed fields as
+  sizes. snprintf size findings follow `--libc` (musl rejects size > INT_MAX; glibc trusts
+  it), here and in `ARM64LengthUnderflowScanner`.
+- **Relocations.**
+  - `elf_relocations()` applies RELATIVE / IRELATIVE / ABS64 / GLOB_DAT / JUMP_SLOT.
+  - It is used by `image_regions()`, the new `ctx.read_ptr()`, `PointerSlots` and
+    `VtableResolver`. The resolver previously read ABS64-against-symbol tables as zeros.
+  - The summary prints `relocs: applied ...`.
+- **Raw images.**
+  - Code ranges are inferred, or set with `--code-range`; scans stay inside them.
+  - Strict function-entry filtering on arm64.
+  - `--base` / `--symbols` / `--code-range` without `--raw` is an error.
+- **Finding quality.**
+  - New `runtime_buffer` provenance for formats built at runtime (stack buffer, `std::string`).
+  - `operator new` objects handed to C++ code lose their constant size in the heap check.
+
+---
+
 ## v2.86.0
 
 **ARM64 format-string wrappers judged by callers; unbounded `%s` into stack buffers; heap
