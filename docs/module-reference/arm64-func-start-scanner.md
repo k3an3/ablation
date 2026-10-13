@@ -78,3 +78,15 @@ xrefs on real AArch64 binaries:
 - **String xrefs:** `adr`, `adrp`+`add`, and `adrp`+`ldr` through a pointer slot (RELATIVE/ABS64
   relocation or on-disk value). Completions may sit up to 16 instructions after the ADRP.
   The recorded site is the completing `add`/`ldr`.
+
+### PE (Windows) ARM64
+
+`BinaryContext` builds the same passes over PE executable sections:
+
+- **Function starts:** `.pdata` RUNTIME_FUNCTIONs plus `bl_targets()`, because leaf
+  functions may have no `.pdata` entry. The full scan is used when there is no `.pdata`.
+- **Imports:** MSVC import thunks (`adrp x16; ldr x16, [IAT]; br x16`) are named like PLT
+  stubs. Inline `ldr xT, [IAT]; blr xT` calls and `br xT` tail calls become call edges labelled
+  with the import name; ELF `-fno-plt` GOT calls go through the same pass.
+- **String xrefs:** the same ADRP pairing, with pointer slots read from disk.
+

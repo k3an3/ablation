@@ -62,6 +62,24 @@ def test_adrp_add_resolves_string():
     assert res.calls[0].args["x0"].str_val == "reboot"
 
 
+def test_adrp_page_is_not_a_string():
+    # a string sitting at a page start must not swallow the page: the following
+    # add / ldr resolve against the page constant
+    ra = ARM64RegAnnotator(_stub_binary(), {0x3000: "page-start", 0x3030: "target"}, dict(_PLT))
+    regs = {}
+    res = AnnotationResult(func_va=0x10000, func_end_va=0x10100)
+    for va, line in enumerate(["adrp x0, #0x3000", "add x0, x0, #0x30", "bl #0x10540"]):
+        mn, _, ops = line.partition(" ")
+        ra._step(make_insn(0x10000 + va * 4, mn, ops), regs, res)
+    assert res.calls[0].args["x0"].str_val == "target"
+
+
+def test_br_through_got_slot_is_tail_call():
+    page = _GOT_SLOT & ~0xFFF
+    res, _ = _run([f"adrp x1, #{page:#x}", f"ldr x1, [x1, #{_GOT_SLOT - page:#x}]", "br x1"])
+    assert [c.target_name for c in res.calls] == ["popen"]
+
+
 def test_movz_movk_chain():
     res, _ = _run(["mov x1, #0xabcd", "movk x1, #0x1234, lsl #16",
                    "movk x1, #0xc0de, lsl #32", "bl #0x10520"])

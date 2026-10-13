@@ -210,17 +210,39 @@ def _detect_arch(binary) -> str:
     return 'x86_64'
 
 
+def image_regions(binary) -> List[Tuple[int, bytes]]:
+    """[(va, bytes)] of everything mapped from the file: ELF LOAD segments, or PE
+    sections at imagebase + RVA. For readers that need code/data at a VA."""
+    out: List[Tuple[int, bytes]] = []
+    try:
+        if _LIEF_OK and isinstance(binary, lief.PE.Binary):
+            base = int(binary.optional_header.imagebase)
+            return [(base + int(s.virtual_address), bytes(s.content)) for s in binary.sections]
+        for seg in binary.segments:
+            if 'LOAD' in str(seg.type) and seg.physical_size:
+                out.append((int(seg.virtual_address), bytes(seg.content)))
+    except Exception:
+        pass
+    return out
+
+
+def _pe_machine_types():
+    """lief < 0.15: lief.PE.MACHINE_TYPES; lief >= 0.15: lief.PE.Header.MACHINE_TYPES."""
+    return getattr(lief.PE, "MACHINE_TYPES", None) or lief.PE.Header.MACHINE_TYPES
+
+
 def _detect_arch_pe(binary) -> str:
     """Detect arch from PE MACHINE_TYPES header field."""
     try:
+        mt = _pe_machine_types()
         m = binary.header.machine
-        if m == lief.PE.MACHINE_TYPES.AMD64:
+        if m == mt.AMD64:
             return 'x86_64'
-        if m == lief.PE.MACHINE_TYPES.I386:
+        if m == mt.I386:
             return 'x86_32'
-        if m == lief.PE.MACHINE_TYPES.ARM64:
+        if m == mt.ARM64:
             return 'arm64'
-        if m == lief.PE.MACHINE_TYPES.ARMNT:
+        if m == mt.ARMNT:
             return 'arm32'
     except Exception:
         pass
@@ -1032,7 +1054,7 @@ class BinaryContext:
 
         self.call_edges = edges
 
-    def _build_call_graph_arm64(self, data: bytes, binary) -> None:
+    def _build_call_graph_arm64(self, data: bytes, binary, regions=None, slot_name=None) -> None:
         """AArch64 call graph via numpy BL / B scan over executable sections.
 
         BL imm26 : (w & 0xFC000000) == 0x94000000
@@ -1042,15 +1064,23 @@ class BinaryContext:
         BL edges keep any target that is a PLT stub or function start. B edges are
         kept only when they leave the owning function, so in-function branches that
         happen to hit a function start (loop back to entry) are not reported.
+
+        Calls through an import pointer slot (ELF -fno-plt GOT, PE IAT) are added by
+        _a64_import_call_edges. regions / slot_name default to the ELF layout and
+        GOT symbol resolver; the PE path passes its own.
         """
         from ablation.analyzers.arm64_func_start_scanner import code_regions
 
+        if regions is None:
+            regions = code_regions(binary)
+        if slot_name is None:
+            slot_name = PointerSlots(binary).symbol
         plt_arr  = _va_arr_to_i64(sorted(self.plt.keys())) if self.plt         else np.empty(0, np.int64)
         func_arr = _va_arr_to_i64(self.func_starts)         if self.func_starts else np.empty(0, np.int64)
         va_to_export: Dict[int, str] = {va: nm for nm, va in self.exports.items()}
         edges: List[Tuple[int, int, str]] = []
 
-        for sec_va, sec_data in code_regions(binary):
+        for sec_va, sec_data in regions:
             n = len(sec_data) // 4
             if n == 0:
                 continue
@@ -1089,7 +1119,59 @@ class BinaryContext:
                 label = self.plt.get(target_va, "") or va_to_export.get(target_va, "")
                 edges.append((int(owner_va) & 0xFFFFFFFFFFFFFFFF, target_va, label))
 
+        edges.extend(self._a64_import_call_edges(regions, slot_name))
         self.call_edges = edges
+
+    def _a64_import_call_edges(self, regions, slot_name) -> List[Tuple[int, int, str]]:
+        """Calls through an import pointer slot: adrp xB ; ldr xT, [xB, #o] ; blr|br xT.
+
+        Covers ELF -fno-plt GOT calls and PE/MSVC inline import calls (`blr x8` on an
+        IAT slot) and import tail calls (`br x1`). The edge target is the slot VA and
+        the label is the import name, so callers_of(name) finds the caller. Within
+        _A64_ADRP_WINDOW words; a pending xT is dropped when xT is rewritten.
+        """
+        edges: List[Tuple[int, int, str]] = []
+        window = self._A64_ADRP_WINDOW
+        for sec_va, sec_data in regions:
+            n = len(sec_data) // 4
+            if n == 0:
+                continue
+            words = struct.unpack_from(f"<{n}I", sec_data, 0)
+            for i, w in enumerate(words):
+                if (w & 0x9F000000) != 0x90000000:                    # ADRP
+                    continue
+                if sec_va + i * 4 in self.plt:                          # import thunk itself
+                    continue
+                base = w & 0x1F
+                page = _a64_adrp_page(w, sec_va + i * 4)
+                pending: Dict[int, Tuple[int, str]] = {}                 # xT -> (slot, name)
+                for j in range(i + 1, min(i + 1 + window, n)):
+                    x = words[j]
+                    rd, rn = x & 0x1F, (x >> 5) & 0x1F
+                    if (x & 0xFFFFFC1F) in (0xD63F0000, 0xD61F0000) and rn in pending:   # BLR / BR
+                        slot, name = pending.pop(rn)
+                        site = sec_va + j * 4
+                        edges.append((self.func_containing(site) or site, slot, name))
+                        if (x & 0xFFFFFC1F) == 0xD61F0000:
+                            break
+                        continue
+                    if (x & 0xFFC00000) == 0xF9400000 and rn == base:    # LDR Xt, [xB, #imm*8]
+                        slot = (page + ((x >> 10) & 0xFFF) * 8) & 0xFFFFFFFFFFFFFFFF
+                        name = slot_name(slot)
+                        if name:
+                            pending[rd] = (slot, name)
+                        else:
+                            pending.pop(rd, None)
+                        if rd == base:
+                            base = -1                                   # base overwritten
+                        continue
+                    pending.pop(rd, None)                               # any other write
+                    if ((x & 0xFC000000) in (0x14000000, 0x94000000)
+                            or (x & 0xFFFFFC1F) == 0xD65F0000):         # B / BL / RET
+                        break
+                    if rd == base and (x & 0x1F000000) == 0x10000000:   # base re-ADRP'd
+                        base = -1
+        return edges
 
     def _build_call_graph_sequential(self, data: bytes, binary) -> None:
         """Sequential capstone fallback for _build_call_graph (NumPy unavailable)."""
@@ -1210,7 +1292,7 @@ class BinaryContext:
     # ADRP base register stays live for at most this many following instructions.
     _A64_ADRP_WINDOW = 16
 
-    def _build_string_xref_index_arm64(self, data: bytes, binary) -> None:
+    def _build_string_xref_index_arm64(self, data: bytes, binary, regions=None, slot_ptr=None) -> None:
         """AArch64 string xref via ADRP page + low-12 completion.
 
         Forms resolved (site recorded = the instruction that completes the address):
@@ -1227,7 +1309,10 @@ class BinaryContext:
         if not self.strings:
             return
         strings = self.strings
-        slots = PointerSlots(binary)
+        if regions is None:
+            regions = code_regions(binary)
+        if slot_ptr is None:
+            slot_ptr = PointerSlots(binary).ptr
 
         str_xref: Dict[int, List[int]] = {}
         func_str: Dict[int, List[int]] = {}
@@ -1240,7 +1325,7 @@ class BinaryContext:
             func_str.setdefault(fva, []).append(sva)
 
         window = self._A64_ADRP_WINDOW
-        for sec_va, sec_data in code_regions(binary):
+        for sec_va, sec_data in regions:
             n = len(sec_data) // 4
             if n == 0:
                 continue
@@ -1269,7 +1354,7 @@ class BinaryContext:
                         if rd == base:
                             break
                     elif (x & 0xFFC00000) == 0xF9400000 and rn == base:  # LDR Xt, [Xb, #imm*8]
-                        ptr = slots.ptr(page + ((x >> 10) & 0xFFF) * 8)
+                        ptr = slot_ptr(page + ((x >> 10) & 0xFFF) * 8)
                         if ptr is not None and ptr in strings:
                             _record(ptr, sec_va + j * 4)
                         if rd == base:
@@ -1963,14 +2048,94 @@ class BinaryContext:
                 continue
             _extract_strings_into(bytes(sec.content), base + sec.virtual_address, self.strings)
 
+    # ── PE helpers ─────────────────────────────────────────────────────────────
+
+    def _pe_code_regions(self, binary) -> List[Tuple[int, bytes]]:
+        """[(absolute_va, bytes)] for executable PE sections."""
+        out: List[Tuple[int, bytes]] = []
+        try:
+            for sec in binary.sections:
+                if sec.characteristics & 0x20000000:            # IMAGE_SCN_MEM_EXECUTE
+                    out.append((self.base_va + int(sec.virtual_address), bytes(sec.content)))
+        except Exception:
+            pass
+        return out
+
+    def _pe_read(self, binary, va: int, size: int) -> Optional[bytes]:
+        rva = va - self.base_va
+        try:
+            for sec in binary.sections:
+                off = rva - int(sec.virtual_address)
+                if 0 <= off and off + size <= len(sec.content):
+                    return bytes(sec.content)[off: off + size]
+        except Exception:
+            pass
+        return None
+
+    def _pdata_starts(self, binary) -> Set[int]:
+        """Function starts from the exception directory (.pdata RUNTIME_FUNCTIONs).
+
+        x64: 12-byte {Begin, End, UnwindInfo}; ARM64 / ARMNT: 8-byte {Begin, Unwind}.
+        Every function that needs unwinding (all non-leaf code) has an entry, so this
+        plays the role .eh_frame plays for ELF.
+        """
+        starts: Set[int] = set()
+        try:
+            d = next(d for d in binary.data_directories
+                     if 'EXCEPTION' in str(d.type) and d.size)
+        except StopIteration:
+            return starts
+        raw = self._pe_read(binary, self.base_va + int(d.rva), int(d.size)) or b""
+        step = 12 if self.arch == 'x86_64' else 8
+        for off in range(0, len(raw) - step + 1, step):
+            begin = struct.unpack_from("<I", raw, off)[0]
+            if begin:
+                starts.add(self.base_va + (begin & ~1 if self.arch == 'arm32' else begin))
+        return starts
+
+    def _extract_pe_arm64_thunks(self, regions) -> None:
+        """Name MSVC import thunks `adrp x16, P ; ldr x16, [x16, #o] ; br x16` like PLT stubs.
+
+        self.plt holds IAT slot VAs at this point; a thunk whose slot is an IAT entry
+        gets the import's name, so `bl thunk` edges are labelled.
+        """
+        iat = dict(self.plt)
+        for sec_va, sec_data in regions:
+            n = len(sec_data) // 4
+            words = struct.unpack_from(f"<{n}I", sec_data, 0)
+            for i in range(n - 2):
+                w0, w1, w2 = words[i], words[i + 1], words[i + 2]
+                if (w0 & 0x9F000000) != 0x90000000:
+                    continue
+                b = w0 & 0x1F
+                if (w1 & 0xFFC003E0) != (0xF9400000 | b << 5):          # ldr xT, [xB, #imm]
+                    continue
+                t = w1 & 0x1F
+                if w2 != (0xD61F0000 | t << 5):                          # br xT
+                    continue
+                va = sec_va + i * 4
+                slot = _a64_adrp_page(w0, va) + ((w1 >> 10) & 0xFFF) * 8
+                if slot in iat:
+                    self.plt[va] = iat[slot]
+
     def _extract_func_starts_pe(self, binary) -> None:
-        """Function starts: exported VAs + prologue scan on executable sections."""
+        """Function starts: exports + .pdata, then a prologue scan (x86) or, for arm64
+        without .pdata, ARM64FuncStartScanner."""
         starts: Set[int] = set()
         base = self.base_va
 
         for va in self.exports.values():
             if va:
                 starts.add(va)
+        pdata = self._pdata_starts(binary)
+        starts |= pdata
+        if self.arch == 'arm64':
+            from ablation.analyzers.arm64_func_start_scanner import ARM64FuncStartScanner
+            regions = self._pe_code_regions(binary)
+            scanner = ARM64FuncStartScanner(regions)
+            # ARM64 leaf functions may have no .pdata entry; BL targets recover them
+            starts.update(scanner.bl_targets() if pdata else scanner.scan())
+            self._extract_pe_arm64_thunks(regions)
 
         _PROLOGUES: Dict[str, List[bytes]] = {
             'x86_64': [
@@ -2008,7 +2173,13 @@ class BinaryContext:
         self.func_starts = sorted(starts)
 
     def _build_call_graph_pe(self, data: bytes, binary) -> None:
-        """Call graph for PE x86_64/x86_32: vectorized 0xe8 scan on executable sections."""
+        """Call graph for PE: vectorized 0xe8 scan (x86_64/x86_32) or BL/B + IAT-call
+        scan (arm64) on executable sections."""
+        if self.arch == 'arm64':
+            if _NUMPY_OK:
+                self._build_call_graph_arm64(data, binary, regions=self._pe_code_regions(binary),
+                                             slot_name=self.plt.get)
+            return
         if self.arch not in ('x86_64', 'x86_32'):
             return
         if not _NUMPY_OK:
@@ -2109,11 +2280,19 @@ class BinaryContext:
         self.call_edges = edges
 
     def _build_string_xref_index_pe(self, data: bytes, binary) -> None:
-        """String xref for PE: RIP-relative scan (x86_64) or absolute scan (x86_32)."""
+        """String xref for PE: RIP-relative scan (x86_64), absolute scan (x86_32),
+        ADRP pairing (arm64)."""
         if not self.strings:
             return
         if self.arch == 'x86_32':
             self._build_string_xref_index_pe_x86_32(data, binary)
+            return
+        if self.arch == 'arm64':
+            def _slot_ptr(slot: int) -> Optional[int]:
+                raw = self._pe_read(binary, slot, 8)     # on-disk VA at preferred base
+                return struct.unpack("<Q", raw)[0] if raw and len(raw) == 8 else None
+            self._build_string_xref_index_arm64(data, binary, regions=self._pe_code_regions(binary),
+                                                slot_ptr=_slot_ptr)
             return
         if not _NUMPY_OK or self.arch != 'x86_64':
             return
@@ -2247,7 +2426,7 @@ class BinaryContext:
 
     def _save_json(self, path: Path) -> None:
         payload = {
-            "cache_version": 3,
+            "cache_version": 4,
             "path": self.path,
             "sha256": self.sha256,
             "base_va": self.base_va,
@@ -2268,8 +2447,10 @@ class BinaryContext:
         payload = json.loads(path.read_text())
         if payload.get("cache_version", 1) < 2:
             raise ValueError("stale cache: cache_version < 2 (pre-multi-r2); rebuild required")
-        if payload.get("arch") == "arm64" and payload["cache_version"] < 3:
-            raise ValueError("stale cache: arm64 built before native AArch64 PLT/BL/ADRP paths")
+        if payload["cache_version"] < 4:
+            # v3 and older: PE arch read as x86_64 for every machine (lief enum moved),
+            # no PE arm64 paths, no GOT/IAT-indirect call edges
+            raise ValueError("stale cache: built before PE machine detection fix; rebuild required")
         ctx = cls()
         ctx.path = orig_path or payload.get("path", "")
         ctx.sha256 = payload["sha256"]

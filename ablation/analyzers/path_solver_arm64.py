@@ -144,16 +144,16 @@ class ARM64PathSolver(PathSolver):
             idx = bisect.bisect_right(ctx.func_starts, func_va)
             nxt = ctx.func_starts[idx] if idx < len(ctx.func_starts) else func_va + max_bytes
             func_end_va = min(nxt, func_va + max_bytes)
+        from .binary_context import image_regions
         binary = lief.parse(Path(ctx.path).read_bytes())
         code = b""
-        for seg in binary.segments:
-            sva = int(seg.virtual_address)
+        for sva, data in image_regions(binary):         # ELF LOAD segments / PE sections
             off = func_va - sva
-            if 'LOAD' in str(seg.type) and 0 <= off < seg.physical_size:
-                code = bytes(seg.content)[off: off + (func_end_va - func_va)]
+            if 0 <= off < len(data):
+                code = data[off: off + (func_end_va - func_va)]
                 break
         if not code:
-            raise ValueError(f"0x{func_va:x} is not in a LOAD segment of {ctx.path}")
+            raise ValueError(f"0x{func_va:x} is not mapped from {ctx.path}")
         arch = getattr(capstone, 'CS_ARCH_AARCH64', None) or getattr(capstone, 'CS_ARCH_ARM64')
         md = capstone.Cs(arch, capstone.CS_MODE_ARM)
         md.skipdata = True

@@ -153,14 +153,14 @@ def test_eh_frame_starts_match_symbols(fixtures):
 
 
 def test_stale_arm64_cache_rejected(fixtures, tmp_path):
-    """v2 arm64 caches were built by the x86 fallback paths and must rebuild."""
+    """Caches older than v4 (wrong PE arch, missing arm64 paths) must rebuild."""
     import json
     ctx = BinaryContext.build(str(fixtures["plain"]))
     cache = tmp_path / "c.json"
     ctx._save_json(cache)
     assert BinaryContext._load_json(cache, "").plt == ctx.plt
     payload = json.loads(cache.read_text())
-    payload["cache_version"] = 2
+    payload["cache_version"] = 3
     cache.write_text(json.dumps(payload))
     with pytest.raises(ValueError):
         BinaryContext._load_json(cache, "")

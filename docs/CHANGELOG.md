@@ -2,6 +2,34 @@
 
 ---
 
+## v2.80.0
+
+**PE (Windows) ARM64 in BinaryContext; PE machine detection fix; GOT/IAT-indirect call edges.**
+
+PE ARM64 binaries got no call graph and no string xrefs. Worse, every PE was labelled
+`x86_64`: `_detect_arch_pe` compared against `lief.PE.MACHINE_TYPES`, which lief >= 0.15 moved
+to `lief.PE.Header.MACHINE_TYPES`, and the exception was swallowed. 32-bit x86 PEs therefore
+got x86_64 prologue patterns and the RIP-relative xref scan.
+
+- PE machine detection works on lief 0.14 and 1.x. The same enum lookup crashed outright
+  (`AttributeError`) in `cfg_bypass_detector`, `rpc_server_analyzer`, `seh_chain_analyzer`,
+  `windows_pool_taint_tracker`, `com_attack_surface_mapper` and `etw_provider_extractor`;
+  all fixed.
+- PE function starts include `.pdata` RUNTIME_FUNCTIONs (x64 12-byte, ARM64/ARMNT 8-byte
+  entries). ARM64 adds BL targets for leaf functions.
+- PE ARM64 call graph: BL/B scan plus MSVC import thunks named like PLT stubs, inline
+  `ldr xT, [IAT]; blr xT` calls, and `br xT` import tail calls. `callers_of('system')` works.
+- PE ARM64 string xrefs: ADRP+ADD / ADRP+LDR / ADR over PE sections.
+- ELF arm64: calls through a GOT slot (`-fno-plt` shape) are now call-graph edges (shared pass).
+- `ARM64RegAnnotator` / `FuncProfiler` / `ARM64PathSolver.from_context` read PE images
+  (`image_regions()`); IAT slots resolve to import names; `br xN` through an import is a tail call.
+- Fix: `ARM64RegAnnotator` turned an `adrp` page into a string when a string started at that
+  page, losing the following `add`/`ldr` (wrong args and missed GOT/IAT calls; ELF too). The
+  pass also stops at PLT stubs / import thunks.
+- `cache_version` 4: older caches are rebuilt (wrong PE arch, missing edges).
+
+---
+
 ## v2.79.0
 
 **ARM64TaintTracker — pointer spills, alias classes, return-address copies; buffer sources.**

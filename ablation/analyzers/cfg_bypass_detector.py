@@ -295,7 +295,7 @@ class CFGBypassDetector:
         """Count indirect call/jmp-through-register sites in all code sections."""
         if not _CS_OK:
             return 0
-        cs_mode = capstone.CS_MODE_64 if self._pe.header.machine == lief.PE.MACHINE_TYPES.AMD64 else capstone.CS_MODE_32
+        cs_mode = capstone.CS_MODE_64 if self._pe.header.machine == (getattr(lief.PE, "MACHINE_TYPES", None) or lief.PE.Header.MACHINE_TYPES).AMD64 else capstone.CS_MODE_32
         md = capstone.Cs(capstone.CS_ARCH_X86, cs_mode)
         md.detail = True
         imagebase = self._pe.optional_header.imagebase

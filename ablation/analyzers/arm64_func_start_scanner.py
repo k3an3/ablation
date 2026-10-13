@@ -164,6 +164,21 @@ class ARM64FuncStartScanner:
         res.starts = sorted(self._fold_landing_pads(starts))
         return res
 
+    def bl_targets(self) -> List[int]:
+        """Sorted BL targets that land inside the scanned code (the most precise signal)."""
+        ranges = [(va, va + len(data)) for va, data in self._regions]
+        out: Set[int] = set()
+        for va, data in self._regions:
+            for i, w in enumerate(self._words(data)):
+                if (w & _BL_MASK) == _BL:
+                    imm26 = w & 0x3FFFFFF
+                    if imm26 & 0x2000000:
+                        imm26 -= 0x4000000
+                    t = va + i * 4 + imm26 * 4
+                    if any(lo <= t < hi for lo, hi in ranges):
+                        out.add(t)
+        return sorted(out)
+
     def report(self, result: Optional[ScanResult] = None) -> str:
         return (result or self.scan_full()).report()
 

@@ -20,6 +20,7 @@ Calls recorded:
                        (-fno-plt: adrp+ldr GOT, blr) or a known function VA
   b    target          tail call: target is a PLT stub, a known function start,
                        or outside [func_va, func_end_va)
+  br   xN              tail call when xN holds a known import / function
 
 After a call x0 = ret(callee) and the rest of the AAPCS64 caller-saved set
 (x1-x17, x30) is unknown; x19-x28 survive. Linear pass only: branches and
@@ -32,7 +33,7 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from .binary_context import BinaryContext, PointerSlots
+from .binary_context import BinaryContext, PointerSlots, image_regions
 from .insn_arm64 import Imm, Insn, Reg, make_insn
 from .isa_arm64 import ARG_REGS, CALLER_SAVED
 from .reg_annotator import AnnotationResult, CallSite, RegVal
@@ -83,13 +84,9 @@ class ARM64RegAnnotator:
         self._exports_by_va: Dict[int, str] = {va: n for n, va in (exports or {}).items()}
         self._slots = PointerSlots(binary)
         self._md = _capstone_a64()
-        self._segs: List[Tuple[int, bytes]] = []
-        try:
-            for seg in binary.segments:
-                if 'LOAD' in str(seg.type) and seg.physical_size:
-                    self._segs.append((int(seg.virtual_address), bytes(seg.content)))
-        except Exception:
-            pass
+        self._segs: List[Tuple[int, bytes]] = image_regions(binary)
+        # PE: self._plt holds IAT slot VAs (-> import name); slots hold on-disk VAs
+        self._is_pe = _LIEF_OK and isinstance(binary, lief.PE.Binary)
 
     @classmethod
     def from_context(cls, ctx: BinaryContext) -> "ARM64RegAnnotator":
@@ -136,6 +133,8 @@ class ARM64RegAnnotator:
         for ci in self._md.disasm(code, func_va):
             if ci.address >= func_end_va:
                 break
+            if ci.address in self._plt and ci.address != func_va:
+                break       # ran into a PLT stub / import thunk: past the function's end
             insn = make_insn(ci.address, ci.mnemonic, ci.op_str, size=ci.size)
             self._step(insn, regs, result)
         return result
@@ -163,6 +162,15 @@ class ARM64RegAnnotator:
             self._call(insn.address, target, regs, result, name=name)
             return
 
+        if mn == 'br' or mn.startswith('bra'):
+            # tail call through a register: record it when the target is known
+            # (import pointer from a GOT / IAT slot, or a function / PLT VA)
+            r = insn.reg(0)
+            target, name = self._indirect_target(regs.get(r.name) if r else None)
+            if name:
+                self._call(insn.address, target, regs, result, name=name)
+            return
+
         if mn == 'b':
             target = insn.imm(0)
             if target is not None and (
@@ -180,7 +188,12 @@ class ARM64RegAnnotator:
         rd = ops[0]
         val: Optional[RegVal] = None
 
-        if mn == 'adrp' or mn == 'adr':
+        if mn == 'adrp':
+            # a page base, not a pointer: a string that happens to start the page is
+            # resolved by the completing add / ldr, which needs the constant
+            v = insn.imm(1)
+            val = RegVal.const(v & _MASK64) if v is not None else RegVal.unknown()
+        elif mn == 'adr':
             val = self._addr_val(insn.imm(1))
 
         elif mn in ('mov', 'movz', 'movn') and len(ops) >= 2:
@@ -271,10 +284,16 @@ class ARM64RegAnnotator:
         if (insn.mnemonic == 'ldr' and mem.index is None and base_val is not None
                 and base_val.kind == 'const' and insn.reg(0) and insn.reg(0).bits == 64):
             slot = (base_val.int_val + off) & _MASK64
-            ptr = self._slots.ptr(slot)
+            if self._is_pe:
+                if slot in self._plt:                       # IAT entry
+                    return RegVal.mem(f"&{self._plt[slot]}")
+                raw = self._read(slot, 8)
+                ptr = int.from_bytes(raw, 'little') if len(raw) == 8 else None
+            else:
+                ptr = self._slots.ptr(slot)
             if ptr is not None:
                 return self._const_or_string(ptr)
-            sym = self._slots.symbol(slot)
+            sym = None if self._is_pe else self._slots.symbol(slot)
             if sym:
                 return RegVal.mem(f"&{sym}")
             return RegVal.mem(f"0x{slot:x}")

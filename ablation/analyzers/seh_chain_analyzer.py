@@ -92,7 +92,7 @@ class SEHChainAnalyzer:
         if pe is None or not isinstance(pe, lief.PE.Binary):
             raise ValueError(f"SEHChainAnalyzer: not a PE binary: {path}")
         header = pe.header
-        if header.machine != lief.PE.MACHINE_TYPES.I386:
+        if header.machine != (getattr(lief.PE, "MACHINE_TYPES", None) or lief.PE.Header.MACHINE_TYPES).I386:
             raise ValueError(
                 f"SEHChainAnalyzer: x86 (I386) PE required, got {header.machine.name}. "
                 "x64 PE uses table-based EH (.pdata); SafeSEH analysis does not apply."

@@ -106,7 +106,7 @@ class ETWProviderExtractor:
         self._raw = raw
         self._imagebase = pe.optional_header.imagebase
         self._iat: dict[str, int] = {}   # function_name → IAT VA
-        self._arch = 64 if pe.header.machine == lief.PE.MACHINE_TYPES.AMD64 else 32
+        self._arch = 64 if pe.header.machine == (getattr(lief.PE, "MACHINE_TYPES", None) or lief.PE.Header.MACHINE_TYPES).AMD64 else 32
         self._build_iat()
         self._providers: Optional[list[ETWProvider]] = None
 

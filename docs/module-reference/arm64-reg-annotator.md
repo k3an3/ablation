@@ -44,6 +44,7 @@ One linear pass per function (no branch or loop following), with AAPCS64 state:
 | `bl T` | call: PLT name, export name, or hex |
 | `blr xN` | call: named from an import GOT slot or a known function VA, else `blr xN` |
 | `b T` | tail call when T is a PLT stub, another function start, or outside the window |
+| `br xN` | tail call when xN holds a known import (GOT / IAT slot) or function VA |
 
 After each call `x0 = ret(callee)`, the rest of the caller-saved set (`x1..x17`, `x30`) is
 unknown, and `x19..x28` survive. That is how `mov x19, x1; bl ioctl; mov x0, x19;
@@ -76,6 +77,10 @@ Measured on a stripped 7.2k-function AArch64 `.so`: all functions profiled in 12
 (~1.7 ms per function), with no failures.
 
 ---
+
+Works on PE (Windows) ARM64 too: IAT slots resolve to import names, and code is read through
+PE sections. The pass stops at a PLT stub or import thunk, so a window that runs past the end
+of the last function does not pick up stub branches.
 
 ## Limits
 
