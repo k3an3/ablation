@@ -180,8 +180,13 @@ class ARM64RegAnnotator:
                 self._call(insn.address, target & _MASK64, regs, result)
             return
 
+        if mn.startswith('st') and mn not in ('stxr', 'stlxr', 'stxp', 'stlxp'):
+            self._store(insn, regs)
+            self._writeback(insn, regs)
+            return
+
         if mn.startswith(_NO_DEST) or not ops or not isinstance(ops[0], Reg):
-            # stores / compares / branches: only a writeback base can change
+            # compares / branches: only a writeback base can change
             self._writeback(insn, regs)
             return
 
@@ -231,9 +236,17 @@ class ARM64RegAnnotator:
         elif mn.startswith('ld'):
             val = self._load(insn, regs)
             if mn.startswith('ldp') and len(ops) >= 2 and isinstance(ops[1], Reg):
-                regs[ops[1].name] = RegVal.unknown()
+                pair = self._frame_slot(insn.first_mem())
+                if pair is not None and mn == 'ldp' and rd.bits == 64:
+                    base, off = pair
+                    val = regs.get(('slot', base, off), RegVal.unknown())
+                    regs[ops[1].name] = regs.get(('slot', base, off + 8), RegVal.unknown())
+                else:
+                    regs[ops[1].name] = RegVal.unknown()
             self._writeback(insn, regs)
 
+        if rd.name in ('sp', 'x29'):
+            self._drop_slots(regs, rd.name)      # frame moved: offsets no longer match
         if rd.name in ('sp', 'xzr'):
             return
         if val is None:
@@ -279,6 +292,12 @@ class ARM64RegAnnotator:
                     return self._const_or_string(int.from_bytes(raw, 'little'))
             return RegVal.unknown()
 
+        loc = self._frame_slot(mem)
+        if loc is not None and insn.mnemonic in ('ldr', 'ldur') and insn.reg(0) and insn.reg(0).bits == 64:
+            v = regs.get(('slot',) + loc)
+            if v is not None:
+                return v                                 # reload of a spilled value
+
         base_val = regs.get(mem.base)
         off = mem.offset if mem.writeback != 'post' else 0
         if (insn.mnemonic == 'ldr' and mem.index is None and base_val is not None
@@ -307,8 +326,39 @@ class ARM64RegAnnotator:
 
     def _writeback(self, insn: Insn, regs: Dict[str, RegVal]) -> None:
         mem = insn.first_mem()
-        if mem is not None and mem.writeback and mem.base not in ('sp', 'x29'):
-            regs[mem.base] = RegVal.unknown()
+        if mem is not None and mem.writeback:
+            if mem.base in ('sp', 'x29'):
+                self._drop_slots(regs, mem.base)
+            else:
+                regs[mem.base] = RegVal.unknown()
+
+    # ---- stack slots (-O0 spills) ---------------------------------------------
+
+    @staticmethod
+    def _frame_slot(mem) -> Optional[Tuple[str, int]]:
+        """(base, offset) for a plain [sp|x29, #off] access, else None."""
+        if mem is None or mem.base not in ('sp', 'x29') or mem.index is not None or mem.writeback:
+            return None
+        return mem.base, mem.offset
+
+    @staticmethod
+    def _drop_slots(regs: Dict, base: str) -> None:
+        for k in [k for k in regs if isinstance(k, tuple) and k[1] == base]:
+            del regs[k]
+
+    def _store(self, insn: Insn, regs: Dict) -> None:
+        """A 64-bit store to a frame slot records the value; narrower stores drop it."""
+        loc = self._frame_slot(insn.first_mem())
+        if loc is None:
+            return
+        base, off = loc
+        srcs = [o for o in insn.ops if isinstance(o, Reg)]
+        for k, r in enumerate(srcs[:2] if insn.mnemonic.startswith('stp') else srcs[:1]):
+            key = ('slot', base, off + k * (r.bits // 8))
+            if r.bits == 64 and insn.mnemonic in ('str', 'stur', 'stp'):
+                regs[key] = self._reg_val(r, regs)
+            else:
+                regs.pop(key, None)
 
     def _indirect_target(self, v: Optional[RegVal]) -> Tuple[int, str]:
         if v is None:

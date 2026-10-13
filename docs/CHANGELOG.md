@@ -2,6 +2,28 @@
 
 ---
 
+## v2.82.0
+
+**ARM64FormatStringScanner, ARM64LengthUnderflowScanner; ARM64TaggingScanner base.**
+
+ARM64 ports of the x86-only `FormatStringScanner` and `LengthUnderflowScanner`, built on the
+ARM64 taint pass, so they also know whether the value is attacker data.
+
+- `ARM64FormatStringScanner`: `FmtStringFinding` output. Provenance comes from
+  `ARM64RegAnnotator` (literal / entry argument / stack or memory load / call result). Formats
+  holding recv/read bytes are HIGH `tainted`. Covers printf, syslog, err/warn, `__*_chk`,
+  printk. `ablation fmtstr` dispatches on arch.
+- `ARM64LengthUnderflowScanner`: `attacker_len - N` (4..256) reaching a call argument; HIGH
+  for copy/read lengths; records `uxth` / `and #0xffff` truncation; flags guarded checks.
+- `ARM64TaggingScanner` (`arm64_tag_scanner.py`): the shared tag/guard base, now also used
+  by `ARM64IntOverflowScanner`. A flag-setting compare counts as a guard only when its flags
+  are consumed (clang `-O0` emits `subs` whose flags nothing reads).
+- `ARM64RegAnnotator`: 64-bit stack spills and reloads (`[sp|x29, #k]`) keep the value's
+  provenance, so `-O0` code reports `arg0_entry` instead of a stack load. Dropped when
+  `sp`/`x29` move.
+
+---
+
 ## v2.81.0
 
 **ARM64IntOverflowScanner — wire-controlled multiply feeding an allocation size.**

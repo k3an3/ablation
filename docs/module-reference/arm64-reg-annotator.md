@@ -85,4 +85,5 @@ of the last function does not pick up stub branches.
 ## Limits
 
 - Linear pass: values set on only one side of a branch can be wrong at a join.
-- No stack-slot tracking: a value spilled with `str` and reloaded is reported as `mem`.
+- Stack slots: 64-bit `str`/`stp` to `[sp|x29, #k]` and a matching reload carry the value
+  (so `-O0` argument spills keep their provenance); any `sp`/`x29` change drops them.

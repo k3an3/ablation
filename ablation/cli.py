@@ -587,10 +587,16 @@ v1.9.1 (2026-09-24)  see CHANGELOG.md for earlier entries
 
 
 def cmd_fmtstr(args):
+    from ablation.analyzers.binary_context import BinaryContext
     from ablation.analyzers.format_string_scanner import FormatStringScanner
 
     p = str(_require_binary(args.binary))
-    scanner = FormatStringScanner.from_path(p)
+    ctx = BinaryContext.load_or_build(p)
+    if ctx.arch == 'arm64':
+        from ablation.analyzers.format_string_scanner_arm64 import ARM64FormatStringScanner
+        scanner = ARM64FormatStringScanner.from_context(ctx)
+    else:
+        scanner = FormatStringScanner.from_context(ctx)
     findings = scanner.scan()
 
     if args.json:
