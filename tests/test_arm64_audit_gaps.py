@@ -155,7 +155,7 @@ def _cli(*a):
 def test_cli_warns_on_zero_resolved_sinks(roles_img, tmp_path):
     binf, _truth = roles_img
     fresh = tmp_path / "fresh.bin"                         # own cache entry, no roles yet
-    fresh.write_bytes(binf.read_bytes() + b"\0" * 4)
+    fresh.write_bytes(binf.read_bytes() + b"\0" * 4 + __import__("os").urandom(8))
     r = _cli("heap", fresh, "--raw", "arm64", "--base", hex(RAW_BASE), "--no-infer-sinks")
     assert "0 of" in r.stdout and "results are not meaningful" in r.stdout
     r = _cli("fmtstr", fresh, "--raw", "arm64", "--base", hex(RAW_BASE))
@@ -168,7 +168,7 @@ def test_sink_map_names_roles_cli(roles_img, tmp_path):
     sm = tmp_path / "sinks.json"
     sm.write_text(json.dumps({hex(truth["sprintf"]): "sprintf"}))
     fresh = tmp_path / "fresh2.bin"
-    fresh.write_bytes(binf.read_bytes() + b"\0" * 8)
+    fresh.write_bytes(binf.read_bytes() + b"\0" * 8 + __import__("os").urandom(8))
     r = _cli("fmtstr", fresh, "--raw", "arm64", "--base", hex(RAW_BASE), "--sink-map", sm,
              "--no-infer-sinks")
     assert "sink map: 1 function" in r.stderr
