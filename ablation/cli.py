@@ -611,10 +611,16 @@ def cmd_fmtstr(args):
 
 
 def cmd_heap(args):
+    from ablation.analyzers.binary_context import BinaryContext
     from ablation.analyzers.heap_vuln_scanner import HeapVulnScanner
 
     p = str(_require_binary(args.binary))
-    scanner = HeapVulnScanner.from_path(p)
+    ctx = BinaryContext.load_or_build(p)
+    if ctx.arch == 'arm64':
+        from ablation.analyzers.heap_scanner_arm64 import ARM64HeapScanner
+        scanner = ARM64HeapScanner.from_context(ctx)
+    else:
+        scanner = HeapVulnScanner.from_context(ctx)
     findings = scanner.scan()
 
     if args.json:

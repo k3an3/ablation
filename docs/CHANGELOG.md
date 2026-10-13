@@ -2,6 +2,24 @@
 
 ---
 
+## v2.83.0
+
+**ARM64HeapScanner — use-after-free, double free, off-by-one allocation, heap overflow.**
+
+ARM64 port of `HeapVulnScanner` + `HeapUAFScanner`, with the same `HeapFinding` output.
+
+- Each allocation is a region in the ARM64 taint state, so a freed pointer is followed through
+  copies, `-O0` spills/reloads and alias classes (x86 tracks registers only).
+- Freed-ness is a must-analysis over the CFG: an error-path `free(); return;` does not make the
+  fall-through `use(p)` a UAF; frees on both arms of a branch do count.
+- Kinds: `uaf` (access / passed on), `double_free`, `off_by_one_alloc` (`malloc(strlen)` +
+  `strcpy`, or `memcpy(strlen+k)`), `heap_overflow` (attacker or oversized length into a fixed
+  allocation; constant-offset store past the end, which catches inlined `memcpy`),
+  `int_overflow_before_alloc` (from `ARM64IntOverflowScanner`).
+- `ablation heap` dispatches on arch.
+
+---
+
 ## v2.82.0
 
 **ARM64FormatStringScanner, ARM64LengthUnderflowScanner; ARM64TaggingScanner base.**
