@@ -2,6 +2,31 @@
 
 ---
 
+## v2.81.0
+
+**ARM64IntOverflowScanner — wire-controlled multiply feeding an allocation size.**
+
+The arm64 counterpart of `ARM32IntOverflowScanner`, built on `ARM64TaintTracker`:
+
+- Operands count as attacker-controlled through buffer contents, spills, aliases and callees,
+  not only when they are the source's return value.
+- A product is reported only if operand bounds and the operation's width (W vs X) allow it to
+  wrap. Widening `umull`/`smull` are ignored.
+- The tagged product is followed to allocator size arguments (`malloc`, `realloc`, `new`,
+  `kmalloc`, ...), including through calls. Chained steps (`n*12` = `(n + n<<1) << 2`) merge
+  into one finding.
+- `bounds_checked` is dataflow-based: a compare / `cbz` / `tbz` on the product or on the
+  tainted operand, or a tested `umulh` overflow check.
+- `ablation overflow` now handles ARM64 as well as ARM32.
+
+Fix (ARM64TaintTracker): a buffer addressed off `x29` (`sub x1, x29, #k`, typical at `-O0`) was
+tainted under base `x29` while loads resolve `x29` to `sp`, so reads from it came back clean.
+Buffers and pointees are now normalised through the frame pointer.
+
+`ARM64TaintTracker._scan` gained `_before_step` / `_after_step` hooks for subclasses.
+
+---
+
 ## v2.80.0
 
 **PE (Windows) ARM64 in BinaryContext; PE machine detection fix; GOT/IAT-indirect call edges.**

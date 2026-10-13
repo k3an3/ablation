@@ -146,14 +146,19 @@ def cmd_taint(args):
 
 
 def cmd_overflow(args):
-    """ARM32 integer overflow scan: MUL/UMULL with wire-controlled operands before allocation."""
+    """Integer overflow scan (ARM32 / ARM64): wire-controlled multiply feeding an allocation size."""
     from ablation.analyzers.binary_context import BinaryContext
 
     p = str(_require_binary(args.binary))
     ctx = BinaryContext.load_or_build(p)
 
+    if ctx.arch == 'arm64':
+        from ablation.analyzers.intoverflow_scanner_arm64 import ARM64IntOverflowScanner
+        scanner = ARM64IntOverflowScanner.from_context(ctx)
+        print(scanner.report(scanner.scan()))
+        return
     if ctx.arch != 'arm32':
-        print(f"overflow scan is ARM32-only (binary arch: {ctx.arch})")
+        print(f"overflow scan supports ARM32 and ARM64 (binary arch: {ctx.arch})")
         return
 
     from ablation.analyzers.intoverflow_scanner_arm32 import ARM32IntOverflowScanner
@@ -1083,7 +1088,7 @@ def main():
     p_taint.set_defaults(func=cmd_taint)
 
     # overflow
-    p_overflow = sub.add_parser('overflow', help='ARM32 integer overflow scan: MUL -> alloc without check')
+    p_overflow = sub.add_parser('overflow', help='ARM32/ARM64 integer overflow scan: MUL -> alloc without check')
     p_overflow.add_argument('binary')
     p_overflow.set_defaults(func=cmd_overflow)
 

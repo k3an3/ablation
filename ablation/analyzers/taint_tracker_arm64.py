@@ -225,7 +225,7 @@ class TaintState:
         if r is None:
             return CLEAN
         loc = self.frame_ptrs.get(r) or (("sp", 0) if r == "sp" else None)
-        return self.mem_get(*loc) if loc is not None else CLEAN
+        return self.mem_get(*self.resolve(*loc)) if loc is not None else CLEAN
 
     # ---- alias classes -------------------------------------------------------
 
@@ -414,7 +414,8 @@ class TaintEngine:
         if loc is None:
             st.point_at(reg, region, 0)
             loc = (region, 0)
-        st.taint_range(loc[0], loc[1], loc[1] + length, label)
+        b, k = st.resolve(*loc)            # x29-relative -> sp-relative, as loads resolve
+        st.taint_range(b, k, k + length, label)
 
     def run(self, insns: Iterable[Insn]) -> List[Finding]:
         for insn in insns:
@@ -1186,8 +1187,16 @@ class ARM64TaintTracker:
                 callee = _name_at(self._syms, target)
                 self._on_call(eng, insn, target, callee, fva, func_name, findings, depth, enqueue)
             else:
+                self._before_step(eng, insn, fva)
                 eng.step(insn)          # ret is checked and the linear pass continues
+                self._after_step(eng, insn, fva)
         return findings
+
+    def _before_step(self, eng: TaintEngine, insn: Insn, fva: int) -> None:
+        """Hook for subclasses: called before each non-call instruction is stepped."""
+
+    def _after_step(self, eng: TaintEngine, insn: Insn, fva: int) -> None:
+        """Hook for subclasses: called after each non-call instruction is stepped."""
 
     def _on_call(self, eng: TaintEngine, insn: Insn, target: int, callee: Optional[str],
                  fva: int, func_name: str, findings: List[TaintFindingARM64],
