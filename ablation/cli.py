@@ -78,6 +78,62 @@ def _load_ctx(args, path: str):
     return ctx
 
 
+def _oracles(engine: str, arch: str):
+    """(sink names, source names) an engine matches calls against."""
+    if engine == 'taint' and arch == 'arm64':
+        from ablation.analyzers import taint_tracker_arm64 as t
+        return set(t._SINK_NAMES), set(t._SOURCE_NAMES)
+    if engine == 'taint' and arch == 'arm32':
+        from ablation.analyzers import taint_tracker_arm32 as t
+        return set(t._DEFAULT_SINKS), set(t._TAINT_SOURCES)
+    if engine == 'fmtstr':
+        from ablation.analyzers import format_string_scanner_arm64 as f
+        return set(f.FMT_ARG) | set(f._UNBOUNDED), set()
+    if engine == 'heap':
+        from ablation.analyzers import heap_scanner_arm64 as h
+        return set(h._ALLOCS) | set(h._FREES) | set(h._SIZED_COPIES) | set(h._STR_COPIES), set()
+    if engine == 'overflow':
+        if arch == 'arm64':
+            from ablation.analyzers import intoverflow_scanner_arm64 as o
+            from ablation.analyzers import taint_tracker_arm64 as t
+            return set(o._ALLOC_SIZE_ARGS), set(t._SOURCE_NAMES)
+        from ablation.analyzers import taint_tracker_arm32 as t
+        return {'malloc', 'calloc', 'realloc'}, set(t._TAINT_SOURCES)
+    return set(), set()
+
+
+def _check_oracles(args, ctx, engine: str) -> None:
+    """Infer libc roles when no sink name resolves (arm64), then warn loudly when an engine
+    would still run with zero resolved sinks / sources: a vacuous pass is not a clean one."""
+    sinks, sources = _oracles(engine, ctx.arch)
+    if not sinks:
+        return
+    extra = {n for n in (getattr(args, 'sinks', None) or '').split(',') if n and not n.startswith('0x')}
+    resolved, _ = ctx.sink_coverage(sinks | extra)
+    want = getattr(args, 'infer_sinks', None)
+    if ctx.arch == 'arm64' and want is not False and (want or not resolved) and not ctx.roles:
+        print(f"[*] {len(resolved)} of {len(sinks)} {engine} sink names resolved; inferring libc "
+              f"roles from behaviour ...", file=sys.stderr)
+        from ablation.analyzers.libc_roles import LibcRoleInferer
+        print(LibcRoleInferer.report(ctx.infer_roles()), file=sys.stderr)
+        resolved, _ = ctx.sink_coverage(sinks | extra)
+    if not resolved:
+        msg = (f"WARNING: 0 of {len(sinks)} {engine} sink oracles resolved (no PLT, symbol, "
+               f"sink-map or inferred name for memcpy / sprintf / ...); results are not "
+               f"meaningful. Use --sink-map, --symbols or --infer-sinks.")
+        print(msg, file=sys.stderr)
+        print(msg)
+    if sources:
+        user_src = [n for n in (getattr(args, 'sources', None) or '').split(',') if n]
+        src_ok, _ = ctx.sink_coverage(sources)
+        if not src_ok and not user_src:
+            msg = (f"WARNING: 0 of {len(sources)} {engine} source oracles resolved (recv / read "
+                   f"...); nothing is attacker-tainted, so only structural findings can appear. "
+                   f"Name the input functions with --sources NAME|0xVA.")
+            print(msg, file=sys.stderr)
+            print(msg)
+
+
 def _add_raw_args(p) -> None:
     p.add_argument('--raw', metavar='ARCH',
                    help='headerless firmware image: thumb (Cortex-M), arm32, or arm64')
@@ -91,6 +147,12 @@ def _add_raw_args(p) -> None:
     p.add_argument('--code-range', metavar='LO-HI[,LO-HI]',
                    help='raw image code ranges (hex VAs); default: inferred from return / '
                         'prologue density')
+    g = p.add_mutually_exclusive_group()
+    g.add_argument('--infer-sinks', dest='infer_sinks', action='store_true', default=None,
+                   help='infer libc roles (memcpy, sprintf, sscanf ...) from behaviour (arm64); '
+                        'automatic when no sink name resolves')
+    g.add_argument('--no-infer-sinks', dest='infer_sinks', action='store_false',
+                   help='never infer libc roles')
     p.add_argument('--sink-map', metavar='JSON',
                    help='{"0xVA": "memcpy", ...}: name sinks / sources in a stripped or '
                         'statically linked image (ELF or raw)')
@@ -148,6 +210,7 @@ def cmd_taint(args):
 
     p = str(_require_binary(args.binary))
     ctx = _load_ctx(args, p)
+    _check_oracles(args, ctx, 'taint')
 
     if ctx.arch == 'arm64':
         from ablation.analyzers.taint_tracker_arm64 import ARM64TaintTracker
@@ -215,6 +278,7 @@ def cmd_overflow(args):
 
     p = str(_require_binary(args.binary))
     ctx = _load_ctx(args, p)
+    _check_oracles(args, ctx, 'overflow')
 
     if ctx.arch == 'arm64':
         from ablation.analyzers.intoverflow_scanner_arm64 import ARM64IntOverflowScanner
@@ -656,6 +720,7 @@ def cmd_fmtstr(args):
 
     p = str(_require_binary(args.binary))
     ctx = _load_ctx(args, p)
+    _check_oracles(args, ctx, 'fmtstr')
     if ctx.arch == 'arm64':
         from ablation.analyzers.format_string_scanner_arm64 import ARM64FormatStringScanner
         scanner = ARM64FormatStringScanner.from_context(ctx)
@@ -680,6 +745,7 @@ def cmd_heap(args):
 
     p = str(_require_binary(args.binary))
     ctx = _load_ctx(args, p)
+    _check_oracles(args, ctx, 'heap')
     if ctx.arch == 'arm64':
         from ablation.analyzers.heap_scanner_arm64 import ARM64HeapScanner
         scanner = ARM64HeapScanner.from_context(ctx)

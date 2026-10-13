@@ -71,6 +71,15 @@ FMT_ARG: Dict[str, str] = {
 }
 _MAX_FUNC_BYTES = 4096
 
+
+def fmt_reg(name: str) -> Optional[str]:
+    """Format register of a printf-family callee; '__fmt_x<k>' is an inferred logger
+    (libc_roles) whose format is in xk."""
+    reg = FMT_ARG.get(name)
+    if reg is None and name.startswith("__fmt_x") and name[7:].isdigit():
+        reg = f"x{name[7:]}"
+    return reg
+
 # unbounded-conversion check: callee -> (format reg, first vararg index or None for a
 # va_list, dst reg for the print family / input reg for sscanf, family)
 _UNBOUNDED: Dict[str, Tuple[str, Optional[int], Optional[str], str]] = {
@@ -217,7 +226,7 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
                 if call.target_name in _UNBOUNDED:
                     self._unb_sites.append((fva, call))
                     self._watch_calls.add(call.site_va)
-                reg = FMT_ARG.get(call.target_name)
+                reg = fmt_reg(call.target_name)
                 if reg is None:
                     continue
                 prov, sev, desc = self._classify(call.args.get(reg), reg)
@@ -426,7 +435,7 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
             labels = st.get(r).labels | st.pointee(r).labels
             if labels:
                 self._arg_taint.setdefault((insn.address, r), set()).update(labels)
-        reg = FMT_ARG.get(callee or "")
+        reg = fmt_reg(callee or "")
         if reg is not None:
             st = eng.state
             labels = st.get(reg).labels | st.pointee(reg).labels

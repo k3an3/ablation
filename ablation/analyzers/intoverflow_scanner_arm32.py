@@ -111,6 +111,8 @@ class ARM32IntOverflowScanner:
     def from_context(cls, ctx) -> 'ARM32IntOverflowScanner':
         data = Path(ctx.path).read_bytes()
         plt = dict(ctx.plt)
+        for va, role in getattr(ctx, 'roles', {}).items():
+            plt.setdefault(va, role)
         if getattr(ctx, 'raw', None):                 # raw image: named functions are the call targets
             plt.update({va: n for n, va in ctx.exports.items()})
         return cls(data, ctx.base_va, plt, ctx.func_starts,

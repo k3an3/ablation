@@ -377,6 +377,9 @@ class BinaryContext:
         self.raw: Optional[Dict] = None
         # ELF: relocations applied by type (see elf_relocations)
         self.reloc_stats: Dict[str, int] = {}
+        # va -> libc role inferred from behaviour (libc_roles.LibcRoleInferer) or a sink map;
+        # several VAs may share a role (memcpy, memmove, __memcpy_chk ...)
+        self.roles: Dict[int, str] = {}
 
     # ── public factory ────────────────────────────────────────────────────────
 
@@ -423,11 +426,13 @@ class BinaryContext:
             try:
                 ctx = cls._load_json(cache_file, path)
                 if ctx.sha256 == sha:
+                    ctx._cache_file = cache_file
                     return ctx
             except Exception:
                 pass
 
         ctx = cls._build(data, path, sha)
+        ctx._cache_file = cache_file
         try:
             ctx._save_json(cache_file)
         except Exception:
@@ -589,6 +594,9 @@ class BinaryContext:
         plt_sym = self.plt.get(va)
         if plt_sym:
             return plt_sym
+        role = getattr(self, "roles", {}).get(va)
+        if role:
+            return role
         return f"0x{va:x}"
 
     def set_name(self, va: int, name: str, source: str = "manual") -> None:
@@ -2184,10 +2192,12 @@ class BinaryContext:
             try:
                 ctx = cls._load_json(cache_file, path)
                 if ctx.sha256 == sha and ctx.raw:
+                    ctx._cache_file = cache_file
                     return ctx
             except Exception:
                 pass
         ctx = cls._build_raw(data, path, sha, mode, base, sym_path, cr)
+        ctx._cache_file = cache_file
         try:
             ctx._save_json(cache_file)
         except Exception:
@@ -2371,6 +2381,37 @@ class BinaryContext:
             return (h0 & 0xFF00) == 0xB500 or (h0 == 0xE92D and bool(h1 & 0x4000))   # push {.., lr}
         w = struct.unpack_from("<I", data, off)[0]
         return (w & 0xFFFF4000) == 0xE92D4000                                        # stmfd sp!, {.., lr}
+
+    def call_names(self) -> Dict[int, str]:
+        """va -> name for every callable this context can name: PLT / IAT, exports,
+        then inferred roles (for VAs with no other name)."""
+        out = {va: n for n, va in self.exports.items()}
+        out.update(self.plt)
+        for va, r in getattr(self, "roles", {}).items():
+            out.setdefault(va, r)
+        return out
+
+    def sink_coverage(self, oracles) -> Tuple[Set[str], Set[str]]:
+        """(resolved, all) oracle names: which of `oracles` some callable carries."""
+        oracles = set(oracles)
+        return oracles & set(self.call_names().values()), oracles
+
+    def save_cache(self) -> None:
+        """Re-write this context's cache file (e.g. after infer_roles())."""
+        cf = getattr(self, "_cache_file", None)
+        if cf:
+            try:
+                self._save_json(cf)
+            except Exception:
+                pass
+
+    def infer_roles(self, save: bool = True) -> Dict[int, str]:
+        """LibcRoleInferer on this context (arm64): sets and returns self.roles."""
+        from ablation.analyzers.libc_roles import LibcRoleInferer
+        roles = LibcRoleInferer(self).infer()
+        if save:
+            self.save_cache()
+        return roles
 
     def apply_sink_map(self, sink_map) -> int:
         """Name functions by address so name-keyed sink / source oracles resolve in a
@@ -2879,6 +2920,7 @@ class BinaryContext:
             "func_str_idx": {str(k): v for k, v in self._func_str_idx.items()},
             "raw": self.raw,
             "reloc_stats": getattr(self, "reloc_stats", {}),
+            "roles": {f"{va:x}": r for va, r in getattr(self, "roles", {}).items()},
         }
         path.write_text(json.dumps(payload, separators=(",", ":")))
 
@@ -2907,4 +2949,5 @@ class BinaryContext:
         ctx._func_str_idx = {int(k): v for k, v in payload.get("func_str_idx", {}).items()}
         ctx.raw = payload.get("raw")
         ctx.reloc_stats = payload.get("reloc_stats") or {}
+        ctx.roles = {int(k, 16): v for k, v in (payload.get("roles") or {}).items()}
         return ctx

@@ -1115,6 +1115,8 @@ class ARM64TaintTracker:
             data, base_va, text_start, text_end, syms = _load_elf(ctx.path)
         syms.update(ctx.plt)                                   # stub VA -> import name
         syms.update({va: name for name, va in ctx.exports.items()})
+        for va, role in getattr(ctx, "roles", {}).items():     # inferred libc roles
+            syms.setdefault(va, role)
         for fva in ctx.func_starts:
             if text_start <= fva < text_end and fva not in syms:
                 syms[fva] = f"fn_{fva:x}"

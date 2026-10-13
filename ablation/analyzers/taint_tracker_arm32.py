@@ -514,6 +514,8 @@ class ARM32TaintTracker:
             inst._disasm = _ARM32Disasm(inst._data, inst._base, inst._thumb)
         # Overlay PLT and exports from BinaryContext
         inst._plt.update(ctx.plt)
+        for va, role in getattr(ctx, 'roles', {}).items():
+            inst._plt.setdefault(va, role)
         inst._exports.update(ctx.exports)
         if ctx.func_starts:
             inst._func_starts = list(ctx.func_starts)

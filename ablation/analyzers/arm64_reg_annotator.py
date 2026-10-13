@@ -94,11 +94,14 @@ class ARM64RegAnnotator:
             inst = cls(None, ctx.strings, ctx.plt, ctx.exports, ctx.func_starts)
             inst._segs = ctx.image_regions()
             inst._slots = RawSlots(inst._segs)
-            return inst
-        if not _LIEF_OK:
-            raise ImportError("lief is required for ARM64RegAnnotator")
-        binary = lief.parse(Path(ctx.path).read_bytes())
-        return cls(binary, ctx.strings, ctx.plt, ctx.exports, ctx.func_starts)
+        else:
+            if not _LIEF_OK:
+                raise ImportError("lief is required for ARM64RegAnnotator")
+            binary = lief.parse(Path(ctx.path).read_bytes())
+            inst = cls(binary, ctx.strings, ctx.plt, ctx.exports, ctx.func_starts)
+        for va, role in getattr(ctx, "roles", {}).items():   # inferred libc roles
+            inst._exports_by_va.setdefault(va, role)
+        return inst
 
     @classmethod
     def from_path(cls, path: str) -> "ARM64RegAnnotator":
