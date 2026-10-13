@@ -112,12 +112,13 @@ def extract_vtable_regions(binary: lief.ELF.Binary, text_va: int, text_size: int
     text_end = text_va + text_size
     drelro_end = drelro_va + drelro_size
 
+    # every relocation type applied (RELATIVE: addend; ABS64 / GLOB_DAT against a defined
+    # symbol: S + A), so tables of ABS64 entries are not read back as zero
+    from .binary_context import elf_relocations
     reloc_map: Dict[int, int] = {}
-    for rel in binary.relocations:
-        addend = rel.addend if hasattr(rel, 'addend') else 0
-        rva = rel.address
-        if text_va <= addend < text_end and drelro_va <= rva < drelro_end:
-            reloc_map[rva] = addend
+    for rva, target in elf_relocations(binary).values.items():
+        if text_va <= target < text_end and drelro_va <= rva < drelro_end:
+            reloc_map[rva] = target
 
     sorted_rvas = sorted(reloc_map.keys())
     if not sorted_rvas:

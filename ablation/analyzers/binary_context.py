@@ -29,6 +29,7 @@ Invalidation: SHA256 mismatch triggers rebuild.
 from __future__ import annotations
 
 import ctypes
+from dataclasses import dataclass, field
 import hashlib
 import json
 import os
@@ -87,13 +88,87 @@ def _a64_adrp_page(w: int, va: int) -> int:
     return ((va & ~0xFFF) + (_a64_adr_imm(w) << 12)) & 0xFFFFFFFFFFFFFFFF
 
 
+@dataclass
+class ElfRelocations:
+    """Static view of an ELF's dynamic / static relocations, applied as the loader would
+    at base 0.
+
+      values  : slot VA -> pointer the loader writes (RELATIVE / IRELATIVE: addend;
+                ABS64 / ABS32 / GLOB_DAT / JUMP_SLOT on a defined symbol: S + A)
+      symbols : slot VA -> imported name (ABS / GLOB_DAT / JUMP_SLOT on an undefined symbol)
+      stats   : {"RELATIVE": n, "ABS64": n, "GLOB_DAT": n, "JUMP_SLOT": n, ...} applied;
+                "<TYPE> (import)" for slots bound to an undefined symbol;
+                "<TYPE> (skipped)" for types not modelled (TLS, COPY, ...)
+      width   : slot size (8 for ELF64, 4 for ELF32)
+    """
+    values: Dict[int, int] = field(default_factory=dict)
+    symbols: Dict[int, str] = field(default_factory=dict)
+    stats: Dict[str, int] = field(default_factory=dict)
+    width: int = 8
+
+    def bump(self, key: str) -> None:
+        self.stats[key] = self.stats.get(key, 0) + 1
+
+    def summary(self) -> str:
+        return ", ".join(f"{n} {k}" for k, n in sorted(self.stats.items(), key=lambda kv: -kv[1]))
+
+
+def _reloc_kind(rtype) -> str:
+    """'TYPE.AARCH64_ABS64' / 'R_X86_64_64' -> 'ABS64' / '64' style short name."""
+    t = str(rtype).split(".")[-1]
+    for pre in ("R_AARCH64_", "AARCH64_", "R_X86_64_", "X86_64_", "R_ARM_", "ARM_",
+                "R_386_", "I386_", "R_MIPS_", "MIPS_", "R_PPC64_", "PPC64_", "R_PPC_", "PPC_",
+                "R_RISCV_", "RISCV_", "R_LARCH_", "LARCH_"):
+        if t.startswith(pre):
+            return t[len(pre):]
+    return t
+
+
+def elf_relocations(binary) -> ElfRelocations:
+    """Apply every static relocation lief exposes (see ElfRelocations)."""
+    out = ElfRelocations()
+    try:
+        out.width = 8 if "64" in str(binary.header.identity_class) else 4
+    except Exception:
+        pass
+    mask = (1 << (8 * out.width)) - 1
+    try:
+        relocs = list(binary.relocations)
+    except Exception:
+        return out
+    for rel in relocs:
+        kind = _reloc_kind(getattr(rel, "type", ""))
+        try:
+            slot = int(rel.address)
+            addend = int(getattr(rel, "addend", 0) or 0)
+        except Exception:
+            continue
+        if kind in ("RELATIVE", "IRELATIVE", "RELATIVE64"):
+            out.values[slot] = addend & mask
+            out.bump(kind)
+        elif kind in ("ABS64", "ABS32", "64", "32", "GLOB_DAT", "JUMP_SLOT", "JMP_SLOT", "ADDR64", "ADDR32"):
+            sym = rel.symbol if getattr(rel, "has_symbol", False) else None
+            sv = int(sym.value) if sym is not None else 0
+            defined = sym is not None and sv and getattr(sym, "shndx", 1) != 0
+            if defined or sym is None:
+                out.values[slot] = (sv + addend) & mask
+                out.bump(kind)
+            else:
+                if sym.name:
+                    out.symbols[slot] = sym.name
+                out.bump(f"{kind} (import)")
+        elif kind not in ("NONE",):
+            out.bump(f"{kind} (skipped)")
+    return out
+
+
 class PointerSlots:
     """Resolve 64-bit pointer slots (GOT, .data.rel.ro, globals) of a lief ELF.
 
-    PIE/.so slots are zero on disk and filled at load time, so relocations win:
-      RELATIVE            -> addend
-      ABS64 / GLOB_DAT    -> symbol value + addend (defined symbol)
-      ABS64 / GLOB_DAT / JUMP_SLOT on an undefined symbol -> symbol(slot) = name
+    PIE/.so slots are zero on disk and filled at load time, so relocations win
+    (elf_relocations: RELATIVE / IRELATIVE / ABS64 / GLOB_DAT / JUMP_SLOT):
+      defined symbol or no symbol -> S + A
+      undefined symbol            -> symbol(slot) = name
     Anything else falls back to the 8 bytes on disk (static, non-PIE images).
     """
 
@@ -105,21 +180,8 @@ class PointerSlots:
 
     def _load(self) -> Dict[int, int]:
         if self._ptrs is None:
-            self._ptrs = {}
-            try:
-                for rel in self._binary.relocations:
-                    rtype = str(getattr(rel, 'type', ''))
-                    if 'RELATIVE' in rtype:
-                        self._ptrs[int(rel.address)] = int(rel.addend)
-                    elif (('ABS64' in rtype or 'GLOB_DAT' in rtype or 'JUMP_SLOT' in rtype)
-                          and rel.has_symbol):
-                        sv = int(rel.symbol.value)
-                        if sv:
-                            self._ptrs[int(rel.address)] = sv + int(rel.addend)
-                        elif rel.symbol.name:
-                            self._syms[int(rel.address)] = rel.symbol.name
-            except Exception:
-                pass
+            rel = elf_relocations(self._binary)
+            self._ptrs, self._syms = rel.values, rel.symbols
         return self._ptrs
 
     def ptr(self, slot: int) -> Optional[int]:
@@ -243,6 +305,28 @@ def image_regions(binary) -> List[Tuple[int, bytes]]:
     return out
 
 
+def apply_relocations(regions: List[Tuple[int, bytes]], rel: "ElfRelocations") -> List[Tuple[int, bytes]]:
+    """Copy of regions with every relocated slot holding its loaded value."""
+    if not rel.values:
+        return regions
+    slots = sorted(rel.values)
+    out = []
+    import bisect as _bisect
+    for va, data in regions:
+        lo = _bisect.bisect_left(slots, va)
+        hi = _bisect.bisect_left(slots, va + len(data))
+        if lo == hi:
+            out.append((va, data))
+            continue
+        buf = bytearray(data)
+        for slot in slots[lo:hi]:
+            off = slot - va
+            if off + rel.width <= len(buf):
+                buf[off:off + rel.width] = rel.values[slot].to_bytes(rel.width, "little")
+        out.append((va, bytes(buf)))
+    return out
+
+
 def _pe_machine_types():
     """lief < 0.15: lief.PE.MACHINE_TYPES; lief >= 0.15: lief.PE.Header.MACHINE_TYPES."""
     return getattr(lief.PE, "MACHINE_TYPES", None) or lief.PE.Header.MACHINE_TYPES
@@ -291,6 +375,8 @@ class BinaryContext:
         self._func_str_idx: Dict[int, List[int]] = {}
         # raw (headerless) image: {"arch": "arm64"|"arm32"|"thumb", "base": int, "symbols": path|None}
         self.raw: Optional[Dict] = None
+        # ELF: relocations applied by type (see elf_relocations)
+        self.reloc_stats: Dict[str, int] = {}
 
     # ── public factory ────────────────────────────────────────────────────────
 
@@ -618,6 +704,10 @@ class BinaryContext:
 
         ctx.base_va = binary.imagebase
         ctx.arch = _detect_arch(binary)
+        try:
+            ctx.reloc_stats = elf_relocations(binary).stats
+        except Exception:
+            ctx.reloc_stats = {}
 
         ctx._extract_plt(binary)
         ctx._extract_exports(binary)
@@ -2321,7 +2411,28 @@ class BinaryContext:
         if not _LIEF_OK:
             return []
         binary = lief.parse(data)
-        return image_regions(binary) if binary is not None else []
+        if binary is None:
+            return []
+        regions = image_regions(binary)
+        if isinstance(binary, lief.ELF.Binary):
+            regions = apply_relocations(regions, elf_relocations(binary))
+        return regions
+
+    def read_ptr(self, va: int) -> Optional[int]:
+        """Pointer at va as the loader leaves it: relocations applied (raw: bytes on disk)."""
+        rel = getattr(self, "_relocs_cache", None)
+        if rel is None and not self.raw and _LIEF_OK:
+            b = lief.parse(Path(self.path).read_bytes())
+            rel = self._relocs_cache = (elf_relocations(b) if isinstance(b, lief.ELF.Binary)
+                                        else ElfRelocations())
+        if rel is not None and va in rel.values:
+            return rel.values[va]
+        width = rel.width if rel is not None else 8
+        for rva, data in self.image_regions():
+            off = va - rva
+            if 0 <= off <= len(data) - width:
+                return int.from_bytes(data[off:off + width], "little")
+        return None
 
     @classmethod
     def _build_pe(cls, data: bytes, path: str, sha: str, binary) -> "BinaryContext":
@@ -2767,6 +2878,7 @@ class BinaryContext:
             "str_xref_idx": {str(k): v for k, v in self._str_xref_idx.items()},
             "func_str_idx": {str(k): v for k, v in self._func_str_idx.items()},
             "raw": self.raw,
+            "reloc_stats": getattr(self, "reloc_stats", {}),
         }
         path.write_text(json.dumps(payload, separators=(",", ":")))
 
@@ -2794,4 +2906,5 @@ class BinaryContext:
         ctx._str_xref_idx = {int(k): v for k, v in payload.get("str_xref_idx", {}).items()}
         ctx._func_str_idx = {int(k): v for k, v in payload.get("func_str_idx", {}).items()}
         ctx.raw = payload.get("raw")
+        ctx.reloc_stats = payload.get("reloc_stats") or {}
         return ctx
