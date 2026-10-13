@@ -68,6 +68,7 @@ class UnderflowFinding64:
     severity: str       # HIGH (length argument) / MEDIUM (other argument)
     wire_evidence: str
     guarded: bool
+    note: str = ""
 
     def fmt(self) -> str:
         tag = "GUARDED" if self.guarded else "UNGUARDED"
@@ -80,6 +81,7 @@ class UnderflowFinding64:
             f"  truncate: {trunc}\n"
             f"  call    : 0x{self.call_va:x}  -> 0x{self.call_target:x}{label}  ({self.arg})\n"
             f"  wire    : {self.wire_evidence}\n"
+            + (f"  note    : {self.note}\n" if self.note else "")
         )
 
 
@@ -88,9 +90,12 @@ class ARM64LengthUnderflowScanner(ARM64TaggingScanner):
 
     KIND = "sub"
 
-    def __init__(self, *args, **kw):
+    def __init__(self, *args, snprintf_rejects_huge: Optional[bool] = None, **kw):
         super().__init__(*args, **kw)
         self._hits: List[UnderflowFinding64] = []
+        # True: this libc's snprintf rejects size > INT_MAX and writes nothing (musl);
+        # False: it trusts the size (glibc); None: unknown
+        self.snprintf_rejects_huge = snprintf_rejects_huge
 
     # ---- public API ---------------------------------------------------------
 
@@ -103,6 +108,14 @@ class ARM64LengthUnderflowScanner(ARM64TaggingScanner):
             label = self._tag(f.sub_va)
             f.guarded = self.guarded(label, self._sites[label])
             f.truncate_va = self._sites[label].extra.get("truncate_va", 0)
+            if f.call_label in ("snprintf", "vsnprintf") and f.arg == "x1" and not f.truncate_va:
+                # a wrapped size is > INT_MAX: safe or fatal depending on the libc
+                if self.snprintf_rejects_huge is True:
+                    f.severity, f.note = "LOW", "this libc's snprintf rejects size > INT_MAX and writes nothing"
+                elif self.snprintf_rejects_huge is None:
+                    f.severity = "MEDIUM"
+                    f.note = ("depends on the libc: some snprintf builds (e.g. musl) reject size > "
+                              "INT_MAX and write nothing, others (glibc) trust it")
             out.setdefault((f.sub_va, f.call_va, f.arg), f)
         return sorted(out.values(), key=lambda f: (f.func_va, f.sub_va, f.call_va))
 

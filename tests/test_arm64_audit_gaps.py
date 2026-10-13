@@ -255,3 +255,75 @@ def test_cli_sources_sinks(http_so):
     so, truth = http_so
     r = _cli("taint", so, "--sources", f"{hex(truth['http_get_param'])}", "--sinks", "sink:x0")
     assert "strcpy" in r.stdout and "-> sink @" in r.stdout
+
+
+# ── conversion-driven lengths, snprintf variants ─────────────────────────────
+
+_CONV_SRC = r'''
+typedef unsigned long size_t;
+extern void *memcpy(void *, const void *, size_t);
+extern int snprintf(char *, size_t, const char *, ...);
+extern long recv(int, void *, size_t, int);
+extern int get(void);
+extern unsigned short get16(void);
+extern void sink(void *);
+int g_len;
+void set_len(long n) { g_len = (int)n; }                                     /* 64 -> 32 store */
+void use_len(char *d, const char *s) { memcpy(d, s, g_len); }               /* ldrsw -> size */
+void signed_chk(char *d, const char *s) { int n = get(); if (n > 64) return; memcpy(d, s, n); }
+void signed_ok(char *d, const char *s) { int n = get(); if (n > 64 || n < 0) return; memcpy(d, s, n); }
+void unsigned_ok(char *d, const char *s) { int n = get(); if ((unsigned)n > 64) return; memcpy(d, s, n); }
+void masked(char *d, const char *s) { unsigned n = (unsigned)get(); if ((n & 0xffff) > 64) return; memcpy(d, s, n); }
+void masked_ok(char *d, const char *s) { unsigned n = (unsigned)get() & 0xffff; if (n > 64) return; memcpy(d, s, n); }
+void byte_loop(char *d) { unsigned short lim = get16(); for (unsigned char i = 0; i < lim; i++) d[i] = 0; }
+void byte_ok(char *d) { unsigned short lim = get16(); for (unsigned short i = 0; i < lim; i++) d[i] = 0; }
+void wire(int fd, char *d) { char b[64]; recv(fd, b, sizeof b, 0); int n = *(int *)(b + 4); if (n > 32) return; memcpy(d, b, n); }
+void snp(char *d, const char *s) { int n = get(); if (n > 64) return; snprintf(d, n, "%s", s); }
+void und(int fd, char *d) { unsigned char b[64]; recv(fd, b, sizeof b, 0); unsigned n = b[2]; snprintf(d, n - 16, "%s", "x"); }
+'''
+
+
+@pytest.fixture(scope="module")
+def conv_bins(tmp_path_factory):
+    return build_variants(tmp_path_factory, src_text=_CONV_SRC, variants={"O1": ["-O1"], "O2": ["-O2"]})
+
+
+@pytest.mark.parametrize("opt", ["O1", "O2"])
+def test_conversion_lengths(conv_bins, opt):
+    from ablation.analyzers.conversion_length_arm64 import ARM64ConversionLengthScanner
+    ctx = BinaryContext.load_or_build(str(conv_bins[opt]))
+    got = {(ctx.name(f.func_va), f.kind, f.severity, f.sink)
+           for f in ARM64ConversionLengthScanner.from_context(ctx).scan()}
+    assert got == {
+        ("use_len", "sext_unchecked", "LOW", "memcpy"),          # 64->32 global, ldrsw
+        ("signed_chk", "sext_signed_check", "MEDIUM", "memcpy"),
+        ("masked", "masked_check", "MEDIUM", "memcpy"),
+        ("byte_loop", "byte_counter_loop", "MEDIUM", ""),
+        ("wire", "sext_signed_check", "HIGH", "memcpy"),         # recv field, b.gt only
+        ("snp", "sext_signed_check", "MEDIUM", "snprintf"),      # libc unknown: note
+    }                                  # signed_ok / unsigned_ok / masked_ok / byte_ok: silent
+
+
+@pytest.mark.parametrize("libc,sev", [("musl", "LOW"), ("glibc", "MEDIUM")])
+def test_snprintf_libc_awareness(conv_bins, libc, sev):
+    from ablation.analyzers.conversion_length_arm64 import (
+        ARM64ConversionLengthScanner, LIBC_SNPRINTF_REJECTS_HUGE)
+    from ablation.analyzers.length_underflow_arm64 import ARM64LengthUnderflowScanner
+    ctx = BinaryContext.load_or_build(str(conv_bins["O2"]))
+    s = ARM64ConversionLengthScanner.from_context(ctx)
+    s.snprintf_rejects_huge = LIBC_SNPRINTF_REJECTS_HUGE[libc]
+    snp = [f for f in s.scan() if f.sink == "snprintf"]
+    assert [f.severity for f in snp] == [sev]
+    u = ARM64LengthUnderflowScanner.from_context(ctx)
+    u.snprintf_rejects_huge = LIBC_SNPRINTF_REJECTS_HUGE[libc]
+    und = [f for f in u.scan_unguarded() if f.call_label == "snprintf" and f.arg == "x1"]
+    assert und and und[0].severity == {"musl": "LOW", "glibc": "HIGH"}[libc]
+    u.snprintf_rejects_huge = None
+    und = [f for f in u.scan_unguarded() if f.call_label == "snprintf" and f.arg == "x1"]
+    assert und[0].severity == "MEDIUM" and "musl" in und[0].note
+
+
+def test_cli_lengths(conv_bins):
+    r = _cli("lengths", conv_bins["O2"], "--libc", "musl")
+    assert "sext_signed_check" in r.stdout and "masked_check" in r.stdout
+    assert "byte_counter_loop" in r.stdout

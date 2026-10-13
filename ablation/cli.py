@@ -92,6 +92,10 @@ def _oracles(engine: str, arch: str):
     if engine == 'heap':
         from ablation.analyzers import heap_scanner_arm64 as h
         return set(h._ALLOCS) | set(h._FREES) | set(h._SIZED_COPIES) | set(h._STR_COPIES), set()
+    if engine == 'lengths':
+        from ablation.analyzers import length_underflow_arm64 as u
+        from ablation.analyzers import taint_tracker_arm64 as t
+        return set(u._LENGTH_ARGS), set(t._SOURCE_NAMES)
     if engine == 'overflow':
         if arch == 'arm64':
             from ablation.analyzers import intoverflow_scanner_arm64 as o
@@ -322,6 +326,32 @@ def cmd_overflow(args):
     scanner = ARM32IntOverflowScanner.from_context(ctx)
     findings = scanner.scan()
     print(scanner.report(findings))
+
+
+def cmd_lengths(args):
+    """ARM64 length bugs: header-size underflow + width / signedness conversions."""
+    p = str(_require_binary(args.binary))
+    ctx = _load_ctx(args, p)
+    if ctx.arch != 'arm64':
+        print(f"lengths supports ARM64 (binary arch: {ctx.arch})")
+        return
+    _check_oracles(args, ctx, 'lengths')
+    from ablation.analyzers.conversion_length_arm64 import (
+        ARM64ConversionLengthScanner, LIBC_SNPRINTF_REJECTS_HUGE)
+    from ablation.analyzers.length_underflow_arm64 import ARM64LengthUnderflowScanner
+    rejects = LIBC_SNPRINTF_REJECTS_HUGE.get(args.libc) if args.libc else None
+    conv = ARM64ConversionLengthScanner.from_context(ctx)
+    conv.snprintf_rejects_huge = rejects
+    _apply_taint_args(args, conv)
+    print(conv.report(conv.scan(depth=args.depth)))
+    under = ARM64LengthUnderflowScanner.from_context(ctx)
+    under.snprintf_rejects_huge = rejects
+    _apply_taint_args(args, under)
+    found = under.scan(depth=args.depth)
+    if not args.all:
+        found = [f for f in found if not f.guarded]
+    print()
+    print(under.report(found))
 
 
 def cmd_window(args):
@@ -1271,6 +1301,19 @@ def main():
     p_overflow.set_defaults(func=cmd_overflow)
 
     # window
+    p_len = sub.add_parser('lengths', help='ARM64 length bugs: len - N underflow, sign / width '
+                                           'conversions (sxtw after a signed check, masked check '
+                                           'with full-width use, byte loop counters)')
+    p_len.add_argument('binary')
+    _add_raw_args(p_len)
+    _add_taint_args(p_len)
+    p_len.add_argument('--libc', choices=sorted(['glibc', 'musl', 'other']),
+                       help='decides whether a wrapped snprintf size is fatal (glibc) or '
+                            'rejected (musl); default: reported MEDIUM with a note')
+    p_len.add_argument('--depth', type=int, default=3)
+    p_len.add_argument('--all', action='store_true', help='include guarded underflow candidates')
+    p_len.set_defaults(func=cmd_lengths)
+
     p_window = sub.add_parser('window', help='annotated disassembly window around a VA')
     p_window.add_argument('binary')
     p_window.add_argument('va', help='center VA in hex, e.g. 0x1234')
