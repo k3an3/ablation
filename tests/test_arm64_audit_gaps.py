@@ -173,3 +173,85 @@ def test_sink_map_names_roles_cli(roles_img, tmp_path):
              "--no-infer-sinks")
     assert "sink map: 1 function" in r.stderr
     assert r.stdout.count("sprintf '%s'") == 2 and "sscanf" not in r.stdout
+
+
+# ── taint: framework sources, wider sinks, opaque summaries ──────────────────
+
+_HTTP_SRC = r'''
+typedef unsigned long size_t;
+#define H __attribute__((visibility("hidden"), noinline))
+extern long recv(int, void *, size_t, int);
+extern char *strcpy(char *, const char *);
+extern void *memcpy(void *, const void *, size_t);
+extern int sprintf(char *, const char *, ...);
+extern int sscanf(const char *, const char *, ...);
+extern long read(int, void *, size_t);
+extern void sink(void *);
+struct req { int fd; char raw[512]; int clen; };
+/* the framework: recv is far below the handlers */
+H static long io_fill(struct req *r) { return recv(r->fd, r->raw, sizeof r->raw, 0); }
+H static long io_read(struct req *r) { long n = io_fill(r); r->raw[511] = 0; return n; }
+H static int parse(struct req *r) { return io_read(r) > 0 ? 0 : -1; }
+H const char *http_get_param(struct req *r, const char *k) { (void)k; return r->raw + 16; }
+H int http_content_length(struct req *r) { return r->clen; }
+H int http_read_body(struct req *r, void *buf, size_t n) { memcpy(buf, r->raw, n); return (int)n; }
+H unsigned be16(const unsigned char *p) { return (unsigned)(p[0] << 8 | p[1]); }
+/* handlers: the real bugs */
+void h_user(struct req *r) { char name[32]; strcpy(name, http_get_param(r, "user")); sink(name); }
+void h_fmt(struct req *r) { char o[64]; sprintf(o, "id=%s", http_get_param(r, "id")); sink(o); }
+void h_scan(struct req *r) { char m[8]; char u[8]; sscanf(http_get_param(r, "q"), "%s %s", m, u); char t[8]; strcpy(t, u); sink(m); sink(t); }
+void h_body(struct req *r, int fd) { char body[256]; read(fd, body, http_content_length(r)); sink(body); }
+void h_copy(struct req *r) { char b[64]; memcpy(b, r->raw, http_content_length(r)); sink(b); }
+void h_hdr(struct req *r) { unsigned char pkt[64]; char out[16]; http_read_body(r, pkt, sizeof pkt);
+    unsigned n = be16(pkt); sink(pkt); memcpy(out, r->raw, n); sink(out); }   /* length parsed from a header */
+void serve(struct req *r) { if (parse(r) == 0) { h_user(r); h_fmt(r); } }
+'''
+
+
+@pytest.fixture(scope="module")
+def http_so(tmp_path_factory):
+    so = build_variants(tmp_path_factory, src_text=_HTTP_SRC, variants={"O1": ["-O1"]})["O1"]
+    return so, symbols(so)
+
+
+def _http_tracker(so, truth, **kw):
+    from ablation.analyzers.taint_tracker_arm64 import ARM64TaintTracker
+    ctx = BinaryContext.load_or_build(str(so))
+    t = ARM64TaintTracker.from_context(ctx)
+    t.add_sources([hex(truth["http_get_param"]), f"{hex(truth['http_content_length'])}:val",
+                   f"http_read_body:x1"])
+    for k, v in kw.items():
+        setattr(t, k, v)
+    return t
+
+
+def test_framework_sources_by_address(http_so):
+    so, truth = http_so
+    from ablation.analyzers.taint_tracker_arm64 import ARM64TaintTracker
+    plain = ARM64TaintTracker.from_context(BinaryContext.load_or_build(str(so)))
+    assert not plain.run_interprocedural(depth=5)          # recv is too deep: nothing
+    got = {(f.func_name, f.sink_name, f.severity) for f in _http_tracker(so, truth).run_interprocedural()}
+    assert ("h_user", "strcpy", "HIGH") in got
+    assert ("h_fmt", "sprintf", "HIGH") in got
+    assert ("h_scan", "sscanf", "MEDIUM") in got              # parsed attacker text
+    assert ("h_scan", "strcpy", "HIGH") in got                # ... and its output field copied
+    assert ("h_body", "read", "HIGH") in got                  # header length into a fixed buffer
+    assert ("h_copy", "memcpy", "HIGH") in got
+    assert not any(n == "h_hdr" for n, _s, _v in got)         # be16() result has no model
+
+
+def test_summarise_opaque_lower_confidence(http_so):
+    so, truth = http_so
+    fs = _http_tracker(so, truth, summarise_opaque=True).run_interprocedural()
+    hdr = [f for f in fs if f.func_name == "h_hdr"]
+    assert len(hdr) == 1 and hdr[0].sink_name == "memcpy" and hdr[0].tainted_args == ["x2"]
+    assert hdr[0].severity == "MEDIUM" and "opaque" in hdr[0].note
+    assert hdr[0].source_name == "http_read_body"
+    # findings with a direct path keep their severity
+    assert {(f.func_name, f.severity) for f in fs if f.sink_name == "strcpy"} >= {("h_user", "HIGH")}
+
+
+def test_cli_sources_sinks(http_so):
+    so, truth = http_so
+    r = _cli("taint", so, "--sources", f"{hex(truth['http_get_param'])}", "--sinks", "sink:x0")
+    assert "strcpy" in r.stdout and "-> sink @" in r.stdout

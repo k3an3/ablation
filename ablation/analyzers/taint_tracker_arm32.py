@@ -317,7 +317,7 @@ class ARM32TaintTracker:
         )
 
     def _is_source(self, sym: str) -> bool:
-        return sym in _TAINT_SOURCES
+        return sym in _TAINT_SOURCES or sym in getattr(self, '_extra_sources', ())
 
     def _sink_args(self, sym: str) -> List[int]:
         return self._sinks.get(sym, [])

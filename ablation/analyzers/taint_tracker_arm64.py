@@ -50,7 +50,13 @@ _SINK_NAMES: frozenset = frozenset({
     "system", "execve", "execl", "execvp", "execle", "execvpe", "popen",
     "strcpy", "strcat", "sprintf", "vsprintf", "snprintf", "vsnprintf",
     "memcpy", "memmove", "gets",
+    "sscanf", "vsscanf", "__isoc99_sscanf", "__isoc99_vsscanf",
 })
+# attacker text parsed by sscanf: the bug is an unbounded %s / %[ (ablation fmtstr shows
+# which); reported MEDIUM, and the parsed fields (x2..x7 outputs) become tainted
+_SCAN_SINKS = frozenset({"sscanf", "vsscanf", "__isoc99_sscanf", "__isoc99_vsscanf"})
+# label carried by values that came out of a call with no model (--summarise-opaque)
+OPAQUE = "~opaque"
 _PLT_TOL = 16
 
 # Sources that fill a caller buffer: name -> (buffer arg, length arg or None)
@@ -66,6 +72,7 @@ _SINK_POINTER_ARGS: Dict[str, Tuple[str, ...]] = {
     "strcpy": ("x1",), "strcat": ("x1",), "memcpy": ("x1",), "memmove": ("x1",),
     "sprintf": tuple(f"x{i}" for i in range(1, 8)), "vsprintf": ("x1", "x2"),
     "snprintf": tuple(f"x{i}" for i in range(2, 8)), "vsnprintf": ("x2", "x3"),
+    "sscanf": ("x0",), "vsscanf": ("x0",), "__isoc99_sscanf": ("x0",), "__isoc99_vsscanf": ("x0",),
 }
 # Copies: dst pointee takes the src args' (pointee) taint
 _COPY_FUNCS: Dict[str, Tuple[str, Tuple[str, ...], Optional[str]]] = {
@@ -115,12 +122,14 @@ class TaintFindingARM64:
     tainted_args: List[str]
     source_name:  str
     severity:     str = "HIGH"
+    note:         str = ""      # e.g. "length", "via opaque call (lower confidence)"
 
     def __str__(self) -> str:
         args = ", ".join(self.tainted_args)
+        note = f" [{self.note}]" if self.note else ""
         return (f"[{self.severity}] 0x{self.func_va:x} ({self.func_name}): "
                 f"tainted {{{args}}} -> {self.sink_name} @ 0x{self.sink_va:x} "
-                f"(source: {self.source_name})")
+                f"(source: {self.source_name}){note}")
 
 
 @dataclass
@@ -1035,6 +1044,9 @@ class ARM64TaintTracker:
         self._syms        = symbols
         self._sink_names  = _SINK_NAMES | (custom_sinks or set())
         self._source_names = _SOURCE_NAMES | (custom_sources or set())
+        self._user_sources: Dict[str, str] = {}               # name -> "ret" | "val" | "xN"
+        self._user_sink_args: Dict[str, Tuple[str, ...]] = {}  # name -> arg regs (() = all)
+        self.summarise_opaque = False
         # name -> VA of functions defined here (a PLT call to one of them is followed)
         self._local_funcs: Dict[str, int] = {
             n: va for va, n in symbols.items() if text_start <= va < text_end}
@@ -1122,6 +1134,55 @@ class ARM64TaintTracker:
                 syms[fva] = f"fn_{fva:x}"
         return cls(data, base_va, text_start, text_end, syms, custom_sinks, custom_sources)
 
+    # ---- user sources / sinks ---------------------------------------------
+
+    def _spec_name(self, tok: str, prefix: str) -> str:
+        """'name' or '0xVA' -> the callee name the tracker will see at that VA."""
+        if tok.lower().startswith("0x"):
+            va = int(tok, 16)
+            name = self._syms.get(va)
+            if name is None or name.startswith("fn_"):
+                name = f"{prefix}_{va:x}"
+                self._syms[va] = name
+            return name
+        return tok
+
+    def add_sources(self, specs) -> List[str]:
+        """Attacker-input functions beyond recv/read: framework accessors (HTTP / MQTT /
+        RTSP request getters, protobuf field readers ...). Each spec is NAME or 0xVA, with:
+          (none) / :ret   result and the memory it points at are tainted (char *get_param())
+          :val            scalar result only (int get_content_length())
+          :xN             fills the buffer at argument xN (int read_body(req, buf, n) -> :x1)
+        Returns the callee names used."""
+        out = []
+        for spec in ([specs] if isinstance(specs, str) else specs):
+            for item in str(spec).split(","):
+                item = item.strip()
+                if not item:
+                    continue
+                tok, _, mode = item.partition(":")
+                name = self._spec_name(tok, "src")
+                self._user_sources[name] = mode or "ret"
+                self._source_names = self._source_names | {name}
+                out.append(name)
+        return out
+
+    def add_sinks(self, specs) -> List[str]:
+        """Extra sinks: NAME or 0xVA, optionally :xN[+xM] = the arguments whose value or
+        pointee must not be tainted (default: any argument's value, x0..x3 pointee)."""
+        out = []
+        for spec in ([specs] if isinstance(specs, str) else specs):
+            for item in str(spec).split(","):
+                item = item.strip()
+                if not item:
+                    continue
+                tok, _, regs = item.partition(":")
+                name = self._spec_name(tok, "sink")
+                self._user_sink_args[name] = tuple(r for r in regs.split("+") if r)
+                self._sink_names = self._sink_names | {name}
+                out.append(name)
+        return out
+
     # ---- listing / objdump entry points ------------------------------------
 
     def run_from_listing(self, text: str, label: str = "input") -> List[Finding]:
@@ -1194,9 +1255,15 @@ class ARM64TaintTracker:
                 callee = _name_at(self._syms, target)
                 self._on_call(eng, insn, target, callee, fva, func_name, findings, depth, enqueue)
             else:
+                opq: Set[str] = set()
+                if self.summarise_opaque and m.startswith("blr"):
+                    for r in ARG_REGS:
+                        opq |= eng.state.get(r).labels | eng.state.pointee(r).labels
                 self._before_step(eng, insn, fva)
                 eng.step(insn)          # ret is checked and the linear pass continues
                 self._after_step(eng, insn, fva)
+                if opq:
+                    self._opaque_result(eng, opq, insn.address)
         return findings
 
     def _before_step(self, eng: TaintEngine, insn: Insn, fva: int) -> None:
@@ -1211,18 +1278,51 @@ class ARM64TaintTracker:
         """bl / tail-call b: sink check, copy + source modelling, callee queueing."""
         st = eng.state
         if callee in self._sink_names:
-            tainted = [r for r in ARG_REGS if st.get(r).tainted]
-            tainted += [f"*{r}" for r in _SINK_POINTER_ARGS.get(callee, ())
-                        if st.pointee(r).tainted and r not in tainted]
+            user = self._user_sink_args.get(callee)
+            regs = user if user else ARG_REGS
+            ptr_regs = user if user else (_SINK_POINTER_ARGS.get(callee)
+                                          or (("x0", "x1", "x2", "x3") if user is not None else ()))
+            tainted = [r for r in regs if st.get(r).tainted and callee not in _SCAN_SINKS]
+            tainted += [f"*{r}" for r in ptr_regs if st.pointee(r).tainted and r not in tainted]
             if tainted:
                 labels: Set[str] = set()
+                sure = False                    # some argument is tainted without an opaque hop
                 for a in tainted:
-                    labels |= (st.pointee(a[1:]) if a.startswith("*") else st.get(a)).labels
-                findings.append(TaintFindingARM64(
-                    func_va=fva, func_name=func_name, sink_va=insn.address, sink_name=callee,
-                    tainted_args=tainted, source_name=next(iter(sorted(labels)), "unknown"),
-                    severity="CRITICAL" if callee in _EXEC_SINKS else "HIGH",
-                ))
+                    al = (st.pointee(a[1:]) if a.startswith("*") else st.get(a)).labels
+                    labels |= al
+                    sure |= OPAQUE not in al
+                if sure:
+                    labels.discard(OPAQUE)
+                sev = ("CRITICAL" if callee in _EXEC_SINKS else
+                       "MEDIUM" if callee in _SCAN_SINKS else "HIGH")
+                note = "parsed with sscanf: check %s width (ablation fmtstr)" if callee in _SCAN_SINKS else ""
+                self._finding(findings, fva, func_name, insn.address, callee, tainted, labels, sev, note)
+
+        # read / recv whose length came from attacker data (a parsed header field)
+        if callee in self._source_names and callee in _SOURCE_BUFFERS:
+            nreg = _SOURCE_BUFFERS[callee][1]
+            if nreg and st.get(nreg).tainted:
+                self._finding(findings, fva, func_name, insn.address, callee, [nreg],
+                              set(st.get(nreg).labels), "HIGH",
+                              "length from attacker data into a fixed buffer")
+
+        # sscanf of attacker text: every output it writes is attacker data
+        if callee in _SCAN_SINKS and st.pointee("x0").tainted:
+            for r in ARG_REGS[2:]:
+                if r in st.frame_ptrs:
+                    eng.taint_buffer(r, 1 << 8, st.pointee("x0").labels, region=f"@scan{insn.address:x}")
+
+        # user sources that fill an argument buffer
+        mode = self._user_sources.get(callee or "")
+        if mode and mode.startswith("x") and mode in ARG_REGS:
+            eng.taint_buffer(mode, 1 << 20, callee, region=f"@buf{insn.address:x}")
+
+        # unmodelled call fed attacker data: summarise conservatively (lower confidence)
+        opaque_labels: Set[str] = set()
+        if (self.summarise_opaque and callee not in self._sink_names
+                and callee not in self._source_names and callee not in _COPY_FUNCS):
+            for r in ARG_REGS:
+                opaque_labels |= st.get(r).labels | st.pointee(r).labels
 
         if callee in _COPY_FUNCS:
             dst, srcs, nreg = _COPY_FUNCS[callee]
@@ -1249,6 +1349,26 @@ class ARM64TaintTracker:
             # scalar result in x0 only: read/recv/fgetc/... do not return in x1
             st.set("x1", CLEAN)
             st.set("x0", Taint(frozenset({callee}), None))
+            if self._user_sources.get(callee) == "ret":       # pointer to request data
+                eng.taint_buffer("x0", 1 << 20, callee, region=f"@ret{insn.address:x}")
+        elif opaque_labels:
+            self._opaque_result(eng, opaque_labels, insn.address)
+
+    def _opaque_result(self, eng: TaintEngine, labels: Set[str], site: int) -> None:
+        st = eng.state
+        lab = frozenset(labels) | {OPAQUE}
+        st.set("x0", Taint(lab, None))
+        eng.taint_buffer("x0", 1 << 12, lab, region=f"@opq{site:x}")
+
+    def _finding(self, findings, fva, func_name, site, callee, tainted, labels, sev, note="") -> None:
+        if OPAQUE in labels:                       # passed through a call with no model
+            sev = {"CRITICAL": "HIGH", "HIGH": "MEDIUM"}.get(sev, "LOW")
+            note = "; ".join(x for x in (note, "via opaque call (lower confidence)") if x)
+        real = sorted(l for l in labels if l != OPAQUE)
+        findings.append(TaintFindingARM64(
+            func_va=fva, func_name=func_name, sink_va=site, sink_name=callee,
+            tainted_args=list(tainted), source_name=next(iter(real), "unknown"),
+            severity=sev, note=note))
 
     # ---- public API -------------------------------------------------------
 

@@ -134,6 +134,30 @@ def _check_oracles(args, ctx, engine: str) -> None:
             print(msg)
 
 
+def _apply_taint_args(args, tracker) -> None:
+    """--sources / --sinks / --summarise-opaque onto an ARM64TaintTracker (or subclass)."""
+    if getattr(args, 'sources', None):
+        names = tracker.add_sources(args.sources)
+        print(f"[*] sources: {', '.join(names)}", file=sys.stderr)
+    if getattr(args, 'sinks', None) and hasattr(tracker, 'add_sinks'):
+        names = tracker.add_sinks(args.sinks)
+        print(f"[*] extra sinks: {', '.join(names)}", file=sys.stderr)
+    if getattr(args, 'summarise_opaque', False):
+        tracker.summarise_opaque = True
+
+
+def _add_taint_args(p) -> None:
+    p.add_argument('--sources', metavar='SPEC[,SPEC]',
+                   help='extra attacker-input functions, NAME or 0xVA: framework accessors '
+                        '(http_get_param, mqtt_payload ...). Suffix :ret (default; result and '
+                        'what it points at), :val (scalar result), :xN (fills buffer at xN)')
+    p.add_argument('--sinks', metavar='SPEC[,SPEC]',
+                   help='extra sinks, NAME or 0xVA, optional :xN[+xM] = guarded arguments')
+    p.add_argument('--summarise-opaque', action='store_true',
+                   help='a call with no model that receives attacker data taints its result '
+                        '(findings through it are marked lower confidence)')
+
+
 def _add_raw_args(p) -> None:
     p.add_argument('--raw', metavar='ARCH',
                    help='headerless firmware image: thumb (Cortex-M), arm32, or arm64')
@@ -215,6 +239,7 @@ def cmd_taint(args):
     if ctx.arch == 'arm64':
         from ablation.analyzers.taint_tracker_arm64 import ARM64TaintTracker
         tracker = ARM64TaintTracker.from_context(ctx)
+        _apply_taint_args(args, tracker)
         findings = tracker.run_interprocedural(depth=getattr(args, 'depth', 4))
         if not findings:
             print("No taint paths found.")
@@ -224,7 +249,10 @@ def cmd_taint(args):
 
     if ctx.arch == 'arm32':
         from ablation.analyzers.taint_tracker_arm32 import ARM32TaintTracker
-        tracker = ARM32TaintTracker.from_context(ctx)
+        sinks = {n: [0, 1, 2, 3] for n in (getattr(args, 'sinks', None) or '').split(',')
+                 if n and not n.startswith('0x')}
+        tracker = ARM32TaintTracker.from_context(ctx, custom_sinks=sinks or None)
+        tracker._extra_sources = {n.partition(':')[0] for n in (getattr(args, 'sources', None) or '').split(',') if n}
         findings = tracker.run_interprocedural()
         if not findings:
             print("No taint paths found.")
@@ -283,6 +311,7 @@ def cmd_overflow(args):
     if ctx.arch == 'arm64':
         from ablation.analyzers.intoverflow_scanner_arm64 import ARM64IntOverflowScanner
         scanner = ARM64IntOverflowScanner.from_context(ctx)
+        _apply_taint_args(args, scanner)
         print(scanner.report(scanner.scan()))
         return
     if ctx.arch != 'arm32':
@@ -724,6 +753,7 @@ def cmd_fmtstr(args):
     if ctx.arch == 'arm64':
         from ablation.analyzers.format_string_scanner_arm64 import ARM64FormatStringScanner
         scanner = ARM64FormatStringScanner.from_context(ctx)
+        _apply_taint_args(args, scanner)
     else:
         scanner = FormatStringScanner.from_context(ctx)
     findings = scanner.scan()
@@ -749,6 +779,7 @@ def cmd_heap(args):
     if ctx.arch == 'arm64':
         from ablation.analyzers.heap_scanner_arm64 import ARM64HeapScanner
         scanner = ARM64HeapScanner.from_context(ctx)
+        _apply_taint_args(args, scanner)
     else:
         scanner = HeapVulnScanner.from_context(ctx)
     findings = scanner.scan()
@@ -1223,6 +1254,7 @@ def main():
     p_taint = sub.add_parser('taint', help='taint analysis: network sources to sinks (arch-aware)')
     p_taint.add_argument('binary')
     _add_raw_args(p_taint)
+    _add_taint_args(p_taint)
     p_taint.add_argument('--interprocedural', action='store_true',
                          help='cross-function BFS taint tracking (x86-64)')
     p_taint.add_argument('--flow-sensitive', action='store_true',
@@ -1235,6 +1267,7 @@ def main():
     p_overflow = sub.add_parser('overflow', help='ARM32/ARM64 integer overflow scan: MUL -> alloc without check')
     p_overflow.add_argument('binary')
     _add_raw_args(p_overflow)
+    _add_taint_args(p_overflow)
     p_overflow.set_defaults(func=cmd_overflow)
 
     # window
@@ -1301,6 +1334,7 @@ def main():
     p_fmtstr = sub.add_parser('fmtstr', help='format string vulnerability scan (printf/syslog/err with non-literal format arg)')
     p_fmtstr.add_argument('binary')
     _add_raw_args(p_fmtstr)
+    _add_taint_args(p_fmtstr)
     p_fmtstr.add_argument('--json', metavar='FILE', default=None, help='write JSON to FILE')
     p_fmtstr.set_defaults(func=cmd_fmtstr)
 
@@ -1308,6 +1342,7 @@ def main():
     p_heap = sub.add_parser('heap', help='heap vulnerability scan: int overflow before alloc, UAF, double-free, off-by-one')
     p_heap.add_argument('binary')
     _add_raw_args(p_heap)
+    _add_taint_args(p_heap)
     p_heap.add_argument('--json', metavar='FILE', default=None, help='write JSON to FILE')
     p_heap.set_defaults(func=cmd_heap)
 
