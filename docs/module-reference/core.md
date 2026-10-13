@@ -91,6 +91,10 @@ binary-searches the result against the known string VA array.
 This builds `_str_xref_idx` (string_va -> [code_vas]) and `_func_str_idx`
 (func_va -> [string_vas]) in one O(N) pass over the binary.
 
+AArch64 has no 32-bit displacements, so arm64 uses its own pass: `adr`, `adrp`+`add`, and
+`adrp`+`ldr` through a pointer slot (`PointerSlots`: RELATIVE/ABS64 relocations, else the
+on-disk value). See [arm64-func-start-scanner.md](arm64-func-start-scanner.md).
+
 ### PPC64 string xref: 5-pass system (Cell PPU / CryEngine PS3)
 
 PowerPC64 big-endian binaries use an ABI-defined Table of Contents (r2) for all global
@@ -142,6 +146,9 @@ operation, and computes `target_va = sec_va + pos + 5 + disp32` across all candi
 single broadcast. A `searchsorted` filter against `plt | func_starts` eliminates false
 positives from `0xe8` bytes that appear inside other instruction operands. Owner assignment
 uses one batched `searchsorted` call rather than per-site binary search.
+
+arm64 scans aligned words for `BL` (`0x94000000`) and tail-call `B` (`0x14000000`) instead;
+arm32 scans for `BL`/`BLX` words.
 
 ### func_starts for stripped static ELF32 binaries
 
@@ -383,6 +390,10 @@ print(profile.summary())
 
 **Profile output includes:** basic block count, edge count, PLT calls, string references,
 estimated size, and branch density classification (linear / switch / loop-heavy).
+
+**Register annotator per arch:** x86_64 `RegAnnotator`, arm32 `ARM32RegAnnotator`, arm64
+[`ARM64RegAnnotator`](arm64-reg-annotator.md). Call args print under the arch's own
+registers (`rdi..r9`, `r0..r3`, `x0..x7`).
 
 ---
 

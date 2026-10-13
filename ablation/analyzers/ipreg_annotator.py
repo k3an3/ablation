@@ -42,7 +42,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 from .binary_context import BinaryContext
-from .reg_annotator import RegAnnotator, RegVal, _ARG_REGS, _norm
+from .arm64_reg_annotator import ARM64RegAnnotator
+from .reg_annotator import RegAnnotator, RegVal, _norm
 
 
 @dataclass
@@ -59,9 +60,8 @@ class ChainCallSite:
     def fmt(self, indent: int = 0) -> str:
         pad = "  " * indent
         parts = []
-        for reg in _ARG_REGS:
-            v = self.args.get(reg)
-            if v and v.kind not in ('unknown',):
+        for reg, v in self.args.items():
+            if v.kind not in ('unknown',):
                 parts.append(f"{reg}={v.display()}")
         args_str = ', '.join(parts)
         name = self.target_name or f"0x{self.target_va:x}"
@@ -132,9 +132,8 @@ class IPChain:
         for func_va, binary, cs in hits:
             b = Path(binary).name if binary else "?"
             args_parts = []
-            for reg in _ARG_REGS:
-                v = cs.args.get(reg)
-                if v and v.kind != 'unknown':
+            for reg, v in cs.args.items():
+                if v.kind != 'unknown':
                     args_parts.append(f"{reg}={v.display()}")
             lines.append(
                 f"  {b}:0x{func_va:x} -> {cs.target_name}(0x{cs.site_va:x})"
@@ -163,12 +162,10 @@ class IPRegAnnotator:
     ):
         self.path = binary_path
         self._ctx = ctx or BinaryContext.load_or_build(binary_path)
-        self._ra = RegAnnotator.from_path(binary_path)
         self._lib_graph = lib_graph
-
-        # Cache of RegAnnotator + BinaryContext per binary path (for cross-binary)
-        self._ra_cache: Dict[str, RegAnnotator] = {binary_path: self._ra}
         self._ctx_cache: Dict[str, BinaryContext] = {binary_path: self._ctx}
+        self._ra_cache: Dict[str, object] = {}
+        self._ra = self._get_ra(binary_path)
 
     @classmethod
     def from_context(
@@ -274,6 +271,12 @@ class IPRegAnnotator:
 
             is_plt = target_va in ra._plt if target_va else False
 
+            # PLT stub for a symbol this binary exports itself (-fPIC .so calls
+            # its own preemptible functions through the PLT): follow the export.
+            if is_plt and target_name in ctx.exports and not self._lib_graph:
+                target_va = ctx.exports[target_name]
+                is_plt = False
+
             # Determine callee binary for cross-binary calls
             if is_plt and self._lib_graph:
                 target_binary = self._resolve_callee_binary(target_name, binary)
@@ -336,14 +339,16 @@ class IPRegAnnotator:
         entry_regs: Dict[str, RegVal],
     ):
         """
-        Run RegAnnotator forward pass with a pre-set register state.
+        Run the forward pass with a pre-set register state.
 
-        Reuses RegAnnotator._step() machinery but injects the caller's
-        register state instead of seeding with generic argN values.
+        Injects the caller's register state instead of seeding with generic
+        argN values. x86 reuses RegAnnotator._step(); other arches take
+        entry_regs directly.
         """
-        from .reg_annotator import _CALLER_SAVED, AnnotationResult
-        from capstone import CS_ARCH_X86, CS_MODE_64, Cs
-        from capstone.x86 import X86_OP_IMM
+        from .reg_annotator import AnnotationResult
+
+        if not isinstance(ra, RegAnnotator):
+            return ra.annotate_calls(va, end_va, seed_args=False, entry_regs=dict(entry_regs))
 
         md = ra._md
         code = ra._read_va(va, end_va - va)
@@ -375,9 +380,14 @@ class IPRegAnnotator:
                 return starts[idx]
         return va + max_window
 
-    def _get_ra(self, binary: str) -> RegAnnotator:
+    def _get_ra(self, binary: str):
+        """Per-binary annotator for that binary's arch (x86_64 default, arm64)."""
         if binary not in self._ra_cache:
-            self._ra_cache[binary] = RegAnnotator.from_path(binary)
+            ctx = self._get_ctx(binary)
+            if ctx.arch == 'arm64':
+                self._ra_cache[binary] = ARM64RegAnnotator.from_context(ctx)
+            else:
+                self._ra_cache[binary] = RegAnnotator.from_path(binary)
         return self._ra_cache[binary]
 
     def _get_ctx(self, binary: str) -> BinaryContext:

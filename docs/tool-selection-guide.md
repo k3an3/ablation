@@ -19,6 +19,7 @@ Task-to-tool lookup. For constructor patterns and key methods, see `docs/module-
 | "Show disassembly around address" | `WindowAnalyzer.dump_text(va, window=1536)` |
 | "Find functions matching vulnerability pattern" | `SemanticSearcher.query(description)` (ALWAYS first on new binary) |
 | "What values are passed to this sink?" | `FuncProfiler.profile(va).fmt()` |
+| "ARM64: arg values at call sites (x0-x7), incl. tail calls and GOT `blr`" | `FuncProfiler.profile(va)` (auto) or `ARM64RegAnnotator.from_context(ctx).annotate_calls(va)` |
 | "Trace taint from network recv to sink" | `TaintTracker.run_interprocedural()` |
 
 ---

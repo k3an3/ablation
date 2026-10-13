@@ -39,8 +39,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 from .binary_context import BinaryContext
-from .reg_annotator import RegAnnotator, CallSite, RegVal, _ARG_REGS
+from .reg_annotator import RegAnnotator, CallSite, RegVal
 from .arm32_reg_annotator import ARM32RegAnnotator
+from .arm64_reg_annotator import ARM64RegAnnotator
 
 # Known dangerous sinks: symbol name -> reason tag
 _DEFAULT_SINKS: Dict[str, str] = {
@@ -90,7 +91,8 @@ class ProfiledCall:
         return bool(self.sink_tag)
 
     def fmt(self, arg_regs=None) -> str:
-        regs = arg_regs or _ARG_REGS
+        # args is built in calling-convention order by each arch's annotator
+        regs = arg_regs or list(self.site.args)
         parts = []
         for reg in regs:
             v = self.site.args.get(reg)
@@ -174,6 +176,8 @@ class FuncProfiler:
         self._ctx = ctx or BinaryContext.load_or_build(binary_path)
         if self._ctx.arch == 'arm32':
             self._ra = ARM32RegAnnotator.from_context(self._ctx)
+        elif self._ctx.arch == 'arm64':
+            self._ra = ARM64RegAnnotator.from_context(self._ctx)
         else:
             self._ra = RegAnnotator.from_path(binary_path)
         self._sinks: Dict[str, str] = {**_DEFAULT_SINKS}
@@ -275,9 +279,10 @@ class FuncProfiler:
         """
         Collect all .rodata strings referenced in this function.
 
-        Two sources:
+        Three sources:
         1. RegAnnotator found a RegVal.string -> its VA is in the trace
-        2. BinaryContext.strings_near the function's VA range
+        2. BinaryContext string xref index (strings_in_func)
+        3. BinaryContext.strings_near the function's VA range
         """
         seen: Set[int] = set()
         strings: List[Tuple[int, str]] = []
@@ -286,6 +291,11 @@ class FuncProfiler:
         for call in result.calls:
             for rv in call.args.values():
                 self._collect_rv_strings(rv, seen, strings)
+
+        for sva, s in self._ctx.strings_in_func(func_va):
+            if sva not in seen:
+                seen.add(sva)
+                strings.append((sva, s))
 
         # From BinaryContext: scan for string references in a larger radius
         # to catch strings in the region not caught by reg trace

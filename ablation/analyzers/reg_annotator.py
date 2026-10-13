@@ -78,7 +78,7 @@ class RegVal:
     A tracked register value.
 
     Kinds:
-      arg    : entry argument (value.int = arg index 0..5)
+      arg    : entry argument (value.int = arg index, value.str = entry register if not SysV)
       const  : immediate constant (value.int = the constant)
       string : resolved .rodata string (value.str = content)
       copy   : copied from another register (value.str = source reg, chain = source's RegVal)
@@ -96,7 +96,7 @@ class RegVal:
         if depth > 4:
             return "..."
         if self.kind == 'arg':
-            reg = _ARG_REGS[self.int_val] if self.int_val < len(_ARG_REGS) else f"arg{self.int_val}"
+            reg = self.str_val or (_ARG_REGS[self.int_val] if self.int_val < len(_ARG_REGS) else f"arg{self.int_val}")
             return f"arg{self.int_val}_entry ({reg}@entry)"
         if self.kind == 'const':
             return f"0x{self.int_val:x}"
@@ -116,8 +116,8 @@ class RegVal:
         return "?"
 
     @staticmethod
-    def arg(n: int) -> "RegVal":
-        return RegVal(kind='arg', int_val=n)
+    def arg(n: int, reg: str = "") -> "RegVal":
+        return RegVal(kind='arg', int_val=n, str_val=reg)
 
     @staticmethod
     def const(v: int) -> "RegVal":
@@ -160,9 +160,9 @@ class CallSite:
     def fmt(self) -> str:
         tname = self.target_name or f"0x{self.target_va:x}"
         lines = [f"  0x{self.site_va:x}: call {tname}"]
-        for reg in ['rdi', 'rsi', 'rdx', 'rcx', 'r8', 'r9']:
-            v = self.args.get(reg)
-            if v and v.kind != 'unknown':
+        # args is built in calling-convention order by each arch's annotator
+        for reg, v in self.args.items():
+            if v.kind != 'unknown':
                 lines.append(f"    {reg} = {v.display()}")
         return "\n".join(lines)
 

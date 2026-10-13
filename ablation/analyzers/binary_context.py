@@ -87,6 +87,62 @@ def _a64_adrp_page(w: int, va: int) -> int:
     return ((va & ~0xFFF) + (_a64_adr_imm(w) << 12)) & 0xFFFFFFFFFFFFFFFF
 
 
+class PointerSlots:
+    """Resolve 64-bit pointer slots (GOT, .data.rel.ro, globals) of a lief ELF.
+
+    PIE/.so slots are zero on disk and filled at load time, so relocations win:
+      RELATIVE            -> addend
+      ABS64 / GLOB_DAT    -> symbol value + addend (defined symbol)
+      ABS64 / GLOB_DAT / JUMP_SLOT on an undefined symbol -> symbol(slot) = name
+    Anything else falls back to the 8 bytes on disk (static, non-PIE images).
+    """
+
+    def __init__(self, binary):
+        self._binary = binary
+        self._cache: Dict[int, Optional[int]] = {}
+        self._ptrs: Optional[Dict[int, int]] = None
+        self._syms: Dict[int, str] = {}
+
+    def _load(self) -> Dict[int, int]:
+        if self._ptrs is None:
+            self._ptrs = {}
+            try:
+                for rel in self._binary.relocations:
+                    rtype = str(getattr(rel, 'type', ''))
+                    if 'RELATIVE' in rtype:
+                        self._ptrs[int(rel.address)] = int(rel.addend)
+                    elif (('ABS64' in rtype or 'GLOB_DAT' in rtype or 'JUMP_SLOT' in rtype)
+                          and rel.has_symbol):
+                        sv = int(rel.symbol.value)
+                        if sv:
+                            self._ptrs[int(rel.address)] = sv + int(rel.addend)
+                        elif rel.symbol.name:
+                            self._syms[int(rel.address)] = rel.symbol.name
+            except Exception:
+                pass
+        return self._ptrs
+
+    def ptr(self, slot: int) -> Optional[int]:
+        """Pointer value stored at slot, or None if unknown (e.g. import slot)."""
+        if slot in self._cache:
+            return self._cache[slot]
+        ptrs = self._load()
+        ptr = ptrs.get(slot)
+        if ptr is None and slot not in self._syms:
+            try:
+                raw = bytes(self._binary.get_content_from_virtual_address(slot, 8))
+                ptr = struct.unpack('<Q', raw)[0] if len(raw) == 8 else None
+            except Exception:
+                ptr = None
+        self._cache[slot] = ptr
+        return ptr
+
+    def symbol(self, slot: int) -> Optional[str]:
+        """Imported symbol bound to slot (GOT entry of an undefined symbol)."""
+        self._load()
+        return self._syms.get(slot)
+
+
 def _cache_path(binary_sha256: str, binary_name: str) -> Path:
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
     slug = f"{binary_sha256[:16]}_{Path(binary_name).name}"
@@ -1171,36 +1227,7 @@ class BinaryContext:
         if not self.strings:
             return
         strings = self.strings
-        slot_cache: Dict[int, Optional[int]] = {}
-        rel_ptrs: Optional[Dict[int, int]] = None
-
-        def _slot_ptr(slot: int) -> Optional[int]:
-            nonlocal rel_ptrs
-            if slot in slot_cache:
-                return slot_cache[slot]
-            if rel_ptrs is None:
-                # PIE/.so: pointer slots are zero on disk and filled by RELATIVE/ABS64 relocs
-                rel_ptrs = {}
-                try:
-                    for rel in binary.relocations:
-                        rtype = str(getattr(rel, 'type', ''))
-                        if 'RELATIVE' in rtype:
-                            rel_ptrs[int(rel.address)] = int(rel.addend)
-                        elif ('ABS64' in rtype or 'GLOB_DAT' in rtype) and rel.has_symbol:
-                            sv = int(rel.symbol.value)
-                            if sv:
-                                rel_ptrs[int(rel.address)] = sv + int(rel.addend)
-                except Exception:
-                    pass
-            ptr = rel_ptrs.get(slot)
-            if ptr is None:
-                try:
-                    raw = bytes(binary.get_content_from_virtual_address(slot, 8))
-                    ptr = struct.unpack('<Q', raw)[0] if len(raw) == 8 else None
-                except Exception:
-                    ptr = None
-            slot_cache[slot] = ptr
-            return ptr
+        slots = PointerSlots(binary)
 
         str_xref: Dict[int, List[int]] = {}
         func_str: Dict[int, List[int]] = {}
@@ -1242,7 +1269,7 @@ class BinaryContext:
                         if rd == base:
                             break
                     elif (x & 0xFFC00000) == 0xF9400000 and rn == base:  # LDR Xt, [Xb, #imm*8]
-                        ptr = _slot_ptr(page + ((x >> 10) & 0xFFF) * 8)
+                        ptr = slots.ptr(page + ((x >> 10) & 0xFFF) * 8)
                         if ptr is not None and ptr in strings:
                             _record(ptr, sec_va + j * 4)
                         if rd == base:

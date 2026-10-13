@@ -2,6 +2,28 @@
 
 ---
 
+## v2.77.0
+
+**ARM64RegAnnotator — AAPCS64 call-site argument values for FuncProfiler and IPRegAnnotator.**
+
+`FuncProfiler` and `IPRegAnnotator` disassembled arm64 code as x86 (`IPRegAnnotator` did so
+for every non-x86 arch), so there were no argument values at arm64 call sites. The new
+`ARM64RegAnnotator` tracks `x0..x7` through `adrp`+`add`/`ldr`, `adr`, literal pools,
+`movz`/`movk`, register copies and stack addresses. It records `bl`, tail-call `b`, and `blr`
+through an import's GOT slot. Both consumers select it automatically for arm64.
+
+- Report formatting: `ProfiledCall.fmt`, `CallSite.fmt` and `ChainCallSite.fmt` iterated a
+  hard-coded `rdi..r9` list, so ARM32 `r0..r3` args printed as `name()`. They now print each
+  call's own registers in calling-convention order. x86 output is unchanged.
+- `RegVal.arg(n, reg)` carries the entry register (`arg1_entry (x1@entry)`).
+- `IPRegAnnotator` follows a PLT call into the same binary's export (`-fPIC` self-calls)
+  when no `lib_graph` is given, instead of stopping at a PLT leaf.
+- `FuncProfiler` also lists strings from `BinaryContext.strings_in_func()`.
+- `PointerSlots` (binary_context): shared GOT / pointer-slot resolver. Import slots resolve
+  to their symbol name rather than the lazy-binding PLT0 address.
+
+---
+
 ## v2.76.0
 
 **BinaryContext — native AArch64 PLT, call graph and string xrefs; ARM64FuncStartScanner.**
