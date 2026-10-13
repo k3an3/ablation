@@ -21,6 +21,7 @@ recorded separately in BinaryContext.thumb_funcs.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 import struct
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -101,29 +102,180 @@ def infer_cortexm_base(data: bytes) -> Optional[int]:
 
 # ── symbols file ─────────────────────────────────────────────────────────────
 
-_HEX = r"(?:0x)?([0-9a-fA-F]{4,16})"
-_NM_RE = re.compile(rf"^\s*{_HEX}\s+([A-Za-z])\s+([A-Za-z_.$][\w.$@]*)\s*$")    # nm
-_ADDR_NAME_RE = re.compile(rf"^\s*{_HEX}\s+([A-Za-z_.$][\w.$@]*)\s*$")            # addr name / ld map
-_NAME_ADDR_RE = re.compile(rf"^\s*([A-Za-z_.$][\w.$@]*)\s*[=:,\s]\s*{_HEX}\s*$")  # name addr / name = addr
+SYMBOL_FORMATS = """\
+one entry per line; '#' starts a comment; commas / tabs count as spaces:
+  VA name                       0x08001234 uart_rx         (also GNU ld map lines)
+  name VA | name = VA           uart_rx 0x08001234
+  VA size name                  0x08001234 0x40 uart_rx
+  nm                            08001234 T uart_rx         (code types t/T/w/W only)
+  readelf -sW                   12: 08001234 64 FUNC GLOBAL DEFAULT 1 uart_rx
+  VA file func line             0x08001234 src/uart.c uart_rx 112
+                                (VA is any address inside the function, e.g. a
+                                 harvested log-call site: the name is attached to
+                                 the function containing it)
+VA is hex, with or without 0x."""
+
+_HEXTOK = re.compile(r"^(?:0x)?[0-9a-fA-F]{1,16}$")
+_NAMETOK = re.compile(r"^[A-Za-z_.$][\w.$@:~<>]*$")
+_READELF = re.compile(r"^\s*\d+:\s+([0-9a-fA-F]+)\s+(\S+)\s+(\w+)\s+\w+\s+\w+\s+\S+\s+(\S+)")
+
+
+@dataclass
+class SymbolEntry:
+    name: str
+    va: int
+    inside: bool = False          # VA lies somewhere inside the function, not at its start
+
+
+@dataclass
+class SymbolFile:
+    entries: List[SymbolEntry] = field(default_factory=list)
+    lines: int = 0                # non-empty, non-comment lines
+    skipped_data: int = 0         # nm / readelf data symbols
+    unrecognised: List[str] = field(default_factory=list)
+    dialects: Dict[str, int] = field(default_factory=dict)
+
+    def _add(self, dialect: str, name: str, va: int, inside: bool = False) -> None:
+        self.entries.append(SymbolEntry(name, va, inside))
+        self.dialects[dialect] = self.dialects.get(dialect, 0) + 1
+
+
+def _looks_va(tok: str) -> bool:
+    """'0x...' or 8+ hex digits: an address, not a name like 'dead' or 'add'."""
+    return _HEXTOK.match(tok) is not None and (tok.lower().startswith("0x") or len(tok) >= 8)
+
+
+def _hex(tok: str) -> Optional[int]:
+    return int(tok, 16) if _HEXTOK.match(tok) else None
+
+
+def parse_symbol_file(path: str) -> SymbolFile:
+    """Parse a symbols file in any of SYMBOL_FORMATS. Thumb bit 0 is kept."""
+    out = SymbolFile()
+    for raw in Path(path).read_text(errors="replace").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        out.lines += 1
+        m = _READELF.match(line)
+        if m:
+            if m.group(3) in ("FUNC", "IFUNC"):
+                out._add("readelf", m.group(4), int(m.group(1), 16))
+            else:
+                out.skipped_data += 1
+            continue
+        toks = line.replace(",", " ").replace("\t", " ").replace("=", " ").split()
+        va0 = _hex(toks[0])
+        if len(toks) == 3 and va0 is not None and len(toks[1]) == 1 and toks[1].isalpha() \
+                and _NAMETOK.match(toks[2]):
+            if toks[1] in "tTwW":
+                out._add("nm", toks[2], va0)
+            else:
+                out.skipped_data += 1
+        elif len(toks) == 2 and va0 is not None and _NAMETOK.match(toks[1]) \
+                and not _looks_va(toks[1]):
+            out._add("va name", toks[1], va0)
+        elif len(toks) == 2 and _NAMETOK.match(toks[0]) and _looks_va(toks[1]):
+            out._add("name va", toks[0], _hex(toks[1]))
+        elif len(toks) == 3 and va0 is not None and toks[1].isdigit() | (_hex(toks[1]) is not None) \
+                and _NAMETOK.match(toks[2]) and not _looks_va(toks[2]):
+            out._add("va size name", toks[2], va0)
+        elif len(toks) >= 4 and va0 is not None and toks[-1].isdigit() and _NAMETOK.match(toks[-2]):
+            out._add("va file func line", toks[-2], va0, inside=True)
+        elif len(out.unrecognised) < 5:
+            out.unrecognised.append(raw.strip())
+        else:
+            out.unrecognised.append("")
+    return out
 
 
 def parse_symbols(path: str) -> Dict[str, int]:
-    """{name: address} from an nm listing, "addr name" / "name addr" lines, or a GNU
-    ld map file (its "0xADDR  symbol" lines). Thumb bit 0 is kept; callers strip it.
-    nm lines keep code symbols only (t/T/w/W): a data symbol is not a function start."""
+    """{name: address} from a symbols file (see SYMBOL_FORMATS); first entry per name wins."""
     out: Dict[str, int] = {}
-    for line in Path(path).read_text(errors="replace").splitlines():
-        line = line.split("#", 1)[0]
-        for rx, name_first in ((_NM_RE, False), (_ADDR_NAME_RE, False), (_NAME_ADDR_RE, True)):
-            m = rx.match(line)
-            if m and rx is _NM_RE:
-                if m.group(2) in "tTwW":
-                    out.setdefault(m.group(3), int(m.group(1), 16))
-                break
-            if m:
-                name, addr = (m.group(1), m.group(2)) if name_first else (m.group(2), m.group(1))
-                out.setdefault(name, int(addr, 16))
-                break
+    for e in parse_symbol_file(path).entries:
+        out.setdefault(e.name, e.va)
+    return out
+
+
+# ── code-region inference ────────────────────────────────────────────────────
+
+_A64_RET = 0xD65F03C0
+
+
+def infer_code_ranges(data: bytes, base: int, mode: str, window: int = 4096,
+                      max_gap: int = 4) -> List[Tuple[int, int]]:
+    """[(lo, hi)] VA ranges that hold code, from return / prologue density per window.
+
+    arm64: a window is code when it holds >= 2 of RET / stp x29,x30,[sp,#-N]! /
+    PACIASP / BTI c (an exact 32-bit match never occurs by chance in data).
+    thumb / arm32: bx lr / pop {..pc} together with push {..lr}, >= 4 in total.
+    Code windows up to max_gap windows apart are merged (literal pools, jump tables).
+    """
+    if not _NUMPY_OK or len(data) < window:
+        return [(base, base + len(data))]
+    nwin = (len(data) + window - 1) // window
+    hits = np.zeros(nwin, dtype=np.int64)
+    if mode == "arm64":
+        n = len(data) // 4
+        w = np.frombuffer(data[: n * 4], dtype="<u4")
+        m = ((w == _A64_RET) | ((w & 0xFFC07FFF) == 0xA9807BFD)
+             | (w == 0xD503233F) | (w == 0xD503245F))
+        np.add.at(hits, (np.nonzero(m)[0] * 4) // window, 1)
+        code = hits >= 2
+    else:
+        n = len(data) // 2
+        h = np.frombuffer(data[: n * 2], dtype="<u2")
+        if mode == "thumb":
+            ret = (h == 0x4770) | ((h & 0xFF00) == 0xBD00)
+            push = (h & 0xFF00) == 0xB500
+        else:
+            w = np.frombuffer(data[: (len(data) // 4) * 4], dtype="<u4")
+            ret = np.zeros(n, dtype=bool)
+            push = np.zeros(n, dtype=bool)
+            ret[::2][: len(w)] = (w == 0xE12FFF1E) | ((w & 0xFFFF8000) == 0xE8BD8000)
+            push[::2][: len(w)] = (w & 0xFFFF4000) == 0xE92D4000
+        r_hits = np.zeros(nwin, dtype=np.int64)
+        p_hits = np.zeros(nwin, dtype=np.int64)
+        np.add.at(r_hits, (np.nonzero(ret)[0] * 2) // window, 1)
+        np.add.at(p_hits, (np.nonzero(push)[0] * 2) // window, 1)
+        code = (r_hits >= 1) & (p_hits >= 1) & (r_hits + p_hits >= 4)
+    # last return-ish marker per window: a range ends right after it, not at the window edge
+    # (exact-match markers only: a b / pop {pc} pattern occurs in random data)
+    if mode == "arm64":
+        rets = np.nonzero(w == _A64_RET)[0] * 4
+    elif mode == "thumb":
+        rets = np.nonzero(h == 0x4770)[0] * 2
+    else:
+        rets = np.nonzero(ret)[0] * 2
+    ranges: List[Tuple[int, int]] = []
+    idx = np.nonzero(code)[0].tolist()
+    for i in idx:
+        lo = base + i * window
+        hi = min(base + (i + 1) * window, base + len(data))
+        if ranges and lo - ranges[-1][1] <= max_gap * window:
+            ranges[-1] = (ranges[-1][0], hi)
+        else:
+            ranges.append((lo, hi))
+    trimmed = []
+    for lo, hi in ranges:
+        k = np.searchsorted(rets, hi - base) - 1
+        if k >= 0 and base + int(rets[k]) >= lo:
+            hi = min(hi, base + int(rets[k]) + (4 if mode != "thumb" else 2))
+        trimmed.append((lo, hi))
+    return trimmed or [(base, base + len(data))]
+
+
+def parse_ranges(spec: str) -> List[Tuple[int, int]]:
+    """'0x1000-0x8000,0x9000-0xa000' -> [(lo, hi)]."""
+    out = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        lo, sep, hi = part.partition("-")
+        if not sep:
+            raise ValueError(f"code range {part!r}: expected LO-HI")
+        out.append((int(lo, 16), int(hi, 16)))
     return out
 
 

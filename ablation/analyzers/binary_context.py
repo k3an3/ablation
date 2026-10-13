@@ -350,7 +350,8 @@ class BinaryContext:
 
     @classmethod
     def from_raw(cls, path: str, arch: str, base: Optional[int] = None,
-                 symbols: Optional[str] = None, force_rebuild: bool = False) -> "BinaryContext":
+                 symbols: Optional[str] = None, force_rebuild: bool = False,
+                 code_ranges: Optional[List[Tuple[int, int]]] = None) -> "BinaryContext":
         """
         Context for a raw (headerless) firmware image, e.g. an RTOS flash dump.
 
@@ -358,11 +359,16 @@ class BinaryContext:
         base   : load address of byte 0. Omitted for Cortex-M: inferred from the vector
                  table. Omitted for arm64: 0 (ADRP string xrefs are base-independent
                  for any page-aligned base; absolute pointers need the real base).
-        symbols: optional nm / "addr name" / ld map file naming functions (memcpy,
-                 uart_recv, ...) so sink / source names resolve in a stripped image.
+        symbols: optional symbols file naming functions (memcpy, uart_recv, ...) so sink /
+                 source names resolve in a stripped image; formats in
+                 raw_image.SYMBOL_FORMATS. Load stats: ctx.raw["symbols_stats"].
+        code_ranges: [(lo, hi)] VAs holding code. Default: inferred from return /
+                 prologue density (ctx.raw["code_ranges"]); BL / ADRP scans and function
+                 starts are restricted to them so data words do not invent call sites.
         """
         return cls.load_or_build(path, force_rebuild=force_rebuild,
-                                 raw={"arch": arch, "base": base, "symbols": symbols})
+                                 raw={"arch": arch, "base": base, "symbols": symbols,
+                                      "code_ranges": code_ranges})
 
     @classmethod
     def load_from_cache_file(cls, cache_file: str, orig_path: str = "") -> "BinaryContext":
@@ -552,8 +558,24 @@ class BinaryContext:
             f"  call_edges : {len(self.call_edges)}",
             f"  str_xrefs  : {sum(len(v) for v in self._str_xref_idx.values())} pairs indexed",
             f"  named funcs: {self.names_count()} (overlay)",
-            "",
         ]
+        if self.raw:
+            cr = self.raw.get("code_ranges") or []
+            span = sum(hi - lo for lo, hi in cr)
+            lines.append(f"  code ranges: {len(cr)} ({self.raw.get('code_source', '?')}), "
+                         f"{span:#x} bytes: " + ", ".join(f"0x{lo:x}-0x{hi:x}" for lo, hi in cr[:4])
+                         + (" ..." if len(cr) > 4 else ""))
+            st = self.raw.get("symbols_stats")
+            if st:
+                lines.append(
+                    f"  symbols    : loaded {st['loaded']} of {st['lines']} lines, attached "
+                    f"{st['attached']} ({st['by_containing_function']} by containing function), "
+                    f"outside image {st['outside_image']}, data skipped {st['skipped_data']}, "
+                    f"unrecognised {st['unrecognised']}")
+        if getattr(self, "reloc_stats", None):
+            lines.append("  relocs     : applied " + ", ".join(
+                f"{n} {k}" for k, n in sorted(self.reloc_stats.items(), key=lambda kv: -kv[1])))
+        lines.append("")
 
         if self.exports:
             lines.append(f"  exports (first {min(top_n, len(self.exports))}):")
@@ -2065,7 +2087,9 @@ class BinaryContext:
         sym_path = raw.get("symbols")
         sym_sha = _sha256(Path(sym_path).read_bytes())[:8] if sym_path else "nosym"
         sha = _sha256(data)
-        cache_file = _cache_path(sha, f"{Path(path).name}.raw-{mode}-{base:x}-{sym_sha}")
+        cr = raw.get("code_ranges")
+        cr_tag = _sha256(repr(sorted(cr)).encode())[:8] if cr else "auto"
+        cache_file = _cache_path(sha, f"{Path(path).name}.raw2-{mode}-{base:x}-{sym_sha}-{cr_tag}")
         if not force_rebuild and cache_file.exists():
             try:
                 ctx = cls._load_json(cache_file, path)
@@ -2073,7 +2097,7 @@ class BinaryContext:
                     return ctx
             except Exception:
                 pass
-        ctx = cls._build_raw(data, path, sha, mode, base, sym_path)
+        ctx = cls._build_raw(data, path, sha, mode, base, sym_path, cr)
         try:
             ctx._save_json(cache_file)
         except Exception:
@@ -2082,19 +2106,47 @@ class BinaryContext:
 
     @classmethod
     def _build_raw(cls, data: bytes, path: str, sha: str, mode: str, base: int,
-                   sym_path: Optional[str]) -> "BinaryContext":
+                   sym_path: Optional[str],
+                   code_ranges: Optional[List[Tuple[int, int]]] = None) -> "BinaryContext":
         from ablation.analyzers import raw_image as ri
         ctx = cls()
         ctx.path, ctx.sha256, ctx.base_va = path, sha, base
         ctx.arch = "arm64" if mode == "arm64" else "arm32"
-        ctx.raw = {"arch": mode, "base": base, "symbols": sym_path}
         end = base + len(data)
-        regions = [(base, data)]
+        ctx.raw = {"arch": mode, "base": base, "symbols": sym_path}
+
+        # code ranges: given, else inferred from return / prologue density
+        if code_ranges:
+            ranges = [(max(lo, base), min(hi, end)) for lo, hi in code_ranges
+                      if lo < end and hi > base]
+            ctx.raw["code_source"] = "given"
+        else:
+            ranges = ri.infer_code_ranges(data, base, mode)
+            ctx.raw["code_source"] = "inferred"
+        ctx.raw["code_ranges"] = [[lo, hi] for lo, hi in ranges]
+        code = [(lo, data[lo - base:hi - base]) for lo, hi in ranges]
+
+        def in_code(va: int) -> bool:
+            return any(lo <= va < hi for lo, hi in ranges)
 
         # names: symbols file first, then (Cortex-M) the vector table
+        symf = ri.parse_symbol_file(sym_path) if sym_path else None
+        if symf is not None and symf.lines and not symf.entries:
+            raise ValueError(
+                f"--symbols {sym_path}: 0 of {symf.lines} lines matched a known format "
+                f"(first: {symf.unrecognised[0]!r}).\nAccepted formats:\n{ri.SYMBOL_FORMATS}")
         names: Dict[str, int] = {}
-        if sym_path:
-            names.update(ri.parse_symbols(sym_path))
+        inside: Dict[str, List[int]] = {}
+        outside = 0
+        for e in (symf.entries if symf else []):
+            va = e.va & ~1 if mode != "arm64" else e.va
+            if not base <= va < end:
+                outside += 1
+                continue
+            if e.inside:
+                inside.setdefault(e.name, []).append(va)
+            else:
+                names.setdefault(e.name, e.va)
         if mode == "thumb":
             for name, va in ri.cortexm_vectors(data, base).items():
                 names.setdefault(name, va)
@@ -2108,22 +2160,23 @@ class BinaryContext:
 
         ctx.strings = ri.nul_terminated_strings(data, base)
 
-        # function starts + call graph
+        # function starts
         starts: Set[int] = set(ctx.exports.values())
+        bls: List[Tuple[int, int]] = []
         if mode == "arm64":
             from ablation.analyzers.arm64_func_start_scanner import ARM64FuncStartScanner
-            starts.update(ARM64FuncStartScanner(regions).scan())
-            ctx.func_starts = sorted(starts)
-            if _NUMPY_OK:
-                ctx._build_call_graph_arm64(data, None, regions=regions, slot_name=lambda _s: None)
+            starts.update(ARM64FuncStartScanner(code, strict=True).scan())
         else:
-            bls = ri.thumb_bl_targets(data, base) if mode == "thumb" else ri.arm_bl_targets(data, base)
+            for lo, chunk in code:
+                f = ri.thumb_bl_targets if mode == "thumb" else ri.arm_bl_targets
+                bls += [(st, t) for st, t in f(chunk, lo) if in_code(t)]
             if mode == "thumb":
                 from ablation.analyzers.flat_binary_func_start_scanner import FlatBinaryFuncStartScanner
-                try:
-                    starts.update(FlatBinaryFuncStartScanner(data, base).scan(arch="arm_cm").function_starts)
-                except Exception:
-                    pass
+                for lo, chunk in code:
+                    try:
+                        starts.update(FlatBinaryFuncStartScanner(chunk, lo).scan(arch="arm_cm").function_starts)
+                    except Exception:
+                        pass
             # a BL target is a function when called from >= 2 sites or it opens with a push
             calls: Dict[int, int] = {}
             for _site, t in bls:
@@ -2132,32 +2185,72 @@ class BinaryContext:
                 if k >= 2 or cls._raw_prologue(data, base, t, mode):
                     starts.add(t)
             starts = {x & ~1 for x in starts if base <= x < end}
-            ctx.func_starts = sorted(starts)
+        ctx.func_starts = sorted(starts)
+
+        # names harvested from inside functions (log-call sites): majority per function
+        by_func: Dict[int, Dict[str, int]] = {}
+        for name, vas in inside.items():
+            for va in vas:
+                fva = ctx.func_containing(va)
+                if fva is not None:
+                    votes = by_func.setdefault(fva, {})
+                    votes[name] = votes.get(name, 0) + 1
+        attached_inside = 0
+        taken = set(ctx.exports)
+        for fva, votes in by_func.items():
+            name = max(votes, key=lambda n: (votes[n], n))
+            if name not in taken:
+                ctx.exports[name] = fva
+                taken.add(name)
+                attached_inside += 1
+        if symf is not None:
+            attached = sum(1 for n in names if n in ctx.exports) + attached_inside
+            ctx.raw["symbols_stats"] = {
+                "lines": symf.lines, "loaded": len(symf.entries), "attached": attached,
+                "by_containing_function": attached_inside, "outside_image": outside,
+                "skipped_data": symf.skipped_data, "unrecognised": len(symf.unrecognised),
+                "dialects": symf.dialects}
+            if attached == 0:
+                import warnings
+                vas = [e.va for e in symf.entries]
+                warnings.warn(
+                    f"--symbols {Path(sym_path).name}: loaded {len(symf.entries)}, attached 0 -- "
+                    f"symbols span 0x{min(vas):x}-0x{max(vas):x}, image is 0x{base:x}-0x{end:x}; "
+                    f"check --base", stacklevel=3)
+
+        # call graph
+        if mode == "arm64":
+            if _NUMPY_OK:
+                ctx._build_call_graph_arm64(data, None, regions=code, slot_name=lambda _s: None)
+        else:
             if mode == "thumb":
-                thumb |= starts
+                thumb |= set(ctx.func_starts)
             ctx.thumb_funcs = thumb
             fs = set(ctx.func_starts)
             va_to_name = {va: n for n, va in ctx.exports.items()}
             ctx.call_edges = [(ctx.func_containing(site) or site, t, va_to_name.get(t, ""))
                               for site, t in bls if t in fs]
             if mode == "thumb":                      # b.w to another function: tail call
-                for site, t in ri.thumb_bl_targets(data, base, branch=True):
-                    caller = ctx.func_containing(site)
-                    if t in fs and caller is not None and caller != t:
-                        ctx.call_edges.append((caller, t, va_to_name.get(t, "")))
+                for lo, chunk in code:
+                    for site, t in ri.thumb_bl_targets(chunk, lo, branch=True):
+                        caller = ctx.func_containing(site)
+                        if t in fs and caller is not None and caller != t:
+                            ctx.call_edges.append((caller, t, va_to_name.get(t, "")))
         ctx._build_indices()
 
-        # string xrefs
+        # string xrefs (sites in code only)
         if mode == "arm64":
             def _slot(slot: int) -> Optional[int]:
                 off = slot - base
                 return struct.unpack_from("<Q", data, off)[0] if 0 <= off <= len(data) - 8 else None
-            ctx._build_string_xref_index_arm64(data, None, regions=regions, slot_ptr=_slot)
+            ctx._build_string_xref_index_arm64(data, None, regions=code, slot_ptr=_slot)
         else:
             str_xref: Dict[int, List[int]] = {}
             func_str: Dict[int, List[int]] = {}
-            refs = (ri.literal_pool_xrefs(data, base, thumb=(mode == "thumb"))
-                    + ri.movw_movt_pairs(data, base, thumb=(mode == "thumb")))
+            refs = []
+            for lo, chunk in code:
+                refs += (ri.literal_pool_xrefs(chunk, lo, thumb=(mode == "thumb"))
+                         + ri.movw_movt_pairs(chunk, lo, thumb=(mode == "thumb")))
             for _site, ptr in refs:
                 # a referenced address that holds a string is a string start, even when the
                 # byte before it is printable (e.g. the tail of a preceding constant)
@@ -2188,6 +2281,36 @@ class BinaryContext:
             return (h0 & 0xFF00) == 0xB500 or (h0 == 0xE92D and bool(h1 & 0x4000))   # push {.., lr}
         w = struct.unpack_from("<I", data, off)[0]
         return (w & 0xFFFF4000) == 0xE92D4000                                        # stmfd sp!, {.., lr}
+
+    def apply_sink_map(self, sink_map) -> int:
+        """Name functions by address so name-keyed sink / source oracles resolve in a
+        stripped, statically linked or headerless image.
+
+        sink_map: path to JSON, or a dict. {"0x419a44e0": "sprintf", ...}; {"sprintf":
+        "0x419a44e0"} is accepted too. Each VA becomes an export (and a function start).
+        Returns the number of functions named. Not cached: apply after every load.
+        """
+        import json
+        if not isinstance(sink_map, dict):
+            sink_map = json.loads(Path(sink_map).read_text())
+        pairs: List[Tuple[int, str]] = []
+        for k, v in sink_map.items():
+            try:
+                pairs.append((int(str(k), 16), str(v)))
+            except ValueError:
+                pairs.append((int(str(v), 16) if isinstance(v, str) else int(v), str(k)))
+        starts = set(self.func_starts)
+        for va, name in pairs:
+            if self.arch == "arm32" and va & 1:
+                va &= ~1
+                self.thumb_funcs = set(self.thumb_funcs or ()) | {va}
+            self.exports[name] = va
+            starts.add(va)
+        self.func_starts = sorted(starts)
+        named = {va: name for va, name in pairs}
+        self.call_edges = [(a, b, named.get(b, lbl)) for a, b, lbl in self.call_edges]
+        self._build_indices()
+        return len(pairs)
 
     def image_regions(self) -> List[Tuple[int, bytes]]:
         """[(va, bytes)] for everything the image maps: the raw image as one region,

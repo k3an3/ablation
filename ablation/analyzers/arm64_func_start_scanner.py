@@ -60,6 +60,17 @@ _BL_MASK = 0xFC000000
 _BL      = 0x94000000
 
 _SHF_EXECINSTR = 0x4
+
+
+def _ends_function(w: int) -> bool:
+    """Word that can be the last of a function (or padding between functions)."""
+    return (w in (0xD65F03C0, 0xD65F0BFF, 0xD65F0FFF, 0xD503201F, 0)   # ret, retaa/ab, nop, 0
+            or (w & 0xFC000000) == 0x14000000                         # b (tail call)
+            or (w & 0xFFFFFC1F) == 0xD61F0000                         # br xN
+            or (w & 0xFFE0001F) == 0xD4200000                         # brk
+            or (w & 0xFFE0001F) == 0xD4400000                         # hlt
+            or (w & 0xFFFF0000) == 0x00000000                         # udf
+            or w == 0xD69F03E0)                                       # eret
 _PF_X = 0x1
 
 
@@ -106,9 +117,15 @@ class ScanResult:
 class ARM64FuncStartScanner:
     """Prologue + BL-target function-start discovery for stripped AArch64 code."""
 
-    def __init__(self, regions: List[Tuple[int, bytes]]):
+    def __init__(self, regions: List[Tuple[int, bytes]], strict: bool = False):
         # regions: [(va, bytes)] of executable code to scan (PLT excluded)
+        # strict: a BL target / prologue is an entry only when the word before it ends
+        # the previous function (ret / b / br / brk / udf / padding); a bl before it is
+        # not enough (every return site follows a bl)
+        # or it opens with a landing pad / frame push; for headerless images where data
+        # words decode as BLs into the middle of real functions
         self._regions = [(va, data) for va, data in regions if len(data) >= 4]
+        self._strict = strict
 
     @classmethod
     def from_lief(cls, binary) -> "ARM64FuncStartScanner":
@@ -152,17 +169,31 @@ class ARM64FuncStartScanner:
                     if imm26 & 0x2000000:
                         imm26 -= 0x4000000
                     t = va + i * 4 + imm26 * 4
-                    if _in_code(t):
+                    if _in_code(t) and (not self._strict or self._entry_ok(t, prologue_ok=True)):
                         starts.add(t)
                         res.bl_targets += 1
                 elif ((w & _STP_FP_LR_MASK) == _STP_FP_LR_PRE
                       or ((w & _SUB_SP_MASK) == _SUB_SP and i + 1 < n
                           and (words[i + 1] & _STP_SP_OFF_MASK) == _STP_SP_OFF)):
+                    if self._strict and not self._entry_ok(va + i * 4, prologue_ok=False):
+                        continue                    # shrink-wrapped push after an early exit
                     res.prologues += 1
                     starts.add(va + i * 4)
 
         res.starts = sorted(self._fold_landing_pads(starts))
         return res
+
+    def _entry_ok(self, t: int, prologue_ok: bool) -> bool:
+        """Strict-mode entry test for t (see __init__)."""
+        w = self._word_at(t)
+        if w is None:
+            return False
+        if w in _LANDING:
+            return True
+        if prologue_ok and ((w & _STP_FP_LR_MASK) == _STP_FP_LR_PRE or (w & _SUB_SP_MASK) == _SUB_SP):
+            return True
+        prev = self._word_at(t - 4)
+        return prev is None or _ends_function(prev)
 
     def bl_targets(self) -> List[int]:
         """Sorted BL targets that land inside the scanned code (the most precise signal)."""

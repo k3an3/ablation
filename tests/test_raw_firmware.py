@@ -266,3 +266,104 @@ def test_cli_raw(cm):
                        capture_output=True, text=True, cwd=Path(__file__).parent.parent)
     assert r.returncode == 0, r.stderr[-500:]
     assert "arm32" in r.stdout
+
+
+# ── loader hygiene: symbols dialects, code ranges, entry filtering ───────────
+
+def test_symbol_dialects(tmp_path):
+    f = tmp_path / "syms"
+    f.write_text("0x08000100 memcpy\n08000110 T strcpy\n08000120 D table\n"
+                 "uart_rx 0x08000130\ndead = 0x08000140\n0x08000150 0x40 log_msg\n"
+                 "0x08000160, 64, parse\n"
+                 "   12: 0000000008000170    64 FUNC    GLOBAL DEFAULT   13 main\n"
+                 "   13: 0000000008000180     4 OBJECT  GLOBAL DEFAULT   13 g\n"
+                 "0x08000190 src/http.c http_handle 412\n0x08000300 add\ngarbage here !!\n")
+    r = ri.parse_symbol_file(str(f))
+    got = {(e.name, e.va, e.inside) for e in r.entries}
+    assert got == {("memcpy", 0x08000100, False), ("strcpy", 0x08000110, False),
+                   ("uart_rx", 0x08000130, False), ("dead", 0x08000140, False),
+                   ("log_msg", 0x08000150, False), ("parse", 0x08000160, False),
+                   ("main", 0x08000170, False), ("http_handle", 0x08000190, True),
+                   ("add", 0x08000300, False)}
+    assert r.skipped_data == 2 and r.unrecognised == ["garbage here !!"]
+
+
+def test_symbols_inside_function_and_stats(a64, tmp_path):
+    binf, _nm, truth = a64
+    f = tmp_path / "logsites"
+    # harvested log-call sites: VAs inside the functions, not their starts
+    f.write_text(f"0x{truth['handle_cmd'] + 0x24:x} net/cmd.c handle_cmd 88\n"
+                 f"0x{truth['handle_cmd'] + 0x30:x} net/cmd.c handle_cmd 91\n"
+                 f"0x{truth['recv'] + 8:x} net/sock.c recv 12\n"
+                 f"0x10 elsewhere.c far_away 1\n")
+    ctx = BinaryContext.from_raw(str(binf), "arm64", base=A64_BASE, symbols=str(f),
+                                 force_rebuild=True)
+    assert ctx.exports["handle_cmd"] == truth["handle_cmd"]
+    assert ctx.exports["recv"] == truth["recv"]
+    st = ctx.raw["symbols_stats"]
+    assert (st["loaded"], st["attached"], st["by_containing_function"], st["outside_image"]) == (4, 2, 2, 1)
+    assert "attached 2 (2 by containing function)" in ctx.summary()
+
+
+def test_symbols_unrecognised_fails_loudly(a64, tmp_path):
+    f = tmp_path / "bad"
+    f.write_text("this is not a symbol file\nnor is this one\n")
+    with pytest.raises(ValueError, match="0 of 2 lines matched"):
+        BinaryContext.from_raw(str(a64[0]), "arm64", base=A64_BASE, symbols=str(f),
+                               force_rebuild=True)
+
+
+def test_symbols_wrong_base_warns(a64, tmp_path):
+    f = tmp_path / "syms"
+    f.write_text("0x10000 foo\n0x20000 bar\n")
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        BinaryContext.from_raw(str(a64[0]), "arm64", base=A64_BASE, symbols=str(f),
+                               force_rebuild=True)
+    assert any("attached 0" in str(x.message) and "--base" in str(x.message) for x in w)
+
+
+def test_code_range_and_strict_entries(a64, tmp_path):
+    """Data after the code full of words that decode as BL into mid-function addresses."""
+    import random
+    binf, _nm, _truth = a64
+    code = binf.read_bytes()
+    code += b"\0" * (-len(code) % 4)
+    rnd = random.Random(1)
+    words = []
+    for i in range(65536):
+        if i % 7 == 0:
+            site = A64_BASE + len(code) + i * 4
+            tgt = A64_BASE + rnd.randrange(0, len(code) // 4) * 4
+            words.append(0x94000000 | (((tgt - site) // 4) & 0x3FFFFFF))
+        else:
+            words.append(rnd.getrandbits(32))
+    big = tmp_path / "big.bin"
+    big.write_bytes(code + struct.pack(f"<{len(words)}I", *words))
+    clean = BinaryContext.from_raw(str(binf), "arm64", base=A64_BASE, force_rebuild=True)
+    ctx = BinaryContext.from_raw(str(big), "arm64", base=A64_BASE, force_rebuild=True)
+    (lo, hi), = ctx.raw["code_ranges"]
+    assert lo == A64_BASE and hi <= A64_BASE + len(code)
+    assert ctx.func_starts == clean.func_starts
+    assert sorted(ctx.call_edges) == sorted(clean.call_edges)
+    whole = BinaryContext.from_raw(str(big), "arm64", base=A64_BASE, force_rebuild=True,
+                                   code_ranges=[(A64_BASE, A64_BASE + big.stat().st_size)])
+    assert whole.raw["code_source"] == "given" and len(whole.call_edges) > len(clean.call_edges)
+
+
+def test_cli_base_without_raw_errors(a64):
+    r = subprocess.run([sys.executable, "-m", "ablation.cli", "analyze", str(a64[0]),
+                        "--base", "0x40080000"], capture_output=True, text=True,
+                       cwd=Path(__file__).parent.parent)
+    assert r.returncode == 2 and "--raw" in r.stderr
+
+
+def test_sink_map(a64, tmp_path):
+    binf, _nm, truth = a64
+    import json
+    sm = tmp_path / "sinks.json"
+    sm.write_text(json.dumps({hex(truth["strcpy"]): "strcpy", hex(truth["recv"]): "recv"}))
+    ctx = BinaryContext.from_raw(str(binf), "arm64", base=A64_BASE, force_rebuild=True)
+    assert ctx.apply_sink_map(str(sm)) == 2
+    from ablation.analyzers.taint_tracker_arm64 import ARM64TaintTracker
+    assert any(f.sink_name == "strcpy" for f in ARM64TaintTracker.from_context(ctx).run_interprocedural())

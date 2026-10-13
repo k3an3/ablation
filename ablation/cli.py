@@ -43,23 +43,57 @@ def _require_binary(path: str) -> Path:
 
 
 def _load_ctx(args, path: str):
-    """BinaryContext for path; --raw ARCH [--base ADDR] [--symbols FILE] for a headerless image."""
+    """BinaryContext for path; --raw ARCH [--base ADDR] [--symbols FILE] [--code-range R]
+    for a headerless image. --base / --symbols / --code-range without --raw is an error."""
     from ablation.analyzers.binary_context import BinaryContext
     arch = getattr(args, 'raw', None)
-    if not arch:
-        return BinaryContext.load_or_build(path)
     base = getattr(args, 'base', None)
-    return BinaryContext.from_raw(path, arch, base=int(base, 0) if base else None,
-                                  symbols=getattr(args, 'symbols', None))
+    if not arch:
+        given = [f for f in ('base', 'symbols', 'code_range') if getattr(args, f, None)]
+        if given:
+            flags = ", ".join("--" + f.replace("_", "-") for f in given)
+            print(f"error: {flags} only apply to a raw image: add --raw thumb|arm32|arm64",
+                  file=sys.stderr)
+            sys.exit(2)
+        ctx = BinaryContext.load_or_build(path)
+    else:
+        from ablation.analyzers.raw_image import parse_ranges
+        cr = getattr(args, 'code_range', None)
+        try:
+            ctx = BinaryContext.from_raw(path, arch, base=int(base, 0) if base else None,
+                                         symbols=getattr(args, 'symbols', None),
+                                         code_ranges=parse_ranges(cr) if cr else None)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            sys.exit(2)
+        st = (ctx.raw or {}).get("symbols_stats")
+        if st:
+            print(f"[*] symbols: loaded {st['loaded']}, attached {st['attached']}"
+                  f" ({st['by_containing_function']} by containing function),"
+                  f" outside image {st['outside_image']}", file=sys.stderr)
+    sink_map = getattr(args, 'sink_map', None)
+    if sink_map:
+        n = ctx.apply_sink_map(sink_map)
+        print(f"[*] sink map: {n} function(s) named from {sink_map}", file=sys.stderr)
+    return ctx
 
 
 def _add_raw_args(p) -> None:
     p.add_argument('--raw', metavar='ARCH',
                    help='headerless firmware image: thumb (Cortex-M), arm32, or arm64')
     p.add_argument('--base', metavar='ADDR',
-                   help='load address of byte 0 (e.g. 0x08000000); inferred from the vector table on Cortex-M')
+                   help='load address of byte 0 (e.g. 0x08000000); needs --raw; inferred from '
+                        'the vector table on Cortex-M')
     p.add_argument('--symbols', metavar='FILE',
-                   help='nm / "addr name" / ld map file naming functions in the raw image')
+                   help='raw image names, one per line: "VA name", "name VA", "VA size name", '
+                        'nm, readelf -sW, or "VA file func line" (VA anywhere inside the '
+                        'function, e.g. harvested log-call sites)')
+    p.add_argument('--code-range', metavar='LO-HI[,LO-HI]',
+                   help='raw image code ranges (hex VAs); default: inferred from return / '
+                        'prologue density')
+    p.add_argument('--sink-map', metavar='JSON',
+                   help='{"0xVA": "memcpy", ...}: name sinks / sources in a stripped or '
+                        'statically linked image (ELF or raw)')
 
 
 def _build_corpus_for(binary_path: str, db: Path) -> None:
