@@ -42,6 +42,26 @@ def _require_binary(path: str) -> Path:
     return p
 
 
+def _load_ctx(args, path: str):
+    """BinaryContext for path; --raw ARCH [--base ADDR] [--symbols FILE] for a headerless image."""
+    from ablation.analyzers.binary_context import BinaryContext
+    arch = getattr(args, 'raw', None)
+    if not arch:
+        return BinaryContext.load_or_build(path)
+    base = getattr(args, 'base', None)
+    return BinaryContext.from_raw(path, arch, base=int(base, 0) if base else None,
+                                  symbols=getattr(args, 'symbols', None))
+
+
+def _add_raw_args(p) -> None:
+    p.add_argument('--raw', metavar='ARCH',
+                   help='headerless firmware image: thumb (Cortex-M), arm32, or arm64')
+    p.add_argument('--base', metavar='ADDR',
+                   help='load address of byte 0 (e.g. 0x08000000); inferred from the vector table on Cortex-M')
+    p.add_argument('--symbols', metavar='FILE',
+                   help='nm / "addr name" / ld map file naming functions in the raw image')
+
+
 def _build_corpus_for(binary_path: str, db: Path) -> None:
     """Ensure func_id.db contains an up-to-date corpus entry for binary_path."""
     from ablation.analyzers.corpus_builder import CorpusBuilder
@@ -54,7 +74,7 @@ def cmd_analyze(args):
     from ablation.analyzers.binary_context import BinaryContext
     from ablation.analyzers.entropy_mapper import EntropyMapper
 
-    ctx = BinaryContext.load_or_build(str(_require_binary(args.binary)))
+    ctx = _load_ctx(args, str(_require_binary(args.binary)))
     print(ctx.summary())
 
     if args.entropy:
@@ -93,7 +113,17 @@ def cmd_taint(args):
     from ablation.analyzers.binary_context import BinaryContext
 
     p = str(_require_binary(args.binary))
-    ctx = BinaryContext.load_or_build(p)
+    ctx = _load_ctx(args, p)
+
+    if ctx.arch == 'arm64':
+        from ablation.analyzers.taint_tracker_arm64 import ARM64TaintTracker
+        tracker = ARM64TaintTracker.from_context(ctx)
+        findings = tracker.run_interprocedural(depth=getattr(args, 'depth', 4))
+        if not findings:
+            print("No taint paths found.")
+            return
+        print(tracker.report(findings))
+        return
 
     if ctx.arch == 'arm32':
         from ablation.analyzers.taint_tracker_arm32 import ARM32TaintTracker
@@ -150,7 +180,7 @@ def cmd_overflow(args):
     from ablation.analyzers.binary_context import BinaryContext
 
     p = str(_require_binary(args.binary))
-    ctx = BinaryContext.load_or_build(p)
+    ctx = _load_ctx(args, p)
 
     if ctx.arch == 'arm64':
         from ablation.analyzers.intoverflow_scanner_arm64 import ARM64IntOverflowScanner
@@ -203,7 +233,7 @@ def cmd_profile(args):
 
     p = str(_require_binary(args.binary))
     va = int(args.va, 16)
-    ctx = BinaryContext.load_or_build(p)
+    ctx = _load_ctx(args, p)
 
     fp = FuncProfiler.from_context(ctx)
     profile = fp.profile(va=va)
@@ -212,7 +242,7 @@ def cmd_profile(args):
     if profile.sink_calls:
         print(f"\nSink calls ({len(profile.sink_calls)}):")
         for sc in profile.sink_calls:
-            print(f"  0x{sc.va:x}  {sc.target_name}  [SINK]")
+            print(f"  0x{sc.site.site_va:x}  {sc.site.target_name}  [SINK]")
 
 
 def cmd_cfg(args):
@@ -591,7 +621,7 @@ def cmd_fmtstr(args):
     from ablation.analyzers.format_string_scanner import FormatStringScanner
 
     p = str(_require_binary(args.binary))
-    ctx = BinaryContext.load_or_build(p)
+    ctx = _load_ctx(args, p)
     if ctx.arch == 'arm64':
         from ablation.analyzers.format_string_scanner_arm64 import ARM64FormatStringScanner
         scanner = ARM64FormatStringScanner.from_context(ctx)
@@ -615,7 +645,7 @@ def cmd_heap(args):
     from ablation.analyzers.heap_vuln_scanner import HeapVulnScanner
 
     p = str(_require_binary(args.binary))
-    ctx = BinaryContext.load_or_build(p)
+    ctx = _load_ctx(args, p)
     if ctx.arch == 'arm64':
         from ablation.analyzers.heap_scanner_arm64 import ARM64HeapScanner
         scanner = ARM64HeapScanner.from_context(ctx)
@@ -1077,6 +1107,7 @@ def main():
     # analyze
     p_analyze = sub.add_parser('analyze', help='binary summary, strings, entropy')
     p_analyze.add_argument('binary')
+    _add_raw_args(p_analyze)
     p_analyze.add_argument('--entropy', action='store_true', help='include entropy scan')
     p_analyze.set_defaults(func=cmd_analyze)
 
@@ -1091,6 +1122,7 @@ def main():
     # taint
     p_taint = sub.add_parser('taint', help='taint analysis: network sources to sinks (arch-aware)')
     p_taint.add_argument('binary')
+    _add_raw_args(p_taint)
     p_taint.add_argument('--interprocedural', action='store_true',
                          help='cross-function BFS taint tracking (x86-64)')
     p_taint.add_argument('--flow-sensitive', action='store_true',
@@ -1102,6 +1134,7 @@ def main():
     # overflow
     p_overflow = sub.add_parser('overflow', help='ARM32/ARM64 integer overflow scan: MUL -> alloc without check')
     p_overflow.add_argument('binary')
+    _add_raw_args(p_overflow)
     p_overflow.set_defaults(func=cmd_overflow)
 
     # window
@@ -1117,6 +1150,7 @@ def main():
     # profile
     p_profile = sub.add_parser('profile', help='full function profile: strings + call args + sinks')
     p_profile.add_argument('binary')
+    _add_raw_args(p_profile)
     p_profile.add_argument('va', help='function VA in hex, e.g. 0x1234')
     p_profile.set_defaults(func=cmd_profile)
 
@@ -1166,12 +1200,14 @@ def main():
     # fmtstr
     p_fmtstr = sub.add_parser('fmtstr', help='format string vulnerability scan (printf/syslog/err with non-literal format arg)')
     p_fmtstr.add_argument('binary')
+    _add_raw_args(p_fmtstr)
     p_fmtstr.add_argument('--json', metavar='FILE', default=None, help='write JSON to FILE')
     p_fmtstr.set_defaults(func=cmd_fmtstr)
 
     # heap
     p_heap = sub.add_parser('heap', help='heap vulnerability scan: int overflow before alloc, UAF, double-free, off-by-one')
     p_heap.add_argument('binary')
+    _add_raw_args(p_heap)
     p_heap.add_argument('--json', metavar='FILE', default=None, help='write JSON to FILE')
     p_heap.set_defaults(func=cmd_heap)
 

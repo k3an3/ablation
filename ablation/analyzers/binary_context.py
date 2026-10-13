@@ -143,6 +143,23 @@ class PointerSlots:
         return self._syms.get(slot)
 
 
+class RawSlots:
+    """PointerSlots for a raw image: no relocations or imports, the 8 bytes at the slot."""
+
+    def __init__(self, regions: List[Tuple[int, bytes]]):
+        self._regions = regions
+
+    def ptr(self, slot: int) -> Optional[int]:
+        for va, data in self._regions:
+            off = slot - va
+            if 0 <= off <= len(data) - 8:
+                return struct.unpack_from('<Q', data, off)[0]
+        return None
+
+    def symbol(self, slot: int) -> Optional[str]:
+        return None
+
+
 def _cache_path(binary_sha256: str, binary_name: str) -> Path:
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
     slug = f"{binary_sha256[:16]}_{Path(binary_name).name}"
@@ -272,19 +289,26 @@ class BinaryContext:
         self._callees_idx: Dict[int, List[Tuple[int, str]]] = {}
         self._str_xref_idx: Dict[int, List[int]] = {}
         self._func_str_idx: Dict[int, List[int]] = {}
+        # raw (headerless) image: {"arch": "arm64"|"arm32"|"thumb", "base": int, "symbols": path|None}
+        self.raw: Optional[Dict] = None
 
     # ── public factory ────────────────────────────────────────────────────────
 
     @classmethod
-    def load_or_build(cls, path: str, force_rebuild: bool = False) -> "BinaryContext":
+    def load_or_build(cls, path: str, force_rebuild: bool = False,
+                      raw: Optional[Dict] = None) -> "BinaryContext":
         """
         Load from cache if valid, otherwise build from scratch and cache.
 
         Args:
-            path         : path to ELF binary
+            path         : path to ELF / PE binary, or a raw image when raw is given
             force_rebuild: ignore cache and rebuild
+            raw          : {"arch": ..., "base": ..., "symbols": ...} for a headerless
+                           image (see from_raw)
         """
         data = Path(path).read_bytes()
+        if raw is not None:
+            return cls._load_or_build_raw(path, data, raw, force_rebuild)
 
         # Detect non-ELF formats early so callers aren't silently misled by an
         # empty context.  Known magic bytes that are NOT ELF:
@@ -323,6 +347,22 @@ class BinaryContext:
         except Exception:
             pass
         return ctx
+
+    @classmethod
+    def from_raw(cls, path: str, arch: str, base: Optional[int] = None,
+                 symbols: Optional[str] = None, force_rebuild: bool = False) -> "BinaryContext":
+        """
+        Context for a raw (headerless) firmware image, e.g. an RTOS flash dump.
+
+        arch   : "thumb" / "cortex-m" (Thumb-2), "arm32" / "arm" (A32), "arm64" / "aarch64"
+        base   : load address of byte 0. Omitted for Cortex-M: inferred from the vector
+                 table. Omitted for arm64: 0 (ADRP string xrefs are base-independent
+                 for any page-aligned base; absolute pointers need the real base).
+        symbols: optional nm / "addr name" / ld map file naming functions (memcpy,
+                 uart_recv, ...) so sink / source names resolve in a stripped image.
+        """
+        return cls.load_or_build(path, force_rebuild=force_rebuild,
+                                 raw={"arch": arch, "base": base, "symbols": symbols})
 
     @classmethod
     def load_from_cache_file(cls, cache_file: str, orig_path: str = "") -> "BinaryContext":
@@ -542,10 +582,16 @@ class BinaryContext:
         try:
             binary = lief.parse(data)
         except Exception:
-            return ctx
+            binary = None
         if isinstance(binary, lief.PE.Binary):
             return cls._build_pe(data, path, sha, binary)
         if not isinstance(binary, lief.ELF.Binary):
+            import warnings
+            ctx.arch = "unknown"
+            warnings.warn(
+                f"BinaryContext: {Path(path).name!r} is not an ELF or PE file -- context is empty. "
+                f"For a raw firmware image use BinaryContext.from_raw(path, arch='thumb'|'arm32'|"
+                f"'arm64', base=...) or the CLI's --raw / --base.", stacklevel=3)
             return ctx
 
         ctx.base_va = binary.imagebase
@@ -1996,6 +2042,164 @@ class BinaryContext:
 
     # ── PE support ────────────────────────────────────────────────────────────
 
+    # ── raw images ─────────────────────────────────────────────────────────────
+
+    _RAW_ARCH = {"thumb": "thumb", "cortex-m": "thumb", "cortexm": "thumb", "armv7m": "thumb",
+                 "armv7-m": "thumb", "armv8m": "thumb", "arm32": "arm32", "arm": "arm32",
+                 "a32": "arm32", "arm64": "arm64", "aarch64": "arm64"}
+
+    @classmethod
+    def _load_or_build_raw(cls, path: str, data: bytes, raw: Dict, force_rebuild: bool) -> "BinaryContext":
+        from ablation.analyzers import raw_image as ri
+        mode = cls._RAW_ARCH.get(str(raw.get("arch", "")).lower())
+        if mode is None:
+            raise ValueError(f"raw arch {raw.get('arch')!r}: use thumb / cortex-m, arm32, or arm64")
+        base = raw.get("base")
+        if base is None and mode == "thumb":
+            base = ri.infer_cortexm_base(data)
+            if base is None:
+                import warnings
+                warnings.warn(f"BinaryContext: no Cortex-M vector table at the start of "
+                              f"{Path(path).name!r}; using base 0 (pass base=...)", stacklevel=3)
+        base = int(base or 0)
+        sym_path = raw.get("symbols")
+        sym_sha = _sha256(Path(sym_path).read_bytes())[:8] if sym_path else "nosym"
+        sha = _sha256(data)
+        cache_file = _cache_path(sha, f"{Path(path).name}.raw-{mode}-{base:x}-{sym_sha}")
+        if not force_rebuild and cache_file.exists():
+            try:
+                ctx = cls._load_json(cache_file, path)
+                if ctx.sha256 == sha and ctx.raw:
+                    return ctx
+            except Exception:
+                pass
+        ctx = cls._build_raw(data, path, sha, mode, base, sym_path)
+        try:
+            ctx._save_json(cache_file)
+        except Exception:
+            pass
+        return ctx
+
+    @classmethod
+    def _build_raw(cls, data: bytes, path: str, sha: str, mode: str, base: int,
+                   sym_path: Optional[str]) -> "BinaryContext":
+        from ablation.analyzers import raw_image as ri
+        ctx = cls()
+        ctx.path, ctx.sha256, ctx.base_va = path, sha, base
+        ctx.arch = "arm64" if mode == "arm64" else "arm32"
+        ctx.raw = {"arch": mode, "base": base, "symbols": sym_path}
+        end = base + len(data)
+        regions = [(base, data)]
+
+        # names: symbols file first, then (Cortex-M) the vector table
+        names: Dict[str, int] = {}
+        if sym_path:
+            names.update(ri.parse_symbols(sym_path))
+        if mode == "thumb":
+            for name, va in ri.cortexm_vectors(data, base).items():
+                names.setdefault(name, va)
+        thumb: Set[int] = set()
+        for name, va in names.items():
+            if mode != "arm64" and (mode == "thumb" or va & 1):
+                thumb.add(va & ~1)
+                va &= ~1
+            if base <= va < end:
+                ctx.exports[name] = va
+
+        ctx.strings = ri.nul_terminated_strings(data, base)
+
+        # function starts + call graph
+        starts: Set[int] = set(ctx.exports.values())
+        if mode == "arm64":
+            from ablation.analyzers.arm64_func_start_scanner import ARM64FuncStartScanner
+            starts.update(ARM64FuncStartScanner(regions).scan())
+            ctx.func_starts = sorted(starts)
+            if _NUMPY_OK:
+                ctx._build_call_graph_arm64(data, None, regions=regions, slot_name=lambda _s: None)
+        else:
+            bls = ri.thumb_bl_targets(data, base) if mode == "thumb" else ri.arm_bl_targets(data, base)
+            if mode == "thumb":
+                from ablation.analyzers.flat_binary_func_start_scanner import FlatBinaryFuncStartScanner
+                try:
+                    starts.update(FlatBinaryFuncStartScanner(data, base).scan(arch="arm_cm").function_starts)
+                except Exception:
+                    pass
+            # a BL target is a function when called from >= 2 sites or it opens with a push
+            calls: Dict[int, int] = {}
+            for _site, t in bls:
+                calls[t] = calls.get(t, 0) + 1
+            for t, k in calls.items():
+                if k >= 2 or cls._raw_prologue(data, base, t, mode):
+                    starts.add(t)
+            starts = {x & ~1 for x in starts if base <= x < end}
+            ctx.func_starts = sorted(starts)
+            if mode == "thumb":
+                thumb |= starts
+            ctx.thumb_funcs = thumb
+            fs = set(ctx.func_starts)
+            va_to_name = {va: n for n, va in ctx.exports.items()}
+            ctx.call_edges = [(ctx.func_containing(site) or site, t, va_to_name.get(t, ""))
+                              for site, t in bls if t in fs]
+            if mode == "thumb":                      # b.w to another function: tail call
+                for site, t in ri.thumb_bl_targets(data, base, branch=True):
+                    caller = ctx.func_containing(site)
+                    if t in fs and caller is not None and caller != t:
+                        ctx.call_edges.append((caller, t, va_to_name.get(t, "")))
+        ctx._build_indices()
+
+        # string xrefs
+        if mode == "arm64":
+            def _slot(slot: int) -> Optional[int]:
+                off = slot - base
+                return struct.unpack_from("<Q", data, off)[0] if 0 <= off <= len(data) - 8 else None
+            ctx._build_string_xref_index_arm64(data, None, regions=regions, slot_ptr=_slot)
+        else:
+            str_xref: Dict[int, List[int]] = {}
+            func_str: Dict[int, List[int]] = {}
+            refs = (ri.literal_pool_xrefs(data, base, thumb=(mode == "thumb"))
+                    + ri.movw_movt_pairs(data, base, thumb=(mode == "thumb")))
+            for _site, ptr in refs:
+                # a referenced address that holds a string is a string start, even when the
+                # byte before it is printable (e.g. the tail of a preceding constant)
+                if ptr not in ctx.strings:
+                    txt = ri.string_at(data, base, ptr)
+                    if txt is not None:
+                        ctx.strings[ptr] = txt
+                        for k in range(ptr - 3, ptr):     # drop the glued '@boot...' variant
+                            if ctx.strings.get(k, "").endswith(txt):
+                                del ctx.strings[k]
+            for site, ptr in refs:
+                if ptr in ctx.strings:
+                    fva = ctx.func_containing(site)
+                    if fva is not None:
+                        str_xref.setdefault(ptr, []).append(site)
+                        func_str.setdefault(fva, []).append(ptr)
+            ctx._str_xref_idx = str_xref
+            ctx._func_str_idx = {k: list(dict.fromkeys(v)) for k, v in func_str.items()}
+        return ctx
+
+    @staticmethod
+    def _raw_prologue(data: bytes, base: int, va: int, mode: str) -> bool:
+        off = va - base
+        if not 0 <= off <= len(data) - 4:
+            return False
+        if mode == "thumb":
+            h0, h1 = struct.unpack_from("<HH", data, off)
+            return (h0 & 0xFF00) == 0xB500 or (h0 == 0xE92D and bool(h1 & 0x4000))   # push {.., lr}
+        w = struct.unpack_from("<I", data, off)[0]
+        return (w & 0xFFFF4000) == 0xE92D4000                                        # stmfd sp!, {.., lr}
+
+    def image_regions(self) -> List[Tuple[int, bytes]]:
+        """[(va, bytes)] for everything the image maps: the raw image as one region,
+        ELF LOAD segments, or PE sections. Analyzers use this instead of re-parsing."""
+        data = Path(self.path).read_bytes()
+        if self.raw:
+            return [(self.base_va, data)]
+        if not _LIEF_OK:
+            return []
+        binary = lief.parse(data)
+        return image_regions(binary) if binary is not None else []
+
     @classmethod
     def _build_pe(cls, data: bytes, path: str, sha: str, binary) -> "BinaryContext":
         ctx = cls()
@@ -2439,6 +2643,7 @@ class BinaryContext:
             "thumb_funcs": sorted(self.thumb_funcs),
             "str_xref_idx": {str(k): v for k, v in self._str_xref_idx.items()},
             "func_str_idx": {str(k): v for k, v in self._func_str_idx.items()},
+            "raw": self.raw,
         }
         path.write_text(json.dumps(payload, separators=(",", ":")))
 
@@ -2465,4 +2670,5 @@ class BinaryContext:
         ctx._build_indices()
         ctx._str_xref_idx = {int(k): v for k, v in payload.get("str_xref_idx", {}).items()}
         ctx._func_str_idx = {int(k): v for k, v in payload.get("func_str_idx", {}).items()}
+        ctx.raw = payload.get("raw")
         return ctx

@@ -2,6 +2,34 @@
 
 ---
 
+## v2.85.0
+
+**Raw (headerless) firmware images: `BinaryContext.from_raw` and `--raw/--base/--symbols`.**
+
+RTOS and bare-metal flash dumps (Cortex-M Thumb-2, ARM32, AArch64) now build a full context:
+names, function starts, call graph, strings and string xrefs.
+
+- `BinaryContext.from_raw(path, arch, base=None, symbols=None)`. The Cortex-M base is
+  inferred from the vector table and handlers are named from it (`Reset_Handler`,
+  `IRQ37_Handler`, ...). `symbols` takes nm output, `addr name` / `name = addr` lines or an
+  ld map. Thumb/ARM32 xrefs come from literal pools and MOVW/MOVT pairs; Thumb-2 `b.w`
+  tail calls are call edges.
+- New `ablation/analyzers/raw_image.py` (vector table, base inference, symbol parsing,
+  BL / literal / MOVW-MOVT scans).
+- Raw-aware: ARM64 taint tracker family, `ARM64RegAnnotator`, `ARM64PathSolver`,
+  `ARM32TaintTracker`, `ARM32RegAnnotator`, `ARM32IntOverflowScanner`, `FuncProfiler`.
+- CLI: `analyze`, `taint`, `overflow`, `profile`, `fmtstr` and `heap` take
+  `--raw ARCH --base ADDR --symbols FILE`.
+- An unrecognised format warns and points at `from_raw` / `--raw` instead of returning a
+  silently empty context.
+- Fixes:
+  - `ablation taint` sent arm64 binaries to the x86 tracker.
+  - `ablation profile` crashed printing sink calls.
+  - `ARM32RegAnnotator` returned nothing when the window ran past the end of the file.
+  - `ARM32RegAnnotator` ignored MOVT.
+
+---
+
 ## v2.84.0
 
 **ARM64BssTaintTracker, ARM64VtableDispatchScanner; x86 BssTaintTracker crash fixes.**

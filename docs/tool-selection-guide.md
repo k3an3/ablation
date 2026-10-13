@@ -100,6 +100,7 @@ Task-to-tool lookup. For constructor patterns and key methods, see `docs/module-
 | "Post-linker security gate on compiled binary" | `CompilerSecurityGate.from_path(elf).scan()` |
 | "Pre-commit gate on staged .py files" | `FORGE.audit_module(path)` — gate_passed=False blocks commit |
 | "Check README/doc text for white-bronco prose violations" | `python3 -m ablation.core.prose README.md` |
+| "Raw RTOS / bare-metal flash dump (Cortex-M, ARM32, AArch64): context + all ARM scanners" | `BinaryContext.from_raw(bin, 'cortex-m' / 'arm32' / 'arm64', base=..., symbols='fw.nm')` (or `--raw ARCH --base ADDR --symbols FILE` on analyze / taint / overflow / profile / fmtstr / heap) |
 | "Scan a flat ECU ROM for function starts (arch-agnostic)" | `FlatBinaryFuncStartScanner(rom, base_va=0).scan()` |
 | "Fingerprint ISA of unknown flat ECU ROM" | `EcuArchDetector(rom_bytes).detect()` |
 | "Classify ECU ROM into CODE/CALIBRATION/IVT/PADDING regions" | `EcuROMLayoutAnalyzer.from_path(rom).analyze()` |

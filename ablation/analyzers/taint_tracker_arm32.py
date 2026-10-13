@@ -509,6 +509,9 @@ class ARM32TaintTracker:
     def from_context(cls, ctx, custom_sinks=None) -> 'ARM32TaintTracker':
         inst = cls(ctx.path, custom_sinks=custom_sinks,
                    thumb_funcs=getattr(ctx, 'thumb_funcs', None))
+        if getattr(ctx, 'raw', None):                 # headerless image: byte 0 at ctx.base_va
+            inst._base = ctx.base_va
+            inst._disasm = _ARM32Disasm(inst._data, inst._base, inst._thumb)
         # Overlay PLT and exports from BinaryContext
         inst._plt.update(ctx.plt)
         inst._exports.update(ctx.exports)

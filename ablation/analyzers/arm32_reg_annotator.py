@@ -138,7 +138,10 @@ class ARM32RegAnnotator:
     @classmethod
     def from_context(cls, ctx) -> 'ARM32RegAnnotator':
         data = Path(ctx.path).read_bytes()
-        return cls(data, ctx.base_va, ctx.strings, ctx.plt,
+        plt = dict(ctx.plt)
+        if getattr(ctx, 'raw', None):                 # raw image: named functions are the call targets
+            plt.update({va: n for n, va in ctx.exports.items()})
+        return cls(data, ctx.base_va, ctx.strings, plt,
                    thumb_funcs=getattr(ctx, 'thumb_funcs', None))
 
     def annotate_calls(
@@ -161,7 +164,8 @@ class ARM32RegAnnotator:
 
         off = va - self._base
         size = min(end_va - va, window) if end_va > va else window
-        if off < 0 or off + size > len(self._data):
+        size = min(size, len(self._data) - off)       # last function: window runs off the image
+        if off < 0 or size <= 0:
             return AnnotationResult(func_va=va, func_end_va=end_va, calls=[], reg_trace=[])
         chunk = self._data[off: off + size]
 
@@ -191,6 +195,20 @@ class ARM32RegAnnotator:
                     state[rd] = v
                     reg_trace.append((insn.address, rd, v))
                     continue
+
+            # MOVT Rd, #imm16: top half of a MOVW/MOVT pair (clang's Thumb-2 address load)
+            if mn == 'movt' and len(ops) == 2 and ops[1].type == C_ARM.ARM_OP_IMM:
+                rd = insn.reg_name(ops[0].reg).lower()
+                lo = state.get(rd)
+                if lo is not None and lo.kind == 'const':
+                    addr = (lo.int_val & 0xFFFF) | ((ops[1].imm & 0xFFFF) << 16)
+                    s_ = self._strings.get(addr)
+                    v = RegVal.string(s_) if s_ else RegVal.const(addr)
+                else:
+                    v = RegVal.unknown()
+                state[rd] = v
+                reg_trace.append((insn.address, rd, v))
+                continue
 
             # MOV Rd, Rn (register copy)
             if mn == 'mov' and len(ops) == 2:

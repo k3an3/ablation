@@ -139,6 +139,9 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
 
     def _is_rodata(self, va: int) -> bool:
         ranges = getattr(self, "_rodata", None)
+        if ranges is None and getattr(self._ctx, "raw", None):
+            # raw image: no sections; any address inside the image is a literal
+            ranges = self._rodata = [(self._base_va, self._base_va + len(self._data))]
         if ranges is None:
             import lief
             ranges = []

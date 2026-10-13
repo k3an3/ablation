@@ -138,16 +138,13 @@ class ARM64PathSolver(PathSolver):
         import bisect
 
         import capstone
-        import lief
 
         if not func_end_va:
             idx = bisect.bisect_right(ctx.func_starts, func_va)
             nxt = ctx.func_starts[idx] if idx < len(ctx.func_starts) else func_va + max_bytes
             func_end_va = min(nxt, func_va + max_bytes)
-        from .binary_context import image_regions
-        binary = lief.parse(Path(ctx.path).read_bytes())
         code = b""
-        for sva, data in image_regions(binary):         # ELF LOAD segments / PE sections
+        for sva, data in ctx.image_regions():           # raw image / ELF LOAD segments / PE sections
             off = func_va - sva
             if 0 <= off < len(data):
                 code = data[off: off + (func_end_va - func_va)]

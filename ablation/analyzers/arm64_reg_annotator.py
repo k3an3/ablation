@@ -33,7 +33,7 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from .binary_context import BinaryContext, PointerSlots, image_regions
+from .binary_context import BinaryContext, PointerSlots, RawSlots, image_regions
 from .insn_arm64 import Imm, Insn, Reg, make_insn
 from .isa_arm64 import ARG_REGS, CALLER_SAVED
 from .reg_annotator import AnnotationResult, CallSite, RegVal
@@ -90,6 +90,11 @@ class ARM64RegAnnotator:
 
     @classmethod
     def from_context(cls, ctx: BinaryContext) -> "ARM64RegAnnotator":
+        if getattr(ctx, "raw", None):                    # headerless image: one flat region
+            inst = cls(None, ctx.strings, ctx.plt, ctx.exports, ctx.func_starts)
+            inst._segs = ctx.image_regions()
+            inst._slots = RawSlots(inst._segs)
+            return inst
         if not _LIEF_OK:
             raise ImportError("lief is required for ARM64RegAnnotator")
         binary = lief.parse(Path(ctx.path).read_bytes())

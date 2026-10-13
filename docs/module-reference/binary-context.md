@@ -32,6 +32,7 @@ Named function VAs are tracked in the overlay (`ctx.set_name(va, name)`) and per
 |---|---|---|
 | ELF | x86_64, x86_32, arm64, arm32, ppc64, ppc32, mips64, mips32, riscv64, riscv32, loongarch64 | DWARF `.eh_frame` + exports + dynamic symbols |
 | ELF arm64 (no `.eh_frame`) | arm64 | exports + `ARM64FuncStartScanner` (BL targets, PACIASP/BTI, STP prologues) |
+| Raw image (`from_raw`) | thumb (Cortex-M), arm32, arm64 | symbols file + vector table + BL targets / prologues; see [raw-firmware.md](raw-firmware.md) |
 | Windows PE / `.sys` | x86_64, x86_32, arm64 (arm32: arch detected, no call graph) | Exports + `.pdata` RUNTIME_FUNCTIONs + prologue scan (x86) / BL targets (arm64; full ARM64FuncStartScanner when no `.pdata`) |
 
 ---

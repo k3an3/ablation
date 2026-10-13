@@ -1106,8 +1106,13 @@ class ARM64TaintTracker:
     @classmethod
     def from_context(cls, ctx, custom_sinks: Optional[Set[str]] = None,
                      custom_sources: Optional[Set[str]] = None) -> "ARM64TaintTracker":
-        """Build from a BinaryContext: file layout from the ELF, names from ctx."""
-        data, base_va, text_start, text_end, syms = _load_elf(ctx.path)
+        """Build from a BinaryContext: file layout from the ELF (or the raw image), names from ctx."""
+        if getattr(ctx, "raw", None):
+            data = Path(ctx.path).read_bytes()
+            base_va = text_start = ctx.base_va
+            text_end, syms = base_va + len(data), {}
+        else:
+            data, base_va, text_start, text_end, syms = _load_elf(ctx.path)
         syms.update(ctx.plt)                                   # stub VA -> import name
         syms.update({va: name for name, va in ctx.exports.items()})
         for fva in ctx.func_starts:
