@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, FrozenSet, Iterable, Iterator, List, Optional, Set, Tuple
 
+from .fortify import CHK_BASE, CHK_DEST_SIZE, dest_size_note
 from .insn_arm64 import (
     Cond, Imm, Insn, Mem, Reg, Sym,
     from_capstone,
@@ -1270,6 +1271,8 @@ class ARM64TaintTracker:
                 continue
             if target is not None:
                 callee = _name_at(self._syms, target)
+                self._chk_site = (insn.address, callee) if callee in CHK_BASE else None
+                callee = CHK_BASE.get(callee, callee)          # __memcpy_chk -> memcpy
                 self._on_call(eng, insn, target, callee, fva, func_name, findings, depth, enqueue)
             else:
                 opq: Set[str] = set()
@@ -1316,6 +1319,13 @@ class ARM64TaintTracker:
                 w = self._wrappers.get(target) or self._wrappers.get(self._local_funcs.get(callee or "", -1))
                 if w is not None:
                     note = f"wrapper of {w.wraps}"
+                chk = getattr(self, "_chk_site", None)
+                if chk is not None and chk[0] == insn.address:
+                    reg = CHK_DEST_SIZE.get(chk[1])
+                    size = st.consts.get(reg) if reg else None
+                    note = "; ".join(x for x in (note, dest_size_note(chk[1], size)) if x)
+                    if size is not None and size not in ((1 << 64) - 1,) and sev == "HIGH":
+                        sev = "MEDIUM"                     # aborts instead of overflowing
                 self._finding(findings, fva, func_name, insn.address, callee, tainted, labels, sev, note)
 
         # read / recv whose length came from attacker data (a parsed header field)

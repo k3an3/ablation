@@ -49,6 +49,7 @@ _LENGTH_ARGS: Dict[str, Tuple[str, ...]] = {
     "fwrite": ("x1", "x2"), "snprintf": ("x1",), "vsnprintf": ("x1",),
     "malloc": ("x0",), "calloc": ("x0", "x1"), "realloc": ("x1",),
     "copy_from_user": ("x2",), "copy_to_user": ("x2",), "__memcpy": ("x2",),
+    "__snprintf_chk": ("x1",), "__vsnprintf_chk": ("x1",),
 }
 
 

@@ -40,6 +40,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
+from .fortify import FMT_CHK_FLAG
 from .insn_arm64 import from_capstone
 
 _MAX_FUNC = 8192
@@ -82,6 +83,7 @@ class SinkWrapper:
     gr_offs: Optional[int] = None
     vr_offs: Optional[int] = None
     source: str = "inferred"                     # or "sink-map"
+    chk_flag: Optional[int] = None               # FORTIFY flag when the chain ends in __*printf_chk
 
     @property
     def fmt_reg(self) -> Optional[str]:
@@ -188,7 +190,12 @@ class SinkWrapperInferer:
                 if pm:
                     # -fPIC: a call to this binary's own export goes through its PLT stub
                     tva = ctx.exports.get(c.target_name, c.target_va) if c.target_name else c.target_va
-                    rows.append((tva, c.target_name, c.site_va, pm))
+                    flag = None
+                    freg = FMT_CHK_FLAG.get(c.target_name or "")
+                    fv = c.args.get(freg) if freg else None
+                    if fv is not None and fv.kind in ("const", "zero"):
+                        flag = fv.int_val if fv.kind == "const" else 0
+                    rows.append((tva, c.target_name, c.site_va, pm, flag))
             if rows:
                 compact[fva] = rows
 
@@ -197,11 +204,11 @@ class SinkWrapperInferer:
         for _ in range(self._max_rounds):
             changed = False
             for fva, rows in compact.items():
-                for tva, tname, site, pm in rows:
+                for tva, tname, site, pm, flag in rows:
                     inner = wrappers.get(tva)
                     if inner is not None:
                         sargs = {k: tuple(v) for k, v in inner.kinds.items()}
-                        wraps, via = inner.wraps, inner.name
+                        wraps, via, flag = inner.wraps, inner.name, inner.chk_flag
                     else:
                         sargs = base_sink_args(tname or names.get(tva, ""))
                         wraps = via = tname or names.get(tva, "")
@@ -214,6 +221,8 @@ class SinkWrapperInferer:
                             w = wrappers[fva] = SinkWrapper(
                                 fva, names.get(fva) or f"fn_{fva:x}", wraps, via, site)
                             changed = True
+                        if kind == "format" and flag is not None:
+                            w.chk_flag = flag
                         cur = set(w.kinds.get(kind, ()))
                         if not set(mapped) <= cur:
                             w.kinds[kind] = sorted(cur | set(mapped))

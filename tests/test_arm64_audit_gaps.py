@@ -517,3 +517,50 @@ def test_overflow_sink_map_rtos_allocator(roles_img, tmp_path):
     assert "sink oracles resolved" not in r.stdout
     r = _cli("overflow", fresh, "--raw", "arm64", "--base", hex(RAW_BASE), "--no-infer-sinks")
     assert "matches any of:" in r.stdout and "malloc" in r.stdout
+
+
+# ── round 2: FORTIFY variants ────────────────────────────────────────────────
+
+_FORT_SRC = r"""
+typedef unsigned long size_t; typedef __builtin_va_list va_list;
+extern int __vsnprintf_chk(char *, size_t, int, size_t, const char *, va_list);
+extern int vsnprintf(char *, size_t, const char *, va_list);
+extern int __printf_chk(int, const char *, ...);
+extern void *__memcpy_chk(void *, const void *, size_t, size_t);
+extern long recv(int, void *, size_t, int);
+extern void out(const char *);
+#define N __attribute__((noinline))
+N void flog(const char *fmt, ...) { char b[64]; va_list ap; __builtin_va_start(ap, fmt); __vsnprintf_chk(b, 64, 1, 64, fmt, ap); __builtin_va_end(ap); out(b); }
+N void plog(const char *fmt, ...) { char b[64]; va_list ap; __builtin_va_start(ap, fmt); vsnprintf(b, 64, fmt, ap); __builtin_va_end(ap); out(b); }
+void via_chk(int fd) { char r[64]; recv(fd, r, 63, 0); r[63] = 0; flog(r); }
+void via_plain(int fd) { char r[64]; recv(fd, r, 63, 0); r[63] = 0; plog(r); }
+void pchk1(int fd) { char r[64]; recv(fd, r, 63, 0); r[63] = 0; __printf_chk(1, r); }
+void pchk0(int fd) { char r[64]; recv(fd, r, 63, 0); r[63] = 0; __printf_chk(0, r); }
+void cpy_known(int fd) { unsigned char b[64]; char t[16]; recv(fd, b, 64, 0); __memcpy_chk(t, b, b[0], 16); out(t); }
+void cpy_unknown(int fd, char *d) { unsigned char b[64]; recv(fd, b, 64, 0); __memcpy_chk(d, b, b[0], (size_t)-1); }
+"""
+
+
+@pytest.fixture(scope="module")
+def fort_so(tmp_path_factory):
+    return build_variants(tmp_path_factory, src_text=_FORT_SRC, variants={"O2": ["-O2"]})["O2"]
+
+
+def test_fortify_percent_n(fort_so):
+    from ablation.analyzers.format_string_scanner_arm64 import ARM64FormatStringScanner
+    ctx, t = _wctx(fort_so)
+    notes = {f.func_va: f.details.get("fortify", "") for f in ARM64FormatStringScanner.from_context(ctx).scan()}
+    assert "blocked by FORTIFY" in notes[t["via_chk"]] and "flag=1" in notes[t["via_chk"]]
+    assert notes[t["via_plain"]].startswith("%n: not blocked (plain vsnprintf")
+    assert "blocked by FORTIFY" in notes[t["pchk1"]]
+    assert notes[t["pchk0"]].startswith("%n: not blocked (__printf_chk with flag 0")
+
+
+def test_fortify_memcpy_chk_is_a_sink(fort_so):
+    from ablation.analyzers.taint_tracker_arm64 import ARM64TaintTracker
+    ctx, t = _wctx(fort_so)
+    got = {f.func_va: f for f in ARM64TaintTracker.from_context(ctx).run_interprocedural()
+           if f.sink_name == "memcpy"}
+    assert got[t["cpy_known"]].severity == "MEDIUM" and "aborts when the copy exceeds 0x10" in got[t["cpy_known"]].note
+    # __memcpy_chk(.., (size_t)-1) is folded to plain memcpy by the compiler: no FORTIFY note
+    assert got[t["cpy_unknown"]].severity == "HIGH" and "FORTIFY" not in got[t["cpy_unknown"]].note

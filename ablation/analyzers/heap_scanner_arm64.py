@@ -43,6 +43,7 @@ from .cfg_arm64 import build_cfg
 from .heap_vuln_scanner import HeapFinding
 from .insn_arm64 import Insn
 from .isa_arm64 import ARG_REGS
+from .fortify import CHK_BASE
 from .taint_tracker_arm64 import ARM64TaintTracker, Taint, TaintEngine, TaintState, _name_at
 
 # allocator -> (size regs multiplied together, pointer-in reg for realloc-style)
@@ -189,7 +190,8 @@ class ARM64HeapScanner(ARM64TaintTracker):
             if m == "b" and (target is None or fva <= target < fend):
                 continue                                   # intra-function branch
             if target is not None:
-                self._heap_call(eng, flow, insn, target, _name_at(self._syms, target), fva)
+                name = _name_at(self._syms, target)
+                self._heap_call(eng, flow, insn, target, CHK_BASE.get(name, name), fva)
                 continue
             self._check_access(eng, flow, insn, fva)
             slen = self._slen_sources(eng, insn)

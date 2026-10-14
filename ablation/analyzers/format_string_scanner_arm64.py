@@ -54,6 +54,7 @@ import bisect
 from typing import Dict, List, Optional, Set, Tuple
 
 from .format_string_scanner import FmtStringFinding
+from .fortify import FMT_CHK_FLAG, percent_n_note
 from .insn_arm64 import Insn
 from .taint_tracker_arm64 import ARG_REGS, ARM64TaintTracker, TaintEngine
 
@@ -68,6 +69,8 @@ FMT_ARG: Dict[str, str] = {
     "verr": "x1", "verrx": "x1", "vwarn": "x0", "vwarnx": "x0",
     "__printf_chk": "x1", "__fprintf_chk": "x2", "__sprintf_chk": "x3",
     "__snprintf_chk": "x4", "__vsnprintf_chk": "x4", "__syslog_chk": "x2",
+    "__vprintf_chk": "x1", "__vfprintf_chk": "x2", "__vsprintf_chk": "x3", "__dprintf_chk": "x2",
+    "__vdprintf_chk": "x2", "__vsyslog_chk": "x2", "__asprintf_chk": "x2", "__vasprintf_chk": "x2",
     "printk": "x0", "_printk": "x0", "panic": "x0",
     "log_printf": "x1", "debug_printf": "x0", "trace_printf": "x0",
 }
@@ -253,9 +256,16 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
                 if wrap is not None:
                     call.target_name = wrap.name
                     desc += f" ({wrap.name} is a format wrapper of {wrap.wraps}, format in {reg})"
+                    sink, flag = wrap.wraps, wrap.chk_flag
+                else:
+                    sink = call.target_name
+                    fv = call.args.get(FMT_CHK_FLAG.get(sink, ""))
+                    flag = (fv.int_val if fv is not None and fv.kind == "const"
+                            else 0 if fv is not None and fv.kind == "zero" else None)
                 if prov == "arg_passthrough":
                     self._wrapper_arg[call.site_va] = self._arg_index(call.args.get(reg))
-                out.append(FmtStringFinding(fva, call.site_va, call.target_name, reg, prov, sev, desc))
+                out.append(FmtStringFinding(fva, call.site_va, call.target_name, reg, prov, sev, desc,
+                                            {"fortify": percent_n_note(sink, flag)}))
         for wva, (site, callee, reg) in internal.items():
             if not self._callers.get(wva):
                 w = self._fwraps[wva]

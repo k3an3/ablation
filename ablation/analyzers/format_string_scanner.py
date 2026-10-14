@@ -30,7 +30,7 @@ Usage:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -128,6 +128,8 @@ class FmtStringFinding:
     provenance: str     # 'arg_passthrough' | 'stack_load' | 'register' | 'unknown' | 'rodata'
     severity: str       # 'HIGH' | 'MEDIUM' | 'SAFE'
     description: str
+    # extra triage facts (ARM64): fortify / slots / leak / dest / bucket / reach / egress
+    details: dict = field(default_factory=dict)
 
     @property
     def verdict(self) -> str:
@@ -147,6 +149,7 @@ class FmtStringFinding:
             'severity': self.severity,
             'verdict': self.verdict,
             'description': self.description,
+            **({'details': self.details} if self.details else {}),
         }
 
     def fmt(self) -> str:
@@ -154,6 +157,9 @@ class FmtStringFinding:
             f"  {self.severity:6s}  fmt_string  0x{self.func_va:x}+{(self.call_va-self.func_va)&0xFFFF:#x}"
             f"  {self.callee}({self.fmt_reg}={'stack' if self.provenance == 'unbounded_s' else 'user?'})"
             f"  {self.description}"
+            + "".join(f"\n      {k}: {v}" for k, v in self.details.items()
+                      if k not in ("slots",) and v)
+            + (("\n      slots: " + "; ".join(self.details["slots"])) if self.details.get("slots") else "")
         )
 
 
