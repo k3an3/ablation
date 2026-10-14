@@ -160,7 +160,8 @@ def test_cli_warns_on_zero_resolved_sinks(roles_img, tmp_path):
     assert "0 of" in r.stdout and "results are not meaningful" in r.stdout
     r = _cli("fmtstr", fresh, "--raw", "arm64", "--base", hex(RAW_BASE))
     assert "inferring libc roles" in r.stderr and "not meaningful" not in r.stdout
-    assert r.stdout.count("unbounded") == 0 and r.stdout.count("sscanf '%s'") == 3
+    assert r.stdout.count("unbounded") == 0
+    assert sum(1 for l in r.stdout.splitlines() if "fmt_string" in l and "sscanf" in l and "(no width)" in l) == 3
 
 
 def test_sink_map_names_roles_cli(roles_img, tmp_path):
@@ -998,3 +999,60 @@ def test_zero_extended_mask_not_a_check(ccmp_so, monkeypatch):
     assert ("masked_check", "memcpy") in kinds()                 # 2.88 behaviour: flagged
     monkeypatch.undo()
     assert ("masked_check", "memcpy") not in kinds()             # ldurh already zero-extended
+
+
+_VALIDATOR_ASM = r"""
+    .text
+    .globl validate
+    .type validate, %function
+validate:                           // gcc layout: frame record at the bottom of a 0x90 frame
+    stp   x29, x30, [sp, #-0x90]!
+    mov   x29, sp
+    adr   x1, vfmt
+    add   x2, sp, #0x80             // first %s: 16 bytes to the frame top
+    add   x3, sp, #0x70
+    add   x4, sp, #0x60
+    add   x5, sp, #0x50
+    add   x6, sp, #0x40
+    add   x7, sp, #0x30
+    bl    sscanf
+    ldp   x29, x30, [sp], #0x90
+    ret
+    .size validate, .-validate
+    .globl route_v
+    .type route_v, %function
+route_v:
+    stp   x29, x30, [sp, #-0x20]!   // caller's record at its sp: 8 more bytes to its x30
+    mov   x29, sp
+    bl    validate
+    ldp   x29, x30, [sp], #0x20
+    ret
+    .size route_v, .-route_v
+vfmt: .asciz "%s %s %s %s %s %s %s %s"
+"""
+
+
+@pytest.fixture(scope="module")
+def validator_so(tmp_path_factory):
+    d = tmp_path_factory.mktemp("val")
+    (d / "t.s").write_text(_VALIDATOR_ASM)
+    so = d / "t.so"
+    r = subprocess.run(["clang", "--target=aarch64-linux-gnu", "-shared", "-nostdlib", "-fuse-ld=lld",
+                        str(d / "t.s"), "-o", str(so)], capture_output=True, text=True)
+    if r.returncode:
+        pytest.skip(r.stderr[-200:])
+    return so
+
+
+def test_widthless_scanf_budget_into_caller(validator_so, tmp_path):
+    from ablation.analyzers.format_string_scanner_arm64 import ARM64FormatStringScanner
+    ctx = BinaryContext.load_or_build(str(validator_so), force_rebuild=True)
+    ctx.infer_wrappers(save=False)
+    (f,) = [f for f in ARM64FormatStringScanner.from_context(ctx).scan() if f.provenance == "unbounded_s"]
+    assert "6 width-less conversions" in f.description          # x2..x7 (the rest go on the stack)
+    assert f.details["budget"] == "24 bytes from %s (x2) to a saved x30"
+    assert "caller's saved x30 (route_v)" in f.details["dest"]
+    out = tmp_path / "l.json"
+    r = _cli("lengths", validator_so, "--json", out)
+    assert r.returncode == 0, r.stderr[-300:]
+    assert json.loads(out.read_text())["unbounded"][0]["details"]["budget"].startswith("24 bytes")

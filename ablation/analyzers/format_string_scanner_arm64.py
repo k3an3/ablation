@@ -258,7 +258,9 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
                 tva = ctx.exports.get(call.target_name, call.target_va)
                 self._callers.setdefault(tva, []).append((fva, call))
                 self._site_calls[call.site_va] = (fva, call)
-                if call.target_name in _UNBOUNDED:
+                uw = self._fwraps.get(call.target_va) or self._fwraps.get(tva)
+                if call.target_name in _UNBOUNDED or (
+                        uw is not None and uw.wraps in _UNBOUNDED and _UNBOUNDED[uw.wraps][3] == "scan"):
                     self._unb_sites.append((fva, call))
                     self._watch_calls.add(call.site_va)
                 wrap = self._fwraps.get(call.target_va) or self._fwraps.get(tva)
@@ -367,9 +369,17 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
 
     def _unbounded_findings(self) -> List[FmtStringFinding]:
         out: List[FmtStringFinding] = []
+        exports = self._ctx.exports
         for fva, call in self._unb_sites:
             name = call.target_name
-            freg, first, io_reg, family = _UNBOUNDED[name]
+            if name in _UNBOUNDED:
+                freg, first, io_reg, family = _UNBOUNDED[name]
+                shown = name
+            else:                                         # a vendor wrapper of sscanf & co.
+                w = self._fwraps.get(call.target_va) or self._fwraps.get(exports.get(name, -1))
+                freg, family, io_reg = w.fmt_reg, "scan", None
+                first = int(freg[1:]) + 1 if w.varargs else None
+                shown = f"{w.name} (wrapper of {w.wraps})"
             fmt = self._literal(call.args.get(freg))
             if fmt is None:
                 continue                                  # non-literal: the fmt check covers it
@@ -381,31 +391,42 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
                 dst = call.args.get(io_reg)
                 if not self._on_stack(dst):
                     continue
-                where = f"stack buffer {dst.display()}"
+                hits = [(io_reg, convs[0][1])]
                 for idx, _spec in convs:
                     if first is not None and first + idx < 8:
                         labels |= self._arg_taint.get((call.site_va, f"x{first + idx}"), set())
-                spec = convs[0][1]
-                tgt = io_reg
             else:
                 hits = [(f"x{first + idx}", spec) for idx, spec in convs
                         if first is not None and first + idx < 8
                         and self._on_stack(call.args.get(f"x{first + idx}"))]
                 if not hits:
                     continue
-                tgt, spec = hits[0]
-                where = f"stack buffer {call.args.get(tgt).display()}"
                 if io_reg:
                     labels |= self._arg_taint.get((call.site_va, io_reg), set())
                 elif name in _STDIN_SCANS:
                     labels.add("stdin")
             sev = "HIGH" if labels else "MEDIUM"
             src = f" from {','.join(sorted(labels))}" if labels else ""
-            dest = self._dest_extent(fva, call.args.get(tgt))
+            dests, budgets = [], []
+            for reg, spec in hits:
+                text, lr = self._dest_extent(fva, call.args.get(reg), budget=True)
+                if text:
+                    dests.append(f"{spec} -> {reg} {text}")
+                if lr is not None:
+                    budgets.append((lr, spec, reg))
+            tgt, spec = hits[0]
+            details = {"dest": "; ".join(dests)} if dests else {}
+            if budgets:
+                lr, bspec, breg = min(budgets)
+                details["budget"] = f"{lr} bytes from {bspec} ({breg}) to a saved x30"
+            many = f"{len(hits)} width-less conversions ({', '.join(sp for _r, sp in hits)})" \
+                if len(hits) > 1 else f"'{spec}'"
+            where = f"stack buffer{'s' if len(hits) > 1 else ''} " + \
+                ", ".join(call.args.get(r).display() for r, _sp in hits[:4])
             out.append(FmtStringFinding(
-                fva, call.site_va, name, tgt, "unbounded_s", sev,
-                f"{name} '{spec}' (no {'precision' if family == 'print' else 'width'}) "
-                f"into {where}{src}", {"dest": dest} if dest else {}))
+                fva, call.site_va, shown, tgt, "unbounded_s", sev,
+                f"{shown} {many} (no {'precision' if family == 'print' else 'width'}) "
+                f"into {where}{src}", details))
         return out
 
     # ---- frame layout: what conversions read / how far a buffer reaches --------
@@ -531,16 +552,36 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
                 f.details["egress"] = "; ".join(chains[:2])
                 f.description += "; the output is served back to clients (see egress)"
 
-    def _dest_extent(self, fva: int, v) -> str:
+    def _dest_extent(self, fva: int, v, budget: bool = False):
+        """'[sp+0x10]: 16 bytes to the next stack object; 40 bytes to saved x30' -- with the
+        frame record below the buffer, the budget continues into each caller's frame up to
+        its saved x30. budget=True returns (text, bytes to the nearest saved x30)."""
         while v is not None and v.kind == "copy":
             v = v.chain
         lay = self._layout(fva)
         off = lay.entry_off(v.str_val) if v is not None else None
         if off is None:
-            return ""
+            return ("", None) if budget else ""
         n, what, lr, note = lay.extent(off)
-        tail = f"; {lr} bytes to saved x30" if lr is not None else (f"; {note}" if note else "")
-        return f"{v.display()}: {n} bytes to the {what}{tail}"
+        if lr is not None:
+            tail = f"; {lr} bytes to saved x30"
+        else:
+            via = []
+            for caller, c in self._callers.get(fva, []):
+                clay = self._layout(caller)
+                lrc = clay.lr_slot()
+                if lrc is not None and lrc - clay.sp_body >= 0:
+                    via.append((-off + (lrc - clay.sp_body), self._fn(caller)))
+            if via:
+                via.sort()
+                lr = via[0][0]
+                more = f" (+{len(via) - 1} other callers)" if len(via) > 1 else ""
+                tail = (f"; frame record below the buffer: {lr} bytes to the caller's saved x30 "
+                        f"({via[0][1]}{more})")
+            else:
+                tail = f"; {note}" if note else ""
+        text = f"{v.display()}: {n} bytes to the {what}{tail}"
+        return (text, lr) if budget else text
 
     def _literal(self, v) -> Optional[str]:
         while v is not None and v.kind == "copy":

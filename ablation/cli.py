@@ -416,16 +416,31 @@ def cmd_lengths(args):
     found = under.scan(depth=args.depth)
     if not args.all:
         found = [f for f in found if not f.guarded]
+    # width-less %s / %[ into stack buffers (sscanf / scanf / sprintf and their wrappers)
+    from ablation.analyzers.format_string_scanner_arm64 import ARM64FormatStringScanner
+    fs = ARM64FormatStringScanner.from_context(ctx)
+    _apply_taint_args(args, fs)
+    unb = [f for f in fs.scan(depth=args.depth) if f.provenance == "unbounded_s"]
+    unb = _reach_filter(args, ctx, unb, 'call_va')
     if args.json:
         import json
         data = {"conversion": [f.as_dict() for f in conv_found],
-                "underflow": [f.as_dict() for f in found]}
+                "underflow": [f.as_dict() for f in found],
+                "unbounded": [f.as_dict() for f in unb]}
         Path(args.json).write_text(json.dumps(data, indent=2))
-        print(f"Wrote {len(conv_found)} conversion + {len(found)} underflow findings to {args.json}")
+        print(f"Wrote {len(conv_found)} conversion + {len(found)} underflow + {len(unb)} "
+              f"width-less conversion findings to {args.json}")
         return
     print(conv.report(conv_found))
     print()
     print(under.report(found))
+    print()
+    if unb:
+        print(f"Width-less %s / %[ into stack buffers: {len(unb)} finding(s)")
+        for f in unb:
+            print(f.fmt())
+    else:
+        print("Width-less %s / %[ into stack buffers: none")
 
 
 def cmd_wrappers(args):
