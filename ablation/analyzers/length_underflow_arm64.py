@@ -163,7 +163,7 @@ class ARM64LengthUnderflowScanner(ARM64TaggingScanner):
 
     def _on_call(self, eng: TaintEngine, insn: Insn, target: int, callee: Optional[str],
                  fva: int, func_name: str, findings, depth: int, enqueue) -> None:
-        length_args = _LENGTH_ARGS.get(callee or "", ())
+        length_args = _LENGTH_ARGS.get(callee or "", ()) or self._wrapper_regs(target, callee, "length")
         for r in ARG_REGS:
             for _label, site in self.sites_in(eng.state.get(r)):
                 self._hits.append(UnderflowFinding64(

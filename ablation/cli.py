@@ -121,6 +121,7 @@ def _check_oracles(args, ctx, engine: str) -> None:
         from ablation.analyzers.libc_roles import LibcRoleInferer
         print(LibcRoleInferer.report(ctx.infer_roles()), file=sys.stderr)
         resolved, _ = ctx.sink_coverage(sinks | extra)
+    _ensure_wrappers(args, ctx)
     if not resolved:
         msg = (f"WARNING: 0 of {len(sinks)} {engine} sink oracles resolved (no PLT, symbol, "
                f"sink-map or inferred name for memcpy / sprintf / ...); results are not "
@@ -162,6 +163,20 @@ def _add_taint_args(p) -> None:
                         '(findings through it are marked lower confidence)')
 
 
+def _ensure_wrappers(args, ctx) -> None:
+    """Infer vendor sink wrappers (arm64) unless disabled; print them with --sink-wrappers."""
+    if ctx.arch != 'arm64' or getattr(args, 'infer_sinks', None) is False:
+        return
+    from ablation.analyzers.sink_wrappers import SinkWrapperInferer, wrappers_of
+    inferred = [w for w in (ctx.wrappers or {}).values() if w.get('source') == 'inferred']
+    if not inferred and not getattr(ctx, '_wrappers_done', False):
+        ctx.infer_wrappers()
+        ctx._wrappers_done = True
+    if getattr(args, 'sink_wrappers', False):
+        print(SinkWrapperInferer.report(wrappers_of(ctx)))
+        print()
+
+
 def _add_raw_args(p) -> None:
     p.add_argument('--raw', metavar='ARCH',
                    help='headerless firmware image: thumb (Cortex-M), arm32, or arm64')
@@ -181,9 +196,13 @@ def _add_raw_args(p) -> None:
                         'automatic when no sink name resolves')
     g.add_argument('--no-infer-sinks', dest='infer_sinks', action='store_false',
                    help='never infer libc roles')
+    p.add_argument('--sink-wrappers', action='store_true',
+                   help='print the inferred vendor sink wrappers (log(fmt, ...) -> vsnprintf, '
+                        'run(cmd) -> system, put(d, s, n) -> memcpy) and their argument indexes')
     p.add_argument('--sink-map', metavar='JSON',
                    help='{"0xVA": "memcpy", ...}: name sinks / sources in a stripped or '
-                        'statically linked image (ELF or raw)')
+                        'statically linked image (ELF or raw); "format:x1" / "exec:x0" / '
+                        '"length:x2" values mark or override a vendor wrapper')
 
 
 def _build_corpus_for(binary_path: str, db: Path) -> None:
@@ -352,6 +371,19 @@ def cmd_lengths(args):
         found = [f for f in found if not f.guarded]
     print()
     print(under.report(found))
+
+
+def cmd_wrappers(args):
+    """Vendor wrappers of format / exec / length sinks (arm64)."""
+    p = str(_require_binary(args.binary))
+    ctx = _load_ctx(args, p)
+    if ctx.arch != 'arm64':
+        print(f"wrappers supports ARM64 (binary arch: {ctx.arch})")
+        return
+    _check_oracles(args, ctx, 'fmtstr')
+    from ablation.analyzers.sink_wrappers import SinkWrapperInferer, wrappers_of
+    if not getattr(args, 'sink_wrappers', False):
+        print(SinkWrapperInferer.report(wrappers_of(ctx)))
 
 
 def cmd_window(args):
@@ -1313,6 +1345,12 @@ def main():
     p_len.add_argument('--depth', type=int, default=3)
     p_len.add_argument('--all', action='store_true', help='include guarded underflow candidates')
     p_len.set_defaults(func=cmd_lengths)
+
+    p_wr = sub.add_parser('wrappers', help='ARM64 vendor sink wrappers: log(fmt, ...) -> vsnprintf, '
+                                            'run(cmd) -> system, put(d, s, n) -> memcpy')
+    p_wr.add_argument('binary')
+    _add_raw_args(p_wr)
+    p_wr.set_defaults(func=cmd_wrappers)
 
     p_window = sub.add_parser('window', help='annotated disassembly window around a VA')
     p_window.add_argument('binary')

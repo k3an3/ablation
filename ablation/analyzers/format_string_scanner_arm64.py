@@ -184,7 +184,7 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
         self.run_interprocedural(depth=depth)    # taint at those call sites
         findings: Dict[int, FmtStringFinding] = {}
         for f in prov:
-            if f.provenance == "arg_passthrough":
+            if f.provenance == "arg_passthrough" and f.func_va not in self._fwraps:
                 f = self._judge_wrapper(f)
                 if f is None:
                     continue
@@ -196,8 +196,9 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
             f = findings.get(call_va)
             if f is None or f.provenance in ("unbounded_s", "tainted"):
                 continue
+            note = f.description[f.description.rfind(" ("):] if " is a format wrapper of " in f.description else ""
             f.provenance, f.severity = "tainted", "HIGH"
-            f.description = f"format string in {reg} carries received data ({src})"
+            f.description = f"format string in {reg} carries received data ({src}){note}"
         return sorted(findings.values(), key=lambda f: (f.func_va, f.call_va))
 
     def report(self, findings: List[FmtStringFinding]) -> str:
@@ -219,6 +220,12 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
         self._callers: Dict[int, List[Tuple[int, object]]] = {}   # callee VA -> [(caller, CallSite)]
         self._unb_sites: List[Tuple[int, object]] = []
         self._wrapper_arg: Dict[int, int] = {}                     # finding call_va -> arg index
+        # inferred / sink-map format wrappers: log_event(kind, fmt, ...) -> vsnprintf
+        from .sink_wrappers import wrappers_of
+        self._fwraps = {va: w for va, w in wrappers_of(ctx).items() if w.fmt_reg}
+        for va, w in self._fwraps.items():
+            self._watch.setdefault(va, set()).add(w.fmt_reg)
+        internal: Dict[int, Tuple[int, str, str]] = {}            # wrapper -> its forwarding call
         for fva in starts:
             if fva in ctx.plt:
                 continue
@@ -230,15 +237,32 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
                 if call.target_name in _UNBOUNDED:
                     self._unb_sites.append((fva, call))
                     self._watch_calls.add(call.site_va)
-                reg = fmt_reg(call.target_name)
+                wrap = self._fwraps.get(call.target_va) or self._fwraps.get(tva)
+                reg = fmt_reg(call.target_name) or (wrap.fmt_reg if wrap else None)
                 if reg is None:
                     continue
-                prov, sev, desc = self._classify(call.args.get(reg), reg)
+                own = self._fwraps.get(fva)
+                v = call.args.get(reg)
+                if own is not None and f"x{self._arg_index(v)}" == own.fmt_reg:
+                    # the wrapper forwarding its own format: checked at the wrapper's call sites
+                    internal[fva] = (call.site_va, call.target_name or (wrap.name if wrap else ""), reg)
+                    continue
+                prov, sev, desc = self._classify(v, reg)
                 if prov is None:
                     continue
+                if wrap is not None:
+                    call.target_name = wrap.name
+                    desc += f" ({wrap.name} is a format wrapper of {wrap.wraps}, format in {reg})"
                 if prov == "arg_passthrough":
                     self._wrapper_arg[call.site_va] = self._arg_index(call.args.get(reg))
                 out.append(FmtStringFinding(fva, call.site_va, call.target_name, reg, prov, sev, desc))
+        for wva, (site, callee, reg) in internal.items():
+            if not self._callers.get(wva):
+                w = self._fwraps[wva]
+                out.append(FmtStringFinding(
+                    wva, site, callee, reg, "arg_passthrough", "LOW",
+                    f"{w.name} is a format wrapper of {w.wraps} (format in {w.fmt_reg}) with no "
+                    f"caller in this binary (exported?)"))
         # wrappers (nested ones too) whose call sites the taint pass must watch
         todo = [(f.func_va, self._wrapper_arg[f.call_va]) for f in out
                 if f.call_va in self._wrapper_arg]
@@ -446,6 +470,11 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
             if labels:
                 self._arg_taint.setdefault((insn.address, r), set()).update(labels)
         reg = fmt_reg(callee or "")
+        if reg is None:
+            fw = getattr(self, "_fwraps", {})
+            w = fw.get(target) or (fw.get(self._ctx.exports.get(callee, -1))
+                                   if callee and self._ctx is not None else None)
+            reg = w.fmt_reg if w is not None else None
         if reg is not None:
             st = eng.state
             labels = st.get(reg).labels | st.pointee(reg).labels

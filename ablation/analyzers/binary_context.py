@@ -380,6 +380,9 @@ class BinaryContext:
         # va -> libc role inferred from behaviour (libc_roles.LibcRoleInferer) or a sink map;
         # several VAs may share a role (memcpy, memmove, __memcpy_chk ...)
         self.roles: Dict[int, str] = {}
+        # va -> sink_wrappers.SinkWrapper dict: vendor wrappers of format / exec / length
+        # sinks (inferred, or "format:x1"-style --sink-map entries)
+        self.wrappers: Dict[int, dict] = {}
 
     # ── public factory ────────────────────────────────────────────────────────
 
@@ -2413,12 +2416,23 @@ class BinaryContext:
             self.save_cache()
         return roles
 
+    def infer_wrappers(self, save: bool = True):
+        """SinkWrapperInferer on this context (arm64): sets self.wrappers, returns
+        {va: SinkWrapper}."""
+        from ablation.analyzers.sink_wrappers import SinkWrapperInferer
+        w = SinkWrapperInferer(self).infer()
+        if save:
+            self.save_cache()
+        return w
+
     def apply_sink_map(self, sink_map) -> int:
         """Name functions by address so name-keyed sink / source oracles resolve in a
         stripped, statically linked or headerless image.
 
         sink_map: path to JSON, or a dict. {"0x419a44e0": "sprintf", ...}; {"sprintf":
         "0x419a44e0"} is accepted too. Each VA becomes an export (and a function start).
+        A value "format:x1" / "exec:x0" / "length:x2" / "copy:x1+x2" instead marks (or
+        overrides) a vendor wrapper: its xN parameter is that kind of sink argument.
         Returns the number of functions named. Not cached: apply after every load.
         """
         import json
@@ -2431,6 +2445,26 @@ class BinaryContext:
             except ValueError:
                 pairs.append((int(str(v), 16) if isinstance(v, str) else int(v), str(k)))
         starts = set(self.func_starts)
+        n_entries = len(pairs)
+        import re as _re
+        wrap_re = _re.compile(r"^(format|exec|length|copy):(x[0-7](?:\+x[0-7])*)$")
+        plain = []
+        for va, name in pairs:
+            m = wrap_re.match(name)
+            if m is None:
+                plain.append((va, name))
+                continue
+            from ablation.analyzers.sink_wrappers import SinkWrapper
+            kind, regs = m.group(1), m.group(2).split("+")
+            cur = self.wrappers.get(va)
+            w = SinkWrapper.from_dict(cur) if cur else SinkWrapper(
+                va, self.name(va) if self.name(va) != f"0x{va:x}" else f"fn_{va:x}",
+                kind, "sink-map", 0)
+            w.kinds[kind] = regs
+            w.source = "sink-map"
+            self.wrappers[va] = w.as_dict()
+            starts.add(va)
+        pairs = plain
         for va, name in pairs:
             if self.arch == "arm32" and va & 1:
                 va &= ~1
@@ -2441,7 +2475,7 @@ class BinaryContext:
         named = {va: name for va, name in pairs}
         self.call_edges = [(a, b, named.get(b, lbl)) for a, b, lbl in self.call_edges]
         self._build_indices()
-        return len(pairs)
+        return n_entries
 
     def image_regions(self) -> List[Tuple[int, bytes]]:
         """[(va, bytes)] for everything the image maps: the raw image as one region,
@@ -2921,6 +2955,7 @@ class BinaryContext:
             "raw": self.raw,
             "reloc_stats": getattr(self, "reloc_stats", {}),
             "roles": {f"{va:x}": r for va, r in getattr(self, "roles", {}).items()},
+            "wrappers": {f"{va:x}": w for va, w in getattr(self, "wrappers", {}).items()},
         }
         path.write_text(json.dumps(payload, separators=(",", ":")))
 
@@ -2950,4 +2985,5 @@ class BinaryContext:
         ctx.raw = payload.get("raw")
         ctx.reloc_stats = payload.get("reloc_stats") or {}
         ctx.roles = {int(k, 16): v for k, v in (payload.get("roles") or {}).items()}
+        ctx.wrappers = {int(k, 16): v for k, v in (payload.get("wrappers") or {}).items()}
         return ctx

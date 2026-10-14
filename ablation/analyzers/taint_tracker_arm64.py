@@ -1047,6 +1047,7 @@ class ARM64TaintTracker:
         self._user_sources: Dict[str, str] = {}               # name -> "ret" | "val" | "xN"
         self._user_sink_args: Dict[str, Tuple[str, ...]] = {}  # name -> arg regs (() = all)
         self.summarise_opaque = False
+        self._wrappers: Dict[int, object] = {}                 # va -> sink_wrappers.SinkWrapper
         # name -> VA of functions defined here (a PLT call to one of them is followed)
         self._local_funcs: Dict[str, int] = {
             n: va for va, n in symbols.items() if text_start <= va < text_end}
@@ -1132,7 +1133,16 @@ class ARM64TaintTracker:
         for fva in ctx.func_starts:
             if text_start <= fva < text_end and fva not in syms:
                 syms[fva] = f"fn_{fva:x}"
-        return cls(data, base_va, text_start, text_end, syms, custom_sinks, custom_sources)
+        inst = cls(data, base_va, text_start, text_end, syms, custom_sinks, custom_sources)
+        # vendor wrappers (sink_wrappers): exec / format wrappers are sinks at their call
+        # sites; length wrappers are looked up by the length scanners (_wrapper_regs)
+        from .sink_wrappers import wrappers_of
+        inst._wrappers = wrappers_of(ctx)
+        for va, w in inst._wrappers.items():
+            regs = list(w.kinds.get("exec", [])) + list(w.kinds.get("format", []))
+            if regs:
+                inst.add_sinks(f"{va:#x}:{'+'.join(dict.fromkeys(regs))}")
+        return inst
 
     # ---- user sources / sinks ---------------------------------------------
 
@@ -1141,11 +1151,18 @@ class ARM64TaintTracker:
         if tok.lower().startswith("0x"):
             va = int(tok, 16)
             name = self._syms.get(va)
-            if name is None or name.startswith("fn_"):
+            if name is None:
                 name = f"{prefix}_{va:x}"
                 self._syms[va] = name
             return name
         return tok
+
+    def _wrapper_regs(self, target: Optional[int], callee: Optional[str], kind: str) -> Tuple[str, ...]:
+        """Parameter registers of a vendor wrapper that act as `kind` sink arguments."""
+        w = self._wrappers.get(target) if target is not None else None
+        if w is None and callee:
+            w = self._wrappers.get(self._local_funcs.get(callee, -1))
+        return tuple(w.kinds.get(kind, ())) if w is not None else ()
 
     def add_sources(self, specs) -> List[str]:
         """Attacker-input functions beyond recv/read: framework accessors (HTTP / MQTT /
@@ -1293,9 +1310,12 @@ class ARM64TaintTracker:
                     sure |= OPAQUE not in al
                 if sure:
                     labels.discard(OPAQUE)
-                sev = ("CRITICAL" if callee in _EXEC_SINKS else
+                sev = ("CRITICAL" if callee in _EXEC_SINKS or self._wrapper_regs(target, callee, "exec") else
                        "MEDIUM" if callee in _SCAN_SINKS else "HIGH")
                 note = "parsed with sscanf: check %s width (ablation fmtstr)" if callee in _SCAN_SINKS else ""
+                w = self._wrappers.get(target) or self._wrappers.get(self._local_funcs.get(callee or "", -1))
+                if w is not None:
+                    note = f"wrapper of {w.wraps}"
                 self._finding(findings, fva, func_name, insn.address, callee, tainted, labels, sev, note)
 
         # read / recv whose length came from attacker data (a parsed header field)

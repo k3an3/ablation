@@ -372,3 +372,86 @@ def test_cxx_objects_not_constant_size(cxx_so):
     got = {(ctx.name(f.func_va), f.kind) for f in
            ARM64HeapScanner.from_context(ctx).scan(include_int_overflow=False)}
     assert got == {("c_oob", "heap_overflow")}
+
+
+# ── round 2: vendor sink wrappers ────────────────────────────────────────────
+
+_WRAP_SRC = r'''
+typedef unsigned long size_t; typedef __builtin_va_list va_list;
+extern int vsnprintf(char *, size_t, const char *, va_list);
+extern long recv(int, void *, size_t, int);
+extern int system(const char *);
+extern void *memcpy(void *, const void *, size_t);
+extern void out(const char *);
+extern void get_name(char *);
+#define N __attribute__((noinline))
+N void log_event(int kind, const char *fmt, ...) { char buf[0x600]; va_list ap; __builtin_va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); __builtin_va_end(ap); out(buf); (void)kind; }
+N static void dbg(const char *msg) { log_event(2, msg); }
+N static void run(const char *c) { system(c); }
+N static void put(char *d, const char *s, size_t n) { memcpy(d, s, n); }
+void h_ok(void) { log_event(1, "started %d", 3); dbg("plain"); }
+void h_bad(int fd) { char req[256]; recv(fd, req, 255, 0); req[255] = 0; log_event(1, req); }
+void h_dbg(int fd) { char r[64]; recv(fd, r, 63, 0); r[63] = 0; dbg(r); }
+void h_mid(void) { char t[32]; get_name(t); log_event(1, t); }
+void h_ext(const char *p) { log_event(2, p); }
+void h_run(int fd) { char c[64]; recv(fd, c, 63, 0); c[63] = 0; run(c); }
+void h_put(int fd, char *d) { unsigned char b[64]; recv(fd, b, 64, 0); put(d, (char *)b, b[0]); }
+'''
+
+
+@pytest.fixture(scope="module")
+def wrap_bins(tmp_path_factory):
+    return build_variants(tmp_path_factory, src_text=_WRAP_SRC, variants={"O0": ["-O0"], "O2": ["-O2"]})
+
+
+def _wctx(path):
+    ctx = BinaryContext.load_or_build(str(path), force_rebuild=True)
+    ctx.infer_wrappers(save=False)
+    return ctx, symbols(path)
+
+
+@pytest.mark.parametrize("opt", ["O0", "O2"])
+def test_wrappers_inferred(wrap_bins, opt):
+    from ablation.analyzers.sink_wrappers import wrappers_of
+    ctx, t = _wctx(wrap_bins[opt])
+    w = wrappers_of(ctx)
+    le = w[t["log_event"]]
+    assert le.kinds["format"] == ["x1"] and le.wraps == "vsnprintf"
+    assert le.varargs and le.gr_offs == -0x30           # x2..x7 saved: 6 GP slots
+    assert w[t["dbg"]].kinds["format"] == ["x0"] and w[t["dbg"]].via == "log_event"
+    assert w[t["run"]].kinds["exec"] == ["x0"]
+    assert w[t["put"]].kinds["length"] == ["x2"]
+
+
+@pytest.mark.parametrize("opt", ["O0", "O2"])
+def test_fmtstr_reports_wrapper_call_sites(wrap_bins, opt):
+    from ablation.analyzers.format_string_scanner_arm64 import ARM64FormatStringScanner
+    ctx, t = _wctx(wrap_bins[opt])
+    got = {(f.func_va, f.provenance, f.severity) for f in ARM64FormatStringScanner.from_context(ctx).scan()}
+    assert got == {
+        (t["h_bad"], "tainted", "HIGH"),                 # recv data as log_event's format
+        (t["h_dbg"], "tainted", "HIGH"),                 # ... through dbg -> log_event
+        (t["h_mid"], "runtime_buffer", "MEDIUM"),
+        (t["h_ext"], "arg_passthrough", "LOW"),          # exported wrapper, no caller
+    }                                                    # nothing at vsnprintf inside log_event
+
+
+def test_taint_wrapper_sinks(wrap_bins):
+    from ablation.analyzers.taint_tracker_arm64 import ARM64TaintTracker
+    ctx, t = _wctx(wrap_bins["O2"])
+    got = {(f.func_va, f.sink_name, f.severity) for f in ARM64TaintTracker.from_context(ctx).run_interprocedural()}
+    assert (t["h_run"], "run", "CRITICAL") in got
+    assert (t["h_bad"], "log_event", "HIGH") in got
+
+
+def test_sink_map_wrapper_override(wrap_bins, tmp_path):
+    from ablation.analyzers.sink_wrappers import wrappers_of
+    ctx, t = _wctx(wrap_bins["O2"])
+    ctx.apply_sink_map({hex(t["h_mid"]): "format:x0"})
+    w = wrappers_of(ctx)[t["h_mid"]]
+    assert w.kinds["format"] == ["x0"] and w.source == "sink-map"
+
+
+def test_cli_wrappers(wrap_bins):
+    r = _cli("wrappers", wrap_bins["O2"])
+    assert "log_event" in r.stdout and "varargs (6 GP" in r.stdout

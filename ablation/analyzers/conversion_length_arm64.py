@@ -239,7 +239,7 @@ class ARM64ConversionLengthScanner(ARM64TaggingScanner):
     def _on_call(self, eng: TaintEngine, insn: Insn, target: int, callee: Optional[str],
                  fva: int, func_name: str, findings, depth: int, enqueue) -> None:
         self._pending_cmp = None
-        size_args = _LENGTH_ARGS.get(callee or "", ())
+        size_args = _LENGTH_ARGS.get(callee or "", ()) or self._wrapper_regs(target, callee, "length")
         st = eng.state
         for r in size_args:
             t = st.get(r)
