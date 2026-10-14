@@ -51,6 +51,7 @@ Usage:
 from __future__ import annotations
 
 import bisect
+import re
 from typing import Dict, List, Optional, Set, Tuple
 
 from .format_string_scanner import FmtStringFinding
@@ -176,6 +177,8 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
         self._watch: Dict[int, Set[str]] = {}                  # wrapper VA -> arg regs
         self._watch_calls: Set[int] = set()                    # unbounded-check call sites
         self._arg_taint: Dict[Tuple[int, str], Set[str]] = {}  # (call_va, reg) -> labels
+        self._slot_taint: Dict[int, Dict[int, Set[str]]] = {}  # call_va -> {[sp+8j] index: labels}
+        self._layouts: Dict[int, object] = {}
 
     # ---- public API ---------------------------------------------------------
 
@@ -202,6 +205,7 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
             note = f.description[f.description.rfind(" ("):] if " is a format wrapper of " in f.description else ""
             f.provenance, f.severity = "tainted", "HIGH"
             f.description = f"format string in {reg} carries received data ({src}){note}"
+        self._slot_details(findings)
         return sorted(findings.values(), key=lambda f: (f.func_va, f.call_va))
 
     def report(self, findings: List[FmtStringFinding]) -> str:
@@ -229,6 +233,7 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
         for va, w in self._fwraps.items():
             self._watch.setdefault(va, set()).add(w.fmt_reg)
         internal: Dict[int, Tuple[int, str, str]] = {}            # wrapper -> its forwarding call
+        self._site_calls: Dict[int, Tuple[int, object]] = {}      # call VA -> (function, CallSite)
         for fva in starts:
             if fva in ctx.plt:
                 continue
@@ -237,6 +242,7 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
             for call in ra.annotate_calls(fva, end).calls:
                 tva = ctx.exports.get(call.target_name, call.target_va)
                 self._callers.setdefault(tva, []).append((fva, call))
+                self._site_calls[call.site_va] = (fva, call)
                 if call.target_name in _UNBOUNDED:
                     self._unb_sites.append((fva, call))
                     self._watch_calls.add(call.site_va)
@@ -380,11 +386,117 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
                     labels.add("stdin")
             sev = "HIGH" if labels else "MEDIUM"
             src = f" from {','.join(sorted(labels))}" if labels else ""
+            dest = self._dest_extent(fva, call.args.get(tgt))
             out.append(FmtStringFinding(
                 fva, call.site_va, name, tgt, "unbounded_s", sev,
                 f"{name} '{spec}' (no {'precision' if family == 'print' else 'width'}) "
-                f"into {where}{src}"))
+                f"into {where}{src}", {"dest": dest} if dest else {}))
         return out
+
+    # ---- frame layout: what conversions read / how far a buffer reaches --------
+
+    def _layout(self, fva: int):
+        from .frame_layout_arm64 import FrameLayout
+        lay = self._layouts.get(fva)
+        if lay is None:
+            starts = self._ctx.func_starts
+            i = bisect.bisect_right(starts, fva)
+            end = starts[i] if i < len(starts) and starts[i] - fva <= _MAX_FUNC_BYTES else fva + _MAX_FUNC_BYTES
+            lay = self._layouts[fva] = FrameLayout.of(self._code(fva, end), fva)
+        return lay
+
+    def _code(self, va: int, end: int) -> bytes:
+        regions = getattr(self, "_regions", None)
+        if regions is None:
+            regions = self._regions = self._ctx.image_regions()
+        for base, data in regions:
+            if 0 <= va - base < len(data):
+                return data[va - base:end - base]
+        return b""
+
+    def _variadic_call(self, fva: int, call, reg: str):
+        """(function, CallSite, format index, GP save slots) of the variadic call whose
+        varargs a controllable format at `call` would render, or None (va_list from
+        elsewhere). Non-variadic wrappers are followed inwards."""
+        exports = self._ctx.exports
+        wrap = self._fwraps.get(call.target_va) or self._fwraps.get(exports.get(call.target_name, -1))
+        name = call.target_name
+        outer = (fva, call)
+        for _ in range(6):
+            if wrap is None:
+                if re.match(r"^(__)?v", name or "") or fmt_reg(name or "") is None:
+                    return None
+                return outer + (fva, call, int(fmt_reg(name)[1:]), None)
+            if wrap.varargs:
+                gp = -wrap.gr_offs // 8 if wrap.gr_offs else None
+                return outer + (fva, call, int(wrap.fmt_reg[1:]), gp)
+            inner = self._site_calls.get(wrap.site)
+            if inner is None:
+                return None
+            if self._layout(inner[0]).lr_slot() is not None:
+                outer = inner           # a frameless wrapper's tail call reads the caller's stack
+            fva, call = inner
+            name = call.target_name
+            wrap = self._fwraps.get(call.target_va) or self._fwraps.get(exports.get(name, -1))
+        return None
+
+    def _image(self) -> Tuple[int, int, int]:
+        ctx = self._ctx
+        if getattr(ctx, "raw", None):
+            cr = ctx.raw.get("code_ranges") or [[ctx.base_va, ctx.base_va + len(self._data)]]
+            return cr[0][0], cr[-1][1], ctx.base_va
+        fs = ctx.func_starts or [0]
+        return fs[0], fs[-1] + _MAX_FUNC_BYTES, 0 if ctx.base_va < 0x10000 else ctx.base_va
+
+    def _slot_details(self, findings: Dict[int, FmtStringFinding]) -> None:
+        from .frame_layout_arm64 import conversion_map
+        lo, hi, base = self._image()
+        for f in findings.values():
+            if f.provenance == "unbounded_s" or f.severity == "LOW":
+                continue
+            fc = self._site_calls.get(f.call_va)
+            if fc is None:
+                continue
+            vc = self._variadic_call(fc[0], fc[1], f.fmt_reg)
+            if vc is None:
+                f.details["slots"] = ["va_list comes from elsewhere: conversions read the variadic "
+                                      "caller's frame, not mapped"]
+                continue
+            ofva, ocall, cfva, ccall, k, gp = vc
+            if self._layout(cfva).lr_slot() is None and ofva != cfva:
+                cfva, site = ofva, ocall.site_va       # frameless: the stack is the caller's
+            else:
+                site = ccall.site_va
+            rets = [c.site_va + 4 for _caller, c in self._callers.get(cfva, [])]
+            lines, leak = conversion_map(self._layout(cfva), ccall.args, k, gp, rets, (lo, hi), base,
+                                         self._slot_taint.get(site))
+            lay = self._layout(cfva)
+            frame = (f"{self._fn(cfva)} frame {lay.size:#x} bytes" if lay.lr_slot() is not None else
+                     f"{self._fn(cfva)} keeps no frame record (tail call / leaf): the conversions "
+                     f"past the registers read its caller's frame, not mapped")
+            f.details["slots"] = [frame] + lines
+            if leak:
+                f.details["leak"] = "; ".join(leak.values())
+            if f.provenance == "tainted":
+                if {"code", "image", "stack"} & set(leak):
+                    f.severity = "HIGH"
+                    if "code" in leak or "image" in leak:
+                        f.description += "; renders a code / image pointer: defeats PIE"
+                elif self._layout(cfva).lr_slot() is not None:
+                    # the map reached this frame's saved x30 and found nothing worse
+                    f.severity = "MEDIUM"
+                    f.description += "; renders only stale registers / locals"
+
+    def _dest_extent(self, fva: int, v) -> str:
+        while v is not None and v.kind == "copy":
+            v = v.chain
+        lay = self._layout(fva)
+        off = lay.entry_off(v.str_val) if v is not None else None
+        if off is None:
+            return ""
+        n, what, lr, note = lay.extent(off)
+        tail = f"; {lr} bytes to saved x30" if lr is not None else (f"; {note}" if note else "")
+        return f"{v.display()}: {n} bytes to the {what}{tail}"
 
     def _literal(self, v) -> Optional[str]:
         while v is not None and v.kind == "copy":
@@ -487,6 +599,15 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
             reg = w.fmt_reg if w is not None else None
         if reg is not None:
             st = eng.state
+            slots = {}
+            for j in range(64):
+                t = st.mem_get("sp", 8 * j)
+                if t.labels:
+                    slots[j] = set(t.labels)
+            if slots:
+                cur = self._slot_taint.setdefault(insn.address, {})
+                for j, l in slots.items():
+                    cur.setdefault(j, set()).update(l)
             labels = st.get(reg).labels | st.pointee(reg).labels
             if labels:
                 prev = self._tainted.get(insn.address, (reg, set()))[1]

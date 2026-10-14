@@ -392,10 +392,11 @@ N static void put(char *d, const char *s, size_t n) { memcpy(d, s, n); }
 void h_ok(void) { log_event(1, "started %d", 3); dbg("plain"); }
 void h_bad(int fd) { char req[256]; recv(fd, req, 255, 0); req[255] = 0; log_event(1, req); }
 void h_dbg(int fd) { char r[64]; recv(fd, r, 63, 0); r[63] = 0; dbg(r); }
-void h_mid(void) { char t[32]; get_name(t); log_event(1, t); }
+N void h_mid(void) { char t[32]; get_name(t); log_event(1, t); }
 void h_ext(const char *p) { log_event(2, p); }
 void h_run(int fd) { char c[64]; recv(fd, c, 63, 0); c[63] = 0; run(c); }
 void h_put(int fd, char *d) { unsigned char b[64]; recv(fd, b, 64, 0); put(d, (char *)b, b[0]); }
+void route(void) { h_mid(); }
 '''
 
 
@@ -564,3 +565,55 @@ def test_fortify_memcpy_chk_is_a_sink(fort_so):
     assert got[t["cpy_known"]].severity == "MEDIUM" and "aborts when the copy exceeds 0x10" in got[t["cpy_known"]].note
     # __memcpy_chk(.., (size_t)-1) is folded to plain memcpy by the compiler: no FORTIFY note
     assert got[t["cpy_unknown"]].severity == "HIGH" and "FORTIFY" not in got[t["cpy_unknown"]].note
+
+
+# ── round 2: conversion -> slot map, destination extent ──────────────────────
+
+def test_format_slot_map(wrap_bins):
+    from ablation.analyzers.format_string_scanner_arm64 import ARM64FormatStringScanner
+    ctx, t = _wctx(wrap_bins["O2"])
+    fs = {f.func_va: f for f in ARM64FormatStringScanner.from_context(ctx).scan()}
+    bad = fs[t["h_bad"]]                       # char req[256] at sp, frame record above it
+    slots = bad.details["slots"]
+    assert "%1$..%6$: stale argument registers" in slots         # x2..x7 (6 GP slots)
+    assert any(s.startswith("%7$..%38$: attacker bytes (recv)") for s in slots)
+    assert any(s.startswith("%39$: [sp+0x100] saved x29") for s in slots)
+    assert any(s.startswith("%40$: [sp+0x108] saved x30") for s in slots)
+    assert bad.severity == "HIGH" and "defeats PIE" in bad.description
+    # through the frameless dbg -> log_event tail call: h_dbg's frame is what is read
+    assert any(s.startswith("%16$: [sp+0x48] saved x30") for s in fs[t["h_dbg"]].details["slots"])
+    # a caller exists: K is the return address into it
+    mid = fs[t["h_mid"]]
+    import subprocess
+    dis = subprocess.run(["llvm-objdump", "-d", "--no-show-raw-insn", str(wrap_bins["O2"])],
+                         capture_output=True, text=True).stdout
+    route = dis.split("<route>:")[1]
+    site = next(int(l.split(":")[0], 16) for l in route.splitlines() if "<h_mid" in l and ("bl\t" in l or "b\t" in l))
+    assert f"base+{site + 4:#x}" in mid.details["leak"]
+
+
+_DEST_SRC = r"""
+typedef unsigned long size_t;
+extern long recv(int, void *, size_t, int);
+extern int sscanf(const char *, const char *, ...);
+extern void use(void *);
+void five(int fd) { char req[64]; char m[5]; char rest[32]; recv(fd, req, 63, 0); req[63] = 0;
+                    sscanf(req, "%s %31s", m, rest); use(m); use(rest); }
+"""
+
+
+@pytest.fixture(scope="module")
+def dest_so(tmp_path_factory):
+    return build_variants(tmp_path_factory, src_text=_DEST_SRC, variants={"O2": ["-O2"]})["O2"]
+
+
+def test_scanf_destination_extent(dest_so):
+    from ablation.analyzers.format_string_scanner_arm64 import ARM64FormatStringScanner
+    from ablation.analyzers.frame_layout_arm64 import FrameLayout
+    ctx, t = _wctx(dest_so)
+    (f,) = [f for f in ARM64FormatStringScanner.from_context(ctx).scan() if f.provenance == "unbounded_s"]
+    dest = f.details["dest"]
+    import re as _re
+    n = int(_re.search(r": (\d+) bytes to the", dest).group(1))
+    assert 5 <= n <= 8                          # char m[5] (allocation rounding), not the frame
+    assert "bytes to saved x30" in dest
