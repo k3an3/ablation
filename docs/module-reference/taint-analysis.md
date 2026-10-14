@@ -210,6 +210,12 @@ for f in findings:
   outputs carry the taint onwards, so `strcpy(t, field)` is HIGH.
 - **Header-field lengths.** A `read` / `recv` whose *length* argument is attacker data (a
   parsed header field) is HIGH.
+- **Vendor wrappers and FORTIFY.**
+  - Inferred exec / format wrappers are sinks at their call sites (see
+    [sink-wrappers.md](sink-wrappers.md)).
+  - `__memcpy_chk` / `__strcpy_chk` / `__read_chk` ... resolve to their base sinks. A constant
+    destination size means an abort, not corruption: the finding is noted and one severity
+    lower.
 - **Opaque calls.** `summarise_opaque = True` (CLI `--summarise-opaque`): a call with no model
   that receives attacker data (value or pointee) taints its result. Example: `n = be16(pkt);
   memcpy(d, s, n)`. Findings that depend only on such hops are one severity lower and noted

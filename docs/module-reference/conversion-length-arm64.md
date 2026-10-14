@@ -32,13 +32,17 @@ that alone.
 | `sext_unchecked` | attacker value sign-extended into a size, no check | HIGH |
 | `sext_unchecked` | signed 32/16/8-bit field (`ldrsw` ...) straight into a size, e.g. a 64-bit length stored to an `int` global | LOW |
 | `masked_check` | bound checked on `len & 0xffff` / `uxth`; the size uses full-width `len` | HIGH attacker / MEDIUM |
+| `signed_clamp` | `min(len, MAX)` with a signed `csel` (lt / le / gt / ge) reaching a size: a negative passes the clamp | HIGH attacker / MEDIUM |
+| `narrowing_store` | a 64-bit length (`strlen` / `read` / `recv` result) stored with a 32-bit `str` outside the frame (LOW), or attacker data stored narrow anywhere (HIGH) | HIGH / LOW |
 | `byte_counter_loop` | loop compares a byte-width counter with a 16-bit / > 255 / attacker limit: never ends | HIGH attacker / MEDIUM |
 
 **Guards.** These make a sign extension safe:
 - an unsigned compare of the value (`b.hi` / `b.hs` / `b.lo` / `b.ls`);
 - a signed upper bound together with a lower bound (`cmp #0` + `b.lt`, `tbnz #31`).
 
-**Sinks** are the length arguments of `memcpy` / `memmove` / `memset` / `read` / `recv` /
+**Sinks** include inferred or sink-map *length wrappers*: a vendor `net_read(fd, b, n)` →
+`read` is a size sink. `ablation lengths --json PATH` writes both scanners' findings. The
+sinks are the length arguments of `memcpy` / `memmove` / `memset` / `read` / `recv` /
 `snprintf` / `malloc` / `calloc` / `realloc` and similar calls.
 
 **snprintf.** A converted or underflowed size reaching `snprintf` / `vsnprintf` x1 is rated by

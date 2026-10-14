@@ -2,6 +2,50 @@
 
 ---
 
+## v2.88.0
+
+**Second round from an AArch64 firmware audit: vendor sink wrappers, what a format string
+leaks, egress coupling, reachability, path-sensitive resolution, FORTIFY.**
+
+- **Vendor sink wrappers** (`SinkWrapperInferer`, `ablation wrappers`, `--sink-wrappers`).
+  - A function that passes its own parameter to a format / exec / length / copy sink argument
+    is a wrapper. This is solved to a fixpoint, and varargs wrappers record their `gr_offs` /
+    `vr_offs` save area.
+  - fmtstr reports at the wrapper's call sites with the caller's provenance. Taint treats
+    exec / format wrappers as sinks, and lengths treats length wrappers as size sinks.
+  - `--sink-map` values `"format:x1"` etc. override.
+- **What a controllable format reads** (`details.slots`, `details.leak`).
+  - Each conversion index maps to stale registers, locals, attacker bytes, or the caller's
+    saved `x29` / `x30` (`base+K`), using the new `FrameLayout`.
+  - Severity follows: a code-pointer disclosure is HIGH; a complete map with only stale data
+    is MEDIUM.
+  - Unbounded `%s` / `%[` get `details.dest`: the bytes to the next object and to the saved
+    `x30`.
+- **Egress coupling** (`EgressMap`, `ablation egress`, `details.egress`). Writers and readers
+  of the same path literal are paired, including through a global `FILE*`, and a reader that
+  sends to a peer completes the chain: `write in log_event -> "/var/log/httpd.log" -> read in
+  serve_log -> send`.
+- **Reachability** (`Reachability`, `ablation reach`, `--show-suppressed`).
+  - Liveness comes from the entry point, exports and address-taken functions.
+  - Handler registrations (setter calls, `{key, handler}` tables) are resolved.
+  - Config gates are labelled with their writers. Suppressed findings are always counted with
+    reasons, and listed with `--show-suppressed`.
+- **Path-sensitive resolution.** `ARM64RegAnnotator.annotate_calls_cfg` meets values at CFG
+  joins. fmtstr reports in three buckets: literal / externally-influenced / unresolved (with
+  the reason).
+- **FORTIFY.**
+  - `__*_chk` copies and reads resolve to their base sinks; a known destination size means
+    abort, not corruption.
+  - All `__*printf_chk` variants are format sinks, and `details.fortify` states `%n` liveness.
+- **lengths.**
+  - `--json`, `signed_clamp` (signed `csel`), and `narrowing_store` (64→32-bit store of a
+    length).
+  - Vendor length wrappers count as size sinks, which fixes all three missed cases.
+  - RTOS allocators (`pvPortMalloc`, `k_malloc`, `rt_malloc` ...) were added to the overflow
+    and heap oracles. The zero-oracle warning now names the functions it expected.
+
+---
+
 ## v2.87.0
 
 **Gaps from a multi-binary AArch64 firmware audit: sinks without imports, symbol dialects,

@@ -21,6 +21,10 @@ from .bss_taint_tracker_arm64 import ARM64BssTaintTracker
 from .vtable_dispatch_arm64 import ARM64VtableDispatchScanner
 from .libc_roles import LibcRoleInferer
 from .conversion_length_arm64 import ARM64ConversionLengthScanner
+from .sink_wrappers import SinkWrapperInferer
+from .reachability_arm64 import Reachability
+from .egress_arm64 import EgressMap
+from .frame_layout_arm64 import FrameLayout
 from .taint_tracker_arm64 import ARM64TaintTracker, TaintFindingARM64
 from .arm64_fgets_fd_discriminator import ARM64FgetsFdDiscriminator, FgetsClassifiedFinding
 from .version_delta import VersionTracker, diff_functions
@@ -165,7 +169,7 @@ __all__ = [
     "ARM64FuncStartScanner",
     "ARM64IntOverflowScanner", "IntOverflowFinding64",
     "ARM64FormatStringScanner", "ARM64LengthUnderflowScanner", "UnderflowFinding64",
-    "ARM64HeapScanner", "ARM64BssTaintTracker", "ARM64VtableDispatchScanner", "LibcRoleInferer", "ARM64ConversionLengthScanner",
+    "ARM64HeapScanner", "ARM64BssTaintTracker", "ARM64VtableDispatchScanner", "LibcRoleInferer", "ARM64ConversionLengthScanner", "SinkWrapperInferer", "Reachability", "EgressMap", "FrameLayout",
     "ARM64TaintTracker", "TaintFindingARM64",
     "ARM64FgetsFdDiscriminator", "FgetsClassifiedFinding",
     "VersionTracker", "diff_functions",

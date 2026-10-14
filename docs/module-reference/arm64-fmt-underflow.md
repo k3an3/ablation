@@ -52,6 +52,46 @@ the wrapper's call sites in the binary, following nested wrappers (`log_mid(lvl,
 | no caller in the binary (exported API) | LOW `arg_passthrough` |
 | every caller passes a literal | not reported |
 
+**What a controllable format reads (`details.slots`, `details.leak`).** The map is computed at
+the variadic boundary: a direct printf-family call, or the call site of a varargs wrapper.
+Non-variadic wrappers are followed inwards, and a frameless wrapper's tail call is mapped
+against its caller's frame. `frame_layout_arm64.FrameLayout` supplies the frame size, the
+saved `x29` / `x30` / callee-saved slots and the address-taken objects. Each `%i$`
+(sequential or positional) maps to one of:
+- stale GP argument registers (stack / image pointers among them are flagged);
+- local slots;
+- slots holding attacker bytes at the call (`%n` / `%s` targets);
+- the caller's saved `x29`: stack disclosure;
+- the caller's saved `x30`: code pointer, `base+K`, where K is the return site into the
+  caller;
+- the caller's caller frame (unknown).
+
+How the map drives severity:
+- A tainted format that renders a code or stack pointer is HIGH ("defeats PIE").
+- One whose map reaches the saved `x30` without any such pointer is MEDIUM.
+
+```
+leak: %7$ reads attacker-controlled bytes; %39$p renders a stack address; %40$p renders the saved return address (base+0x...)
+slots: h_bad frame 0x120 bytes; %1$..%6$: stale argument registers; %7$..%38$: attacker bytes (recv) ...;
+       %39$: [sp+0x100] saved x29 ...; %40$: [sp+0x108] saved x30: return address into the caller ...
+```
+
+**Three buckets.** `ARM64RegAnnotator.annotate_calls_cfg` is path-sensitive: a register or
+slot with different definitions on different paths is `unresolved` with the reason (e.g.
+`ret(calloc) | 'lit %d'`). It is never silently taken as a literal.
+- literal: not reported;
+- externally-influenced: a finding;
+- `unresolved (reason)`: LOW, listed separately as a to-do (`details.bucket`).
+
+**FORTIFY (`details.fortify`).**
+- `%n: blocked by FORTIFY (__vsnprintf_chk flag=1 ...)`;
+- `%n: not blocked (... with flag 0)`;
+- `%n: not blocked (plain vsnprintf ...)`.
+
+This works through wrappers too. All `__*printf_chk` variants are format sinks.
+
+**Egress (`details.egress`).** See [reachability-egress.md](reachability-egress.md).
+
 **Unbounded `%s`.** For a literal format, `%s` with no precision (print family) or
 `%s` / `%[` with no width (scan family, skipping `%*s` and `%ms`) is checked. It is flagged
 when it writes into a stack buffer:
@@ -63,7 +103,9 @@ when it writes into a stack buffer:
 | `scanf` | same | always (stdin) |
 | `fscanf` | same | never (MEDIUM) |
 
-The other cases are MEDIUM. `__sprintf_chk` is not flagged, because it aborts on overflow.
+The other cases are MEDIUM. `details.dest` gives the byte budget: the bytes to the next stack
+object or saved register, and to this frame's saved `x30`. A note is added when the frame
+record sits below the buffer, where an overflow runs into the caller's frame. `__sprintf_chk` is not flagged, because it aborts on overflow.
 `unbounded_conversions(fmt, family)` exposes the parser.
 
 Covers printf / fprintf / sprintf / snprintf / dprintf / asprintf (+ `v*`), syslog, err / warn
