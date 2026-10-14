@@ -455,3 +455,65 @@ def test_sink_map_wrapper_override(wrap_bins, tmp_path):
 def test_cli_wrappers(wrap_bins):
     r = _cli("wrappers", wrap_bins["O2"])
     assert "log_event" in r.stdout and "varargs (6 GP" in r.stdout
+
+
+# ── round 2: lengths through vendor wrappers, clamps, narrowing stores ───────
+
+_LEN2_SRC = r'''
+typedef unsigned long size_t;
+extern long read(int, void *, size_t);
+extern long recv(int, void *, size_t, int);
+extern size_t strlen(const char *);
+extern long get64(void);
+extern int get(void);
+#define N __attribute__((noinline))
+N static long net_read(int fd, void *b, size_t n) { return read(fd, b, n); }   /* vendor wrapper */
+int g_len32;
+void store_len(const char *s) { g_len32 = strlen(s); }                         /* 64 -> 32 store */
+void store_wire(int fd) { unsigned char b[8]; recv(fd, b, 8, 0); long v = *(long *)b; g_len32 = (int)v; }
+void signed64(int fd, char *b) { long n = get64(); if (n > 64) return; net_read(fd, b, (int)n); }
+void clamp(int fd, char *b) { int n = get(); int m = n < 64 ? n : 64; net_read(fd, b, m); }
+void clamp_ok(int fd, char *b) { unsigned n = (unsigned)get(); unsigned m = n < 64 ? n : 64; net_read(fd, b, m); }
+void local_ok(const char *s) { int n = (int)strlen(s); (void)n; }
+'''
+
+
+@pytest.fixture(scope="module")
+def len2_bins(tmp_path_factory):
+    return build_variants(tmp_path_factory, src_text=_LEN2_SRC, variants={"O1": ["-O1"], "O2": ["-O2"]})
+
+
+@pytest.mark.parametrize("opt", ["O1", "O2"])
+def test_lengths_wrapper_clamp_narrowing(len2_bins, opt):
+    from ablation.analyzers.conversion_length_arm64 import ARM64ConversionLengthScanner
+    ctx, t = _wctx(len2_bins[opt])
+    got = {(f.func_va, f.kind, f.severity, f.sink) for f in
+           ARM64ConversionLengthScanner.from_context(ctx).scan()}
+    assert got == {
+        (t["store_len"], "narrowing_store", "LOW", ""),       # strlen result -> int global
+        (t["store_wire"], "narrowing_store", "HIGH", ""),
+        (t["signed64"], "sext_signed_check", "MEDIUM", "net_read"),   # vendor read wrapper
+        (t["clamp"], "signed_clamp", "MEDIUM", "net_read"),
+    }                                                          # clamp_ok / local_ok: silent
+
+
+def test_lengths_json(len2_bins, tmp_path):
+    out = tmp_path / "l.json"
+    r = _cli("lengths", len2_bins["O2"], "--json", out)
+    assert r.returncode == 0, r.stderr[-400:]
+    data = json.loads(out.read_text())
+    assert {d["kind"] for d in data["conversion"]} == {"narrowing_store", "sext_signed_check", "signed_clamp"}
+    assert data["underflow"] == []
+
+
+def test_overflow_sink_map_rtos_allocator(roles_img, tmp_path):
+    binf, truth = roles_img
+    fresh = tmp_path / "ov.bin"
+    fresh.write_bytes(binf.read_bytes() + b"\0" * 12 + __import__("os").urandom(8))
+    sm = tmp_path / "alloc.json"
+    sm.write_text(json.dumps({hex(truth["memset"]): "pvPortMalloc"}))     # any VA, named
+    r = _cli("overflow", fresh, "--raw", "arm64", "--base", hex(RAW_BASE), "--sink-map", sm,
+             "--no-infer-sinks")
+    assert "sink oracles resolved" not in r.stdout
+    r = _cli("overflow", fresh, "--raw", "arm64", "--base", hex(RAW_BASE), "--no-infer-sinks")
+    assert "matches any of:" in r.stdout and "malloc" in r.stdout

@@ -23,6 +23,11 @@ Kinds
                       size uses the full-width len
   byte_counter_loop   a loop compares a byte-width counter (uxtb / and #0xff / ldrb)
                       against a limit wider than 255: a limit above 255 never ends
+  signed_clamp        min(len, MAX) done with a signed csel (lt / le / gt / ge) reaches a
+                      size: a negative len passes the clamp
+  narrowing_store     a 64-bit length (strlen / read / recv result, or attacker data)
+                      stored with a 32-bit str: the high half is lost (attacker data:
+                      any store; a library length: stores outside the stack frame)
 
 Guards: an unsigned compare (b.hi / b.hs / b.lo / b.ls / cs / cc) of the value, or a
 signed upper bound together with a lower bound (cmp #0 + b.lt / b.ge, tbnz / tbz #31),
@@ -52,6 +57,9 @@ from .taint_tracker_arm64 import Taint, TaintEngine
 _SEXT = frozenset({"sxtw", "sxth", "sxtb", "ldrsw", "ldrsh", "ldrsb", "ldursw", "ldursh", "ldursb"})
 _SIGNED = frozenset({"gt", "ge", "lt", "le", "mi", "pl"})
 _UNSIGNED = frozenset({"hi", "hs", "cs", "lo", "cc", "ls"})
+_LEN_RETURNS = frozenset({"strlen", "strnlen", "read", "recv", "recvfrom", "pread", "fread",
+                          "ftell", "lseek", "readlink", "wcslen", "__strlen_chk"})
+_CSEL = frozenset({"csel", "csinc", "csinv", "csneg"})
 _SNPRINTF = frozenset({"snprintf", "vsnprintf", "__snprintf_chk", "__vsnprintf_chk"})
 # libcs whose snprintf rejects size > INT_MAX (returns -1, writes nothing): True;
 # trusts the size: False. Only implementations whose source was checked are listed.
@@ -70,6 +78,12 @@ class ConversionFinding:
     detail: str
     sources: str = ""
     note: str = ""
+
+    def as_dict(self) -> dict:
+        return {"kind": self.kind, "func_va": hex(self.func_va), "site_va": hex(self.site_va),
+                "sink_va": hex(self.sink_va) if self.sink_va else "", "sink": self.sink,
+                "arg": self.arg, "severity": self.severity, "detail": self.detail,
+                "sources": self.sources, "note": self.note}
 
     def fmt(self) -> str:
         src = f"  source={self.sources}" if self.sources else ""
@@ -104,6 +118,8 @@ class ARM64ConversionLengthScanner(ARM64TaggingScanner):
         self._cmps: List[_Cmp] = []
         self._pending_cmp: Optional[_Cmp] = None
         self._found = {}
+        self._wide: Dict[str, bool] = {}           # register -> last written as 64-bit
+        self._wide_fva = None
 
     # ---- public API ---------------------------------------------------------
 
@@ -142,6 +158,10 @@ class ARM64ConversionLengthScanner(ARM64TaggingScanner):
     def _before_step(self, eng: TaintEngine, insn: Insn, fva: int) -> None:
         m = insn.mnemonic
         st = eng.state
+        if fva != self._wide_fva:
+            self._wide, self._wide_fva = {}, fva
+        if m in ("str", "stur") and insn.reg(0) is not None and insn.reg(0).bits == 32:
+            self._narrow_store(eng, insn, fva)
         # flag consumer: finish the pending compare with its condition
         if self._pending_cmp is not None and (m.startswith("b.") or m in _FLAG_USERS):
             c = self._pending_cmp
@@ -172,6 +192,18 @@ class ARM64ConversionLengthScanner(ARM64TaggingScanner):
         st = eng.state
         rd, rn = insn.reg(0), insn.reg(1)
         masked = (m in ("uxth", "uxtb") or (m == "and" and insn.imm(2) in (0xFF, 0xFFFF)))
+        if m in _CSEL and rd is not None and rd.name != "xzr":
+            cond = (insn.raw or "").rsplit(",", 1)[-1].strip()
+            if cond in _SIGNED:
+                va = insn.address
+                ops = [r.name for r in insn.regs()[1:3]]
+                t = st.get(rd.name)
+                lbl = f"{TAG}clamp@{va:#x}"
+                st.regs[rd.name] = Taint(t.labels | {lbl}, t.bound)
+                self._sites[lbl] = TagSite(fva, va, m, ops, attacker(t.labels),
+                                           {"kind": "clamp", "cond": cond})
+        if rd is not None and rd.name not in ("xzr", "sp") and not m.startswith(("st", "cmp", "b", "tst")):
+            self._wide[rd.name] = rd.bits == 64
         if masked and rd is not None and rn is not None and rd.name != rn.name:
             va = insn.address
             width = 8 if (m == "uxtb" or insn.imm(2) == 0xFF) else 16
@@ -243,11 +275,13 @@ class ARM64ConversionLengthScanner(ARM64TaggingScanner):
         st = eng.state
         for r in size_args:
             t = st.get(r)
-            for label in t.labels:
-                site = self._sites.get(label)
-                if site is None:
-                    continue
-                if site.extra.get("kind") == "sext":
+            sites = [(l, self._sites[l]) for l in t.labels if l in self._sites]
+            clamped = False
+            for label, site in sites:
+                if site.extra.get("kind") == "clamp":
+                    clamped |= self._check_clamp(label, site, t, insn, callee, r)
+            for label, site in sites:
+                if site.extra.get("kind") == "sext" and not clamped:
                     self._check_sext(label, site, t, insn, callee, r, fva)
                 elif site.extra.get("kind") == "mask":
                     self._check_mask(label, site, t, insn, callee, r, fva)
@@ -258,6 +292,46 @@ class ARM64ConversionLengthScanner(ARM64TaggingScanner):
             if t.labels and not attacker(t.labels):
                 st.regs[r] = Taint(frozenset(), t.bound)
         super()._on_call(eng, insn, target, callee, fva, func_name, findings, depth, enqueue)
+        # 64-bit length results (size_t / ssize_t), for narrowing stores
+        self._wide = {k: v for k, v in self._wide.items() if k not in ("x0", "x1")}
+        if callee in _LEN_RETURNS:
+            t = st.get("x0")
+            st.regs["x0"] = Taint(t.labels | {f"{TAG}len64@{insn.address:#x}"}, t.bound)
+            self._wide["x0"] = True
+
+    def _narrow_store(self, eng: TaintEngine, insn: Insn, fva: int) -> None:
+        r = insn.reg(0)
+        if r.name in ("xzr",) or not self._wide.get(r.name):
+            return
+        t = eng.state.get(r.name)
+        src = attacker(t.labels)
+        lens = [l for l in t.labels if l.startswith(f"{TAG}len64@")]
+        mem = insn.first_mem()
+        on_stack = mem is not None and mem.base in ("sp", "x29")
+        if not src and not (lens and not on_stack):
+            return
+        where = str(mem) if mem is not None else "memory"
+        what = (f"attacker 64-bit value ({','.join(sorted(src))})" if src else
+                f"64-bit length (result of the call at {lens[0].split('@')[1]})")
+        self._add(ConversionFinding(
+            "narrowing_store", fva, insn.address, 0, "", "",
+            "HIGH" if src else "LOW",
+            f"{what} stored as 32 bits ({insn.mnemonic} {r.name.replace('x', 'w', 1)}, {where}): "
+            f"the high half is dropped; a reload (ldrsw / ldr w) sees a different length",
+            ",".join(sorted(src))))
+
+    def _check_clamp(self, label, site, t, insn, callee, arg) -> bool:
+        g = self._guards_on(label, site)
+        if any(c.cond in _UNSIGNED for c in g) or any(c.zero and c.va != site.va for c in g):
+            return False
+        src = attacker(t.labels)
+        self._add(self._snprintf(ConversionFinding(
+            "signed_clamp", site.func_va, site.va, insn.address, callee or "", arg,
+            "HIGH" if src else "MEDIUM",
+            f"{site.mnemonic} ... {site.extra['cond']} at 0x{site.va:x} clamps with a signed "
+            f"compare: a negative length passes the clamp and becomes a huge {callee} size",
+            ",".join(sorted(src)))))
+        return True
 
     def _guards_on(self, label: str, site: TagSite) -> List[_Cmp]:
         out = []

@@ -123,9 +123,11 @@ def _check_oracles(args, ctx, engine: str) -> None:
         resolved, _ = ctx.sink_coverage(sinks | extra)
     _ensure_wrappers(args, ctx)
     if not resolved:
+        sample = ", ".join(sorted(sinks)[:8])
         msg = (f"WARNING: 0 of {len(sinks)} {engine} sink oracles resolved (no PLT, symbol, "
-               f"sink-map or inferred name for memcpy / sprintf / ...); results are not "
-               f"meaningful. Use --sink-map, --symbols or --infer-sinks.")
+               f"sink-map or inferred name matches any of: {sample}, ...); results are not "
+               f"meaningful. Name them with --sink-map (e.g. {{\"0xVA\": \"malloc\"}}), "
+               f"--symbols or --infer-sinks.")
         print(msg, file=sys.stderr)
         print(msg)
     if sources:
@@ -362,13 +364,21 @@ def cmd_lengths(args):
     conv = ARM64ConversionLengthScanner.from_context(ctx)
     conv.snprintf_rejects_huge = rejects
     _apply_taint_args(args, conv)
-    print(conv.report(conv.scan(depth=args.depth)))
+    conv_found = conv.scan(depth=args.depth)
     under = ARM64LengthUnderflowScanner.from_context(ctx)
     under.snprintf_rejects_huge = rejects
     _apply_taint_args(args, under)
     found = under.scan(depth=args.depth)
     if not args.all:
         found = [f for f in found if not f.guarded]
+    if args.json:
+        import json
+        data = {"conversion": [f.as_dict() for f in conv_found],
+                "underflow": [f.as_dict() for f in found]}
+        Path(args.json).write_text(json.dumps(data, indent=2))
+        print(f"Wrote {len(conv_found)} conversion + {len(found)} underflow findings to {args.json}")
+        return
+    print(conv.report(conv_found))
     print()
     print(under.report(found))
 
@@ -1344,6 +1354,7 @@ def main():
                             'rejected (musl); default: reported MEDIUM with a note')
     p_len.add_argument('--depth', type=int, default=3)
     p_len.add_argument('--all', action='store_true', help='include guarded underflow candidates')
+    p_len.add_argument('--json', metavar='PATH', help='write findings as JSON')
     p_len.set_defaults(func=cmd_lengths)
 
     p_wr = sub.add_parser('wrappers', help='ARM64 vendor sink wrappers: log(fmt, ...) -> vsnprintf, '

@@ -49,6 +49,12 @@ _ALLOC_SIZE_ARGS: Dict[str, Tuple[str, ...]] = {
     "g_realloc": ("x1",), "CRYPTO_malloc": ("x0",), "CRYPTO_zalloc": ("x0",),
     "kmalloc": ("x0",), "__kmalloc": ("x0",), "kzalloc": ("x0",), "kvmalloc": ("x0",),
     "vmalloc": ("x0",), "vzalloc": ("x0",), "kvmalloc_node": ("x0",),
+    # RTOS / embedded allocators
+    "pvPortMalloc": ("x0",), "pvPortCalloc": ("x0", "x1"), "k_malloc": ("x0",),
+    "k_calloc": ("x0", "x1"), "k_aligned_alloc": ("x1",), "rt_malloc": ("x0",),
+    "rt_calloc": ("x0", "x1"), "rt_realloc": ("x1",), "os_malloc": ("x0",), "os_zalloc": ("x0",),
+    "os_calloc": ("x0", "x1"), "os_realloc": ("x1",), "mem_malloc": ("x0",), "mem_calloc": ("x0", "x1"),
+    "osal_malloc": ("x0",), "tx_byte_allocate": ("x2",), "heap_caps_malloc": ("x0",),
 }
 
 _MUL_MNEMS = frozenset({"mul", "madd", "msub", "mneg"})

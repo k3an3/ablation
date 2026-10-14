@@ -55,9 +55,17 @@ _ALLOCS: Dict[str, Tuple[Tuple[str, ...], Optional[str]]] = {
     "kcalloc": (("x0", "x1"), None), "kvmalloc": (("x0",), None), "vmalloc": (("x0",), None),
     "vzalloc": (("x0",), None), "krealloc": (("x1",), "x0"),
     "strdup": ((), None), "strndup": ((), None),
+    # RTOS / embedded allocators
+    "pvPortMalloc": (("x0",), None), "pvPortCalloc": (("x0", "x1"), None), "k_malloc": (("x0",), None),
+    "k_calloc": (("x0", "x1"), None), "rt_malloc": (("x0",), None), "rt_calloc": (("x0", "x1"), None),
+    "rt_realloc": (("x1",), "x0"), "os_malloc": (("x0",), None), "os_zalloc": (("x0",), None),
+    "os_calloc": (("x0", "x1"), None), "os_realloc": (("x1",), "x0"), "mem_malloc": (("x0",), None),
+    "mem_calloc": (("x0", "x1"), None), "osal_malloc": (("x0",), None), "heap_caps_malloc": (("x0",), None),
 }
 _FREES = frozenset({"free", "kfree", "vfree", "kvfree", "g_free", "kfree_sensitive",
-                    "_ZdlPv", "_ZdaPv", "_ZdlPvm", "_ZdaPvm"})
+                    "_ZdlPv", "_ZdaPv", "_ZdlPvm", "_ZdaPvm",
+                    "vPortFree", "k_free", "rt_free", "os_free", "mem_free", "osal_free",
+                    "heap_caps_free"})
 _STRLENS = frozenset({"strlen", "strnlen", "wcslen"})
 _CXX_NEW = frozenset({"_Znwm", "_Znam", "_ZnwmRKSt9nothrow_t", "_ZnamRKSt9nothrow_t",
                       "_ZnwmSt11align_val_t", "_ZnamSt11align_val_t"})

@@ -70,6 +70,13 @@ class UnderflowFinding64:
     guarded: bool
     note: str = ""
 
+    def as_dict(self) -> dict:
+        from dataclasses import asdict
+        d = asdict(self)
+        for k in ("func_va", "sub_va", "truncate_va", "call_va", "call_func_va", "call_target"):
+            d[k] = hex(d[k]) if d[k] else ""
+        return d
+
     def fmt(self) -> str:
         tag = "GUARDED" if self.guarded else "UNGUARDED"
         label = f" ({self.call_label})" if self.call_label else ""
