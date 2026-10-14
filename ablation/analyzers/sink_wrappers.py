@@ -51,7 +51,7 @@ _EXEC_ARGS: Dict[str, Tuple[str, ...]] = {
     "execvp": ("x0", "x1"), "execvpe": ("x0", "x1"), "execl": ("x0", "x1", "x2"),
     "execlp": ("x0", "x1", "x2"), "execle": ("x0", "x1", "x2"),
 }
-KINDS = ("format", "exec", "length", "copy")
+KINDS = ("format", "exec", "length", "copy", "open")
 
 
 def base_sink_args(name: str) -> Dict[str, Tuple[str, ...]]:
@@ -69,6 +69,9 @@ def base_sink_args(name: str) -> Dict[str, Tuple[str, ...]]:
         out["length"] = _LENGTH_ARGS[name]
     if name in _SINK_POINTER_ARGS and name not in _EXEC_ARGS:
         out["copy"] = _SINK_POINTER_ARGS[name]
+    from .egress_arm64 import OPEN_FUNCS
+    if name in OPEN_FUNCS:
+        out["open"] = (OPEN_FUNCS[name][0],)
     return out
 
 
@@ -86,6 +89,7 @@ class SinkWrapper:
     source: str = "inferred"                     # or "sink-map"
     chk_flag: Optional[int] = None               # FORTIFY flag when the chain ends in __*printf_chk
     derived: List[str] = field(default_factory=list)   # kinds reached only through arithmetic / clamps
+    open_mode: Optional[str] = None              # open wrappers: "mode:a" / "flags:0x441" / "param:x1"
 
     @property
     def fmt_reg(self) -> Optional[str]:
@@ -212,6 +216,39 @@ class SinkWrapperInferer:
         self._max_rounds = max_rounds
 
     @staticmethod
+    def _open_mode(c, regions) -> Optional[str]:
+        """Mode of an fopen / open call: 'mode:<literal>', 'flags:<n>', 'param:xN'."""
+        from .egress_arm64 import OPEN_FUNCS
+        spec = OPEN_FUNCS.get(c.target_name or "")
+        if spec is None:
+            return None
+        _p, mreg, kind = spec
+        if kind == "write":
+            return "flags:0x41"
+        v = c.args.get(mreg)
+        while v is not None and v.kind == "copy":
+            v = v.chain
+        if v is None:
+            return None
+        if v.kind == "arg":
+            return f"param:x{v.int_val}"
+        if kind == "mode":
+            if v.kind == "string":
+                return f"mode:{v.str_val}"
+            if v.kind == "const":
+                for rva, data in regions:
+                    off = v.int_val - rva
+                    if 0 <= off < len(data):
+                        end = data.find(b"\0", off, off + 16)
+                        return f"mode:{data[off:end].decode(errors='replace')}" if end > off else None
+            return None
+        if v.kind == "const":
+            return f"flags:{v.int_val:#x}"
+        if v.kind == "zero":
+            return "flags:0x0"
+        return None
+
+    @staticmethod
     def _code(regions, va: int, end: int) -> bytes:
         for rva, data in regions:
             if 0 <= va - rva < len(data):
@@ -246,6 +283,7 @@ class SinkWrapperInferer:
                     fv = c.args.get(freg) if freg else None
                     if fv is not None and fv.kind in ("const", "zero"):
                         flag = fv.int_val if fv.kind == "const" else 0
+                    flag = self._open_mode(c, regions) if flag is None else flag
                     rows.append((tva, c.target_name, c.site_va, pm, flag, dm))
             if rows:
                 compact[fva] = rows
@@ -259,7 +297,10 @@ class SinkWrapperInferer:
                     inner = wrappers.get(tva)
                     if inner is not None:
                         sargs = {k: tuple(v) for k, v in inner.kinds.items()}
-                        wraps, via, flag = inner.wraps, inner.name, inner.chk_flag
+                        wraps, via = inner.wraps, inner.name
+                        flag = inner.open_mode if "open" in inner.kinds else inner.chk_flag
+                        if isinstance(flag, str) and flag.startswith("param:"):
+                            flag = f"param:x{pm.get(flag[6:], -1)}" if flag[6:] in pm else None
                     else:
                         sargs = base_sink_args(tname or names.get(tva, ""))
                         wraps = via = tname or names.get(tva, "")
@@ -278,8 +319,10 @@ class SinkWrapperInferer:
                             w = wrappers[fva] = SinkWrapper(
                                 fva, names.get(fva) or f"fn_{fva:x}", wraps, via, site)
                             changed = True
-                        if kind == "format" and flag is not None:
+                        if kind == "format" and isinstance(flag, int):
                             w.chk_flag = flag
+                        if kind == "open" and isinstance(flag, str):
+                            w.open_mode = flag
                         if derived and kind not in w.derived and kind not in w.kinds:
                             w.derived.append(kind)
                         cur = set(w.kinds.get(kind, ()))

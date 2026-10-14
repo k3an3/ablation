@@ -21,6 +21,10 @@ What it computes
             written within two call levels, and for each a reader whose own code or
             callees (two levels) emit:  F -> write "/var/log/x" in log_line (0x..) ->
             read in serve_file (0x..) -> sendfile (0x..)
+  Vendor open helpers (open_log(path, mode) -> fopen) are inferred as wrappers
+  (sink_wrappers kind "open", with the inner mode). When nothing pairs exactly, a coarse
+  fallback pairs functions that reference the same path literal: one near the finding that
+  writes / opens, another that reaches a send (labelled "coarse").
   Limits: paths built at runtime (snprintf'd names) and output shared through global
   buffers rather than files are not followed.
 """
@@ -73,8 +77,8 @@ class EgressMap:
         self.readers: Dict[str, Set[int]] = defaultdict(set)
         self._emits: Dict[int, List[Tuple[int, str]]] = defaultdict(list)    # func -> [(site, name)]
         self._callees: Dict[int, Set[int]] = defaultdict(set)
-        for a, b, _l in ctx.call_edges:
-            self._callees[a].add(b)
+        for a, b, lbl in ctx.call_edges:
+            self._callees[a].add(ctx.exports.get(lbl, b) if lbl else b)   # PLT stub -> own export
 
     # ---- build ---------------------------------------------------------------
 
@@ -97,8 +101,10 @@ class EgressMap:
         names = set(OPEN_FUNCS) | set(STREAM_OUT) | self._egress
         interesting = [a for a, _b, lbl in ctx.call_edges if lbl in names]
         name_of = ctx.call_names()                       # edges without a label: by callee VA
-        for a, b, _l in ctx.call_edges:
-            if name_of.get(b) in names:
+        from .sink_wrappers import wrappers_of
+        self._open_wraps = {va: w for va, w in wrappers_of(ctx).items() if "open" in w.kinds}
+        for a, b, lbl in ctx.call_edges:
+            if name_of.get(b) in names or b in self._open_wraps or ctx.exports.get(lbl, -1) in self._open_wraps:
                 interesting.append(a)
         interesting = sorted(set(interesting))
         ra = ARM64RegAnnotator.from_context(ctx)
@@ -109,12 +115,18 @@ class EgressMap:
             insns = None
             for c in calls:
                 name = c.target_name or name_of.get(c.target_va, "")
-                if name in OPEN_FUNCS:
-                    preg, mreg, kind = OPEN_FUNCS[name]
-                    path = self._text(c.args.get(preg))
+                ow = self._open_wraps.get(ctx.exports.get(name, c.target_va)) or self._open_wraps.get(c.target_va)
+                if name in OPEN_FUNCS or ow is not None:
+                    if ow is not None:                   # vendor open wrapper: open_log(path, ...)
+                        path = self._text(c.args.get(ow.kinds["open"][0]))
+                        write = self._wrapper_write(ow, c)
+                        name = f"{ow.name} (wrapper of {ow.wraps})"
+                    else:
+                        preg, mreg, kind = OPEN_FUNCS[name]
+                        path = self._text(c.args.get(preg))
+                        write = self._is_write(kind, c.args.get(mreg) if mreg else None)
                     if not path or not path.startswith("/"):
                         continue
-                    write = self._is_write(kind, c.args.get(mreg) if mreg else None)
                     self.opens.append(OpenSite(fva, c.site_va, path, write, name))
                     (self.writers if write else self.readers)[path].add(fva)
                     if write:
@@ -155,6 +167,20 @@ class EgressMap:
                 raw = data[off:end] if end > off else b""
                 return raw.decode() if raw and all(32 <= ch < 127 for ch in raw) else None
         return None
+
+    def _wrapper_write(self, w, c) -> bool:
+        mode = w.open_mode or ""
+        if mode.startswith("param:"):
+            v = c.args.get(mode[6:])
+            if v is None:
+                return False
+            return self._is_write("mode", v) or (v.kind == "const" and bool(v.int_val & _O_WRITE)
+                                                  and self._text(v) is None)
+        if mode.startswith("mode:"):
+            return any(ch in mode[5:] for ch in "wa+")
+        if mode.startswith("flags:"):
+            return bool(int(mode[6:], 16) & _O_WRITE)
+        return False
 
     def _is_write(self, kind: str, v) -> bool:
         if kind == "write":
@@ -204,7 +230,7 @@ class EgressMap:
         return out
 
     def _emitter(self, fva: int) -> Optional[Tuple[int, int, str]]:
-        for f in self._near([fva]):
+        for f in self._near([fva], depth=3):
             for site, name in self._emits.get(f, ()):
                 return f, site, name
         return None
@@ -216,6 +242,7 @@ class EgressMap:
         name = self._ctx.name
         near = self._near(list(fvas))
         chains: List[str] = []
+        exact_paths = set()
         for path, ws in self.writers.items():
             hit = [w for w in ws if w in near]
             if not hit:
@@ -228,7 +255,49 @@ class EgressMap:
                 via = f" in {name(ef)}" if ef != rd else ""
                 chains.append(f"write in {name(hit[0])} (0x{hit[0]:x}) -> \"{path}\" -> read in "
                               f"{name(rd)} (0x{rd:x}) -> {ename} (0x{esite:x}){via}")
+                exact_paths.add(path)
+        if not chains:
+            chains = self._coarse(near)
         return chains
+
+    def _path_refs(self) -> Dict[str, Set[int]]:
+        """path-like string literal -> functions referencing it (string xrefs)."""
+        ctx = self._ctx
+        out: Dict[str, Set[int]] = defaultdict(set)
+        for va, sites in ctx._str_xref_idx.items():
+            text = ctx.strings.get(va, "")
+            if len(text) > 1 and text.startswith("/") and " " not in text and "%" not in text:
+                for site in sites:
+                    f = ctx.func_containing(site)
+                    if f is not None:
+                        out[text].add(f)
+        return out
+
+    def _coarse(self, near: Dict[int, int]) -> List[str]:
+        """Fallback when no open site pairs up (paths handed to helpers the inference does
+        not model): the output side references a path literal and writes / opens within two
+        calls; another function referencing the same literal sends to a peer."""
+        name = self._ctx.name
+        names = self._ctx.call_names()
+        writes = set(STREAM_OUT) | set(OPEN_FUNCS)
+
+        def does(f: int, what) -> bool:
+            return any(names.get(c) in what for c in self._near([f], depth=2))
+
+        out = []
+        for path, refs in self._path_refs().items():
+            mine = [f for f in refs if f in near and (does(f, writes) or f in self.writers.get(path, ()))]
+            if not mine:
+                continue
+            for rd in sorted(refs - set(near)):
+                em = self._emitter(rd)
+                if em is None:
+                    continue
+                ef, esite, ename = em
+                out.append(f"(coarse: shared path literal) {name(mine[0])} (0x{mine[0]:x}) references "
+                           f"\"{path}\" and writes; {name(rd)} (0x{rd:x}) references it and reaches "
+                           f"{ename} (0x{esite:x})")
+        return out
 
     def report(self) -> str:
         self.build()

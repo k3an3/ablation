@@ -806,3 +806,58 @@ def test_size_wrappers_derived(sizew_so):
     got = {(f.func_va, f.kind, f.sink) for f in ARM64ConversionLengthScanner.from_context(ctx).scan()}
     assert (t["h_body"], "sext_signed_check", "body_read") in got
     assert (t["h_tls"], "signed_clamp", "tls_read") in got
+
+
+# ── round 3: egress through vendor open helpers, coarse fallback ─────────────
+
+_EGRESS2_SRC = r"""
+typedef unsigned long size_t; typedef __builtin_va_list va_list; typedef struct FILE FILE;
+extern FILE *fopen(const char *, const char *);
+extern int fputs(const char *, FILE *);
+extern int vsnprintf(char *, size_t, const char *, va_list);
+extern int snprintf(char *, size_t, const char *, ...);
+extern long send(int, const void *, size_t, int);
+extern long recv(int, void *, size_t, int);
+extern int open(const char *, int, ...);
+extern long read(int, void *, size_t);
+#define N __attribute__((noinline))
+N FILE *xfopen(const char *path, const char *mode) { return fopen(path, mode); }
+N int xopen_ro(const char *p) { return open(p, 0); }
+N long http_send(int s, const void *b, size_t n) { return send(s, b, n, 0); }
+static FILE *g_acc;
+N void acc_init(void) { g_acc = xfopen("/var/log/access.log", "a"); }
+N void gpFileAccessLog(int k, const char *fmt, ...) { char buf[0x200]; va_list ap; __builtin_va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap); __builtin_va_end(ap); fputs(buf, g_acc); (void)k; }
+N void serve_access(int s) { int fd = xopen_ro("/var/log/access.log"); char b[256]; long n = read(fd, b, 256); http_send(s, b, n); }
+void route(int s) { char r[128]; recv(s, r, 127, 0); r[127] = 0; gpFileAccessLog(1, r); }
+/* runtime-built paths: only the shared literal links writer and reader */
+N void rot_log(const char *fmt, ...) { char p[64]; char buf[256]; va_list ap; snprintf(p, 64, "%s.%d", "/var/log/rot.log", 1);
+    FILE *f = fopen(p, "a"); __builtin_va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); __builtin_va_end(ap); fputs(buf, f); }
+N void serve_rot(int s) { char q[64]; char b[256]; snprintf(q, 64, "%s.%d", "/var/log/rot.log", 1); int fd = open(q, 0);
+    long n = read(fd, b, 256); send(s, b, n, 0); }
+void route2(int s) { char r[128]; recv(s, r, 127, 0); r[127] = 0; rot_log(r); }
+"""
+
+
+@pytest.fixture(scope="module")
+def egress2_so(tmp_path_factory):
+    return build_variants(tmp_path_factory, src_text=_EGRESS2_SRC, variants={"O2": ["-O2"]})["O2"]
+
+
+def test_egress_vendor_open_helpers(egress2_so):
+    from ablation.analyzers.egress_arm64 import EgressMap
+    from ablation.analyzers.format_string_scanner_arm64 import ARM64FormatStringScanner
+    from ablation.analyzers.sink_wrappers import wrappers_of
+    ctx, t = _wctx(egress2_so)
+    w = wrappers_of(ctx)
+    assert w[t["xfopen"]].kinds["open"] == ["x0"] and w[t["xfopen"]].open_mode == "param:x1"
+    assert w[t["xopen_ro"]].open_mode == "flags:0x0"
+    em = EgressMap(ctx).build()
+    assert t["acc_init"] in em.writers["/var/log/access.log"]
+    assert t["gpFileAccessLog"] in em.writers["/var/log/access.log"]      # via the FILE* global
+    assert em.readers["/var/log/access.log"] == {t["serve_access"]}
+    fs = {f.func_va: f for f in ARM64FormatStringScanner.from_context(ctx).scan()}
+    eg = fs[t["route"]].details["egress"]
+    assert '"/var/log/access.log" -> read in serve_access' in eg and "send" in eg
+    eg2 = fs[t["route2"]].details["egress"]
+    assert eg2.startswith("(coarse: shared path literal)") and "serve_rot" in eg2
