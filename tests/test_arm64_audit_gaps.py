@@ -1127,3 +1127,120 @@ def test_writable_format_and_explain(wfmt_so, wrap_bins):
     assert "forwarding inside the format wrapper log_event" in inner
     r = _cli("fmtstr", wrap_bins["O2"], "--explain", hex(bad_site))
     assert "taint at the call: recv" in r.stdout and "reach:" in r.stdout
+
+
+# ── round 4: the abl_repro corpus (lengths through a vendor body_read; nine %s) ─
+
+_REPRO_SRC = r'''
+/* ablation lengths / width-less %s corpus (synthetic; rebuilt from the round-4 description).
+ * The size sink is a vendor wrapper: body_read(conn, dst, len) saturates len up to INT_MAX
+ * and forwards it to read(). Nothing calls read() directly with an attacker length. */
+typedef unsigned long size_t;
+typedef long ssize_t;
+#define N __attribute__((noinline))
+#define INT_MAX 0x7fffffff
+struct conn { int fd; long avail; };
+N ssize_t read(int fd, void *buf, size_t n) { register long x0 __asm__("x0") = fd; register void *x1 __asm__("x1") = buf;
+    register size_t x2 __asm__("x2") = n; register long x8 __asm__("x8") = 63;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x8) : "memory"); return x0; }
+N int sscanf(const char *s, const char *f, ...) { __asm__ volatile("" :: "r"(s), "r"(f) : "memory"); return 0; }
+N long hdr_int(struct conn *c) { long v; read(c->fd, &v, sizeof v); return v; }
+N ssize_t body_read(struct conn *c, char *dst, long len) { if (len > INT_MAX) len = INT_MAX; return read(c->fd, dst, (size_t)len); }
+N void sink(void *p) { __asm__ volatile("" :: "r"(p) : "memory"); }
+int g_truncated_len;
+volatile long g_consumed;
+/* 1: zero-only cbz, then a SIGNED cap check, then sxtw into the wrapper */
+N void case1(struct conn *c) { char buf[6001]; int len = (int)hdr_int(c); if (len == 0) return; if (len >= 6001) return; body_read(c, buf, len); sink(buf); }
+/* 2: 64 -> 32 truncating store to a global, used as a size in another function */
+N void case2_store(struct conn *c) { long total = hdr_int(c); g_truncated_len = (int)total; }
+N void case2_use(struct conn *c) { char buf[256]; body_read(c, buf, g_truncated_len); sink(buf); }
+/* 3: signed csel min that keeps a negative, guarded only by cbz */
+N void case3(struct conn *c, int cap) { char buf[256]; long rem = g_truncated_len - g_consumed; int n = rem < cap ? (int)rem : cap;
+    if (n == 0) return; body_read(c, buf, n); sink(buf); }
+/* 4 (negative control): reject <= 0, then a true clamp to the cap */
+N void case4(struct conn *c, int cap) { char buf[256]; int n = (int)hdr_int(c); if (n <= 0) return; if (n > cap) n = cap;
+    body_read(c, buf, n); sink(buf); }
+/* 5: nine width-less %s: destinations 1-6 in x2-x7, 7-9 on the stack (the smallest) */
+N void case5(struct conn *c) { char req[256]; char a[64], b2[48], c3[32], d[24], e[16], f[12], g[8], h[5], i[4];
+    read(c->fd, req, 255); req[255] = 0;
+    sscanf(req, "%s %s %s %s %s %s %s %s %s", a, b2, c3, d, e, f, g, h, i);
+    sink(a); sink(b2); sink(c3); sink(d); sink(e); sink(f); sink(g); sink(h); sink(i); }
+void _start(void) { struct conn c = { 0, 0 }; case1(&c); case2_store(&c); case2_use(&c); case3(&c, 64); case4(&c, 64); case5(&c); for (;;) {} }
+'''
+
+
+@pytest.fixture(scope="module")
+def repro_bin(tmp_path_factory):
+    d = tmp_path_factory.mktemp("repro")
+    (d / "abl_repro.c").write_text(_REPRO_SRC)
+    out = d / "abl_repro"
+    r = subprocess.run(["clang", "--target=aarch64-linux-gnu", "-nostdlib", "-static", "-O2",
+                        "-fno-stack-protector", "-fomit-frame-pointer", "-fuse-ld=lld",
+                        str(d / "abl_repro.c"), "-o", str(out)], capture_output=True, text=True)
+    if r.returncode:
+        pytest.skip(r.stderr[-200:])
+    return out
+
+
+def test_repro_corpus_lengths(repro_bin):
+    from ablation.analyzers.conversion_length_arm64 import ARM64ConversionLengthScanner
+    from ablation.analyzers.sink_wrappers import wrappers_of
+    ctx = BinaryContext.load_or_build(str(repro_bin), force_rebuild=True)
+    ctx.infer_wrappers(save=False)
+    e = ctx.exports
+    w = wrappers_of(ctx)
+    assert w[e["body_read"]].kinds["length"] == ["x2"]
+    assert e["case1"] not in w                         # a callee's result is not a parameter
+    got = {(f.func_va, f.kind, f.sink) for f in ARM64ConversionLengthScanner.from_context(ctx).scan()}
+    assert got == {
+        (e["case1"], "sext_signed_check", "body_read"),     # cbz is not a lower bound
+        (e["case2_use"], "narrowing_store", "body_read"),   # linked to case2_store's 32-bit store
+        (e["case3"], "signed_clamp", "body_read"),          # min(rem, cap) keeps a negative
+    }                                                       # case4 (<= 0 rejected) and body_read's
+                                                            # own INT_MAX saturation: silent
+
+
+def test_repro_corpus_nine_dests(repro_bin):
+    from ablation.analyzers.format_string_scanner_arm64 import ARM64FormatStringScanner
+    ctx = BinaryContext.load_or_build(str(repro_bin), force_rebuild=True)
+    ctx.infer_wrappers(save=False)
+    (f,) = [f for f in ARM64FormatStringScanner.from_context(ctx).scan() if f.provenance == "unbounded_s"]
+    assert "9 width-less conversions" in f.description
+    dest = f.details["dest"]
+    for reg in ("x2", "x7", "stack+0x0", "stack+0x8", "stack+0x10"):
+        assert f"-> {reg} [sp+" in dest
+    assert f.details["smallest"] == "%s (stack+0x10): 4 bytes before the next stack object"
+
+
+_SPCOPY_ASM = r"""
+    .text
+    .globl val_spcopy
+    .type val_spcopy, %function
+val_spcopy:                         // destinations addressed through a copy of sp
+    stp   x29, x30, [sp, #-0x40]!
+    mov   x29, sp
+    str   x19, [sp, #0x10]
+    add   x19, sp, #0x18
+    adr   x1, sfmt
+    add   x2, x19, #0x0             // char[5] at sp+0x18
+    add   x3, x19, #0x8             // char[13] at sp+0x20
+    bl    sscanf
+    ldr   x19, [sp, #0x10]
+    ldp   x29, x30, [sp], #0x40
+    ret
+    .size val_spcopy, .-val_spcopy
+sfmt: .asciz "%s %s"
+"""
+
+
+def test_widthless_dest_through_sp_copy(tmp_path):
+    (tmp_path / "t.s").write_text(_SPCOPY_ASM)
+    so = tmp_path / "t.so"
+    r = subprocess.run(["clang", "--target=aarch64-linux-gnu", "-shared", "-nostdlib", "-fuse-ld=lld",
+                        str(tmp_path / "t.s"), "-o", str(so)], capture_output=True, text=True)
+    if r.returncode:
+        pytest.skip(r.stderr[-200:])
+    from ablation.analyzers.format_string_scanner_arm64 import ARM64FormatStringScanner
+    ctx = BinaryContext.load_or_build(str(so), force_rebuild=True)
+    (f,) = [f for f in ARM64FormatStringScanner.from_context(ctx).scan() if f.provenance == "unbounded_s"]
+    assert "2 width-less conversions" in f.description and "[sp+0x18]" in f.description

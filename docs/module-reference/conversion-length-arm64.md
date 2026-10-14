@@ -36,6 +36,13 @@ that alone.
 | `narrowing_store` | a 64-bit length (`strlen` / `read` / `recv` result) stored with a 32-bit `str` outside the frame (LOW), or attacker data stored narrow anywhere (HIGH) | HIGH / LOW |
 | `byte_counter_loop` | loop compares a byte-width counter with a 16-bit / > 255 / attacker limit: never ends | HIGH attacker / MEDIUM |
 
+**Lower bounds.** `cbz` / `cbnz` test `== 0` only and do not exclude negatives. A signed
+compare with 0 or 1 (`n <= 0` is `cmp #1; b.lt`), or `tbz` / `tbnz` of the sign bit, does.
+Inside a length wrapper, a clamp or extension of the wrapper's own parameter is the caller's
+problem, so it is reported at the call sites. A clamp that mixes in a global or a callee
+result stays reported. `narrowing_store` also links a 32-bit store to a global with a
+sign-extending reload of it used as a size elsewhere.
+
 **Guards.** These make a sign extension safe:
 - an unsigned compare of the value (`b.hi` / `b.hs` / `b.lo` / `b.ls`);
 - a signed upper bound together with a lower bound (`cmp #0` + `b.lt`, `tbnz #31`).

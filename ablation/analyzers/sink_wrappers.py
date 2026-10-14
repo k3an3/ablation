@@ -45,6 +45,9 @@ from .fortify import FMT_CHK_FLAG
 from .insn_arm64 import from_capstone
 
 _MAX_FUNC = 8192
+# bump when inference changes: older inferred records in a cached context are ignored and
+# re-inferred (sink-map records are kept)
+WRAPPERS_VERSION = 3
 
 _EXEC_ARGS: Dict[str, Tuple[str, ...]] = {
     "system": ("x0",), "popen": ("x0",), "execve": ("x0", "x1"), "execv": ("x0", "x1"),
@@ -90,6 +93,7 @@ class SinkWrapper:
     chk_flag: Optional[int] = None               # FORTIFY flag when the chain ends in __*printf_chk
     derived: List[str] = field(default_factory=list)   # kinds reached only through arithmetic / clamps
     open_mode: Optional[str] = None              # open wrappers: "mode:a" / "flags:0x441" / "param:x1"
+    version: int = WRAPPERS_VERSION
 
     @property
     def fmt_reg(self) -> Optional[str]:
@@ -124,15 +128,17 @@ class SinkWrapper:
 def _value_flow_engine():
     """TaintEngine that follows values only: a load through a tainted pointer does not
     taint the result (a struct parameter's fields are not 'derived from' the parameter)."""
-    from .taint_tracker_arm64 import Taint, TaintEngine
+    from .taint_tracker_arm64 import TaintEngine
 
     class _ValueFlow(TaintEngine):
         def _load_value(self, rb, off, exact, bt, nbytes, signed):
+            from .taint_tracker_arm64 import Taint
             return super()._load_value(rb, off, exact, Taint(frozenset(), None), nbytes, signed)
     return _ValueFlow()
 
 
 def derived_param_args(insns, fva: int, fend: int) -> Dict[int, Dict[str, Set[int]]]:
+    from .taint_tracker_arm64 import Taint
     """call site -> {arg reg: parameter indexes its value is computed from}, following
     register / stack-slot dataflow through arithmetic, masks and csel clamps."""
     eng = _value_flow_engine()
@@ -151,6 +157,8 @@ def derived_param_args(insns, fva: int, fend: int) -> Dict[int, Dict[str, Set[in
             if row:
                 out[insn.address] = row
             eng._call_effects(insn, target)
+            for r in ("x0", "x1"):                    # a callee's result is not our parameter
+                eng.state.set(r, Taint(frozenset(), None))
             continue
         try:
             eng.step(insn)
@@ -359,5 +367,7 @@ class SinkWrapperInferer:
 
 
 def wrappers_of(ctx) -> Dict[int, SinkWrapper]:
-    """ctx.wrappers as SinkWrapper objects."""
-    return {va: SinkWrapper.from_dict(d) for va, d in (getattr(ctx, "wrappers", None) or {}).items()}
+    """ctx.wrappers as SinkWrapper objects (inferred records from an older inference
+    version are ignored: re-run ctx.infer_wrappers())."""
+    return {va: SinkWrapper.from_dict(d) for va, d in (getattr(ctx, "wrappers", None) or {}).items()
+            if d.get("source") != "inferred" or d.get("version", 0) == WRAPPERS_VERSION}

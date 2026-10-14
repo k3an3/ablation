@@ -2,6 +2,30 @@
 
 ---
 
+## v2.89.1
+
+**The abl_repro corpus: four lengths cases through a vendor `body_read`, nine width-less
+`%s`.**
+
+- `cbz` / `cbnz` are no longer taken as lower bounds (they only test `== 0`). A signed
+  compare with 0 or 1 is one (`n <= 0` compiles to `cmp #1; b.lt`), and so is
+  `tbz` / `tbnz` of the sign bit.
+- A length wrapper's own clamp / extension of its parameter is reported at its call sites.
+  A clamp mixing in a global or a callee result (`min(rem, cap)`) stays reported, decided on
+  the operands *before* the `csel` overwrites one.
+- Value-flow inference: a callee's return value is no longer "derived" from the caller's
+  parameters, which had produced bogus all-register length wrappers. Inferred wrappers carry
+  a version; older cached ones are ignored and re-inferred.
+- `narrowing_store` links a 32-bit store to a global with a sign-extending reload of it,
+  used as a size in another function.
+- Varargs past `x7`: `ARM64RegAnnotator` exposes stores to `[sp, #8k]` before a call as
+  `stack+0x8k` arguments. Width-less `%s` checks every destination, including stack-passed
+  ones, and `details.smallest` names the tightest one.
+- Stack destinations addressed through a copy of `sp` (`mov x19, sp; add x2, x19, #k`) are
+  recognised.
+
+---
+
 ## v2.89.0
 
 **Third round from an AArch64 daemon audit: size-taking wrappers, egress through vendor

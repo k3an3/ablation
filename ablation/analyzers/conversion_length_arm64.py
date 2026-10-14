@@ -126,6 +126,7 @@ class ARM64ConversionLengthScanner(ARM64TaggingScanner):
         self._wide: Dict[str, bool] = {}           # register -> last written as 64-bit
         self._wide_fva = None
         self._zext: Dict[str, int] = {}            # register -> known zero-extended width (bits)
+        self._global_stores: Dict[int, List[Tuple[int, int, str]]] = {}   # global -> narrow stores
         self._trunc_checked: Set[str] = set()      # printf returns tested by a signed compare
 
     # ---- public API ---------------------------------------------------------
@@ -133,7 +134,23 @@ class ARM64ConversionLengthScanner(ARM64TaggingScanner):
     def scan(self, depth: int = 3) -> List[ConversionFinding]:
         self._reset()
         self.run_interprocedural(depth=depth)
+        for f in self._found.values():                 # store -> use links (other functions)
+            site = self._sites.get(f"{TAG}conv@{f.site_va:#x}")
+            addr = site.extra.get("addr") if site is not None else None
+            stores = self._global_stores.get(addr, []) if addr is not None else []
+            if stores and f.kind in ("sext_unchecked", "sext_signed_check"):
+                sfva, ssite, how = stores[0]
+                f.kind = "narrowing_store"
+                if f.severity == "LOW":
+                    f.severity = "MEDIUM"
+                width = "a 64-bit value" if how == "64-bit" else "a call result (64-bit if the callee returns long)"
+                f.detail = (f"{width} stored as 32 bits at 0x{ssite:x} ({self._fn(sfva)}) to "
+                            f"[0x{addr:x}], reloaded sign-extended ({site.mnemonic} at 0x{f.site_va:x}) "
+                            f"into {f.sink} {f.arg}: the high half is lost and the sign is re-applied")
         return sorted(self._found.values(), key=lambda f: (f.func_va, f.site_va, f.sink_va))
+
+    def _fn(self, va: int) -> str:
+        return self._syms.get(va) or f"0x{va:x}"
 
     def report(self, findings: List[ConversionFinding]) -> str:
         if not findings:
@@ -154,7 +171,11 @@ class ARM64ConversionLengthScanner(ARM64TaggingScanner):
             src = insn.reg(1) if not m.startswith("ld") else None
             regs = [src.name] if src is not None else []
             labels = st.get(src.name).labels if src is not None else frozenset()
-            return TagSite(fva, insn.address, m, regs, attacker(labels), {"kind": "sext"})
+            extra = {"kind": "sext", "param_only": self._param_only(st, regs, insn)}
+            mem = insn.first_mem()
+            if mem is not None and mem.index is None and st.consts.get(mem.base) is not None:
+                extra["addr"] = st.consts[mem.base] + mem.offset          # a global
+            return TagSite(fva, insn.address, m, regs, attacker(labels), extra)
         # `, sxtw` operand extend in an add / sub / mov producing a 64-bit value
         for r in insn.regs()[1:]:
             if r.shift == "sxtw" and rd.bits == 64:
@@ -168,6 +189,14 @@ class ARM64ConversionLengthScanner(ARM64TaggingScanner):
         if fva != self._wide_fva:
             self._wide, self._wide_fva = {}, fva
             self._zext = {}
+            if self._in_length_wrapper(fva):         # tag the wrapper's own parameters
+                for i in range(8):
+                    t = st.get(f"x{i}")
+                    st.regs[f"x{i}"] = Taint(t.labels | {f"{TAG}p{i}"}, t.bound)
+        # operands of a csel clamp, read before it overwrites one of them
+        if m in _CSEL:
+            self._csel_po = (insn.address,
+                             self._param_only(st, [r.name for r in insn.regs()[1:3]], insn))
         # capacity - x: the minuend must be a constant *before* the sub overwrites it
         rn0 = insn.reg(1)
         self._capsub_at = (insn.address if m == "sub" and rn0 is not None and insn.reg(2) is not None
@@ -189,15 +218,18 @@ class ARM64ConversionLengthScanner(ARM64TaggingScanner):
             regs = [r for r in (insn.regs()[1:] if m == "subs" else insn.regs()) if r.name != "xzr"]
             labels = frozenset().union(*(st.get(r.name).labels for r in regs)) if regs else frozenset()
             ops = [str(o) for o in insn.ops]
-            zero = insn.imm(len(insn.ops) - 1) == 0 or any(o in ("wzr", "xzr") for o in ops[1:])
+            # against 0 or 1: with a signed condition, a lower bound (n <= 0 compiles to cmp #1; b.lt)
+            zero = insn.imm(len(insn.ops) - 1) in (0, 1) or any(o in ("wzr", "xzr") for o in ops[1:])
             byte = {r.name for r in regs if r.shift in ("uxtb",)}
             self._pending_cmp = _Cmp(fva, insn.address, tuple(r.name for r in regs), labels, zero=zero)
             self._pending_cmp_insn = (insn, byte)
         elif m in ("cbz", "cbnz", "tbz", "tbnz") and insn.reg(0) is not None:
             r = insn.reg(0)
             bit = insn.imm(1) if m.startswith("tb") else None
+            # cbz / cbnz only test == 0: they do not exclude negatives; tbz / tbnz of the sign
+            # bit do
             self._cmps.append(_Cmp(fva, insn.address, (r.name,), st.get(r.name).labels,
-                                   zero=(m.startswith("cb") or bit in (31, 63))))
+                                   cond="sign" if bit in (31, 63) else m, zero=bit in (31, 63)))
         if m in ("bl", "blr", "ret"):
             self._pending_cmp = None
         super()._before_step(eng, insn, fva)
@@ -220,7 +252,9 @@ class ARM64ConversionLengthScanner(ARM64TaggingScanner):
                 lbl = f"{TAG}clamp@{va:#x}"
                 st.regs[rd.name] = Taint(t.labels | {lbl}, t.bound)
                 self._sites[lbl] = TagSite(fva, va, m, ops, attacker(t.labels),
-                                           {"kind": "clamp", "cond": cond})
+                                           {"kind": "clamp", "cond": cond,
+                                            "param_only": getattr(self, "_csel_po", (0, False))[1]
+                                            if getattr(self, "_csel_po", (0,))[0] == va else False})
         if rd is not None and rd.name not in ("xzr", "sp") and not m.startswith(("st", "cmp", "b", "tst")):
             self._wide[rd.name] = rd.bits == 64
         if masked and rd is not None and rn is not None and rd.name != rn.name:
@@ -345,6 +379,13 @@ class ARM64ConversionLengthScanner(ARM64TaggingScanner):
 
     def _narrow_store(self, eng: TaintEngine, insn: Insn, fva: int) -> None:
         r = insn.reg(0)
+        mem = insn.first_mem()
+        if mem is not None and mem.index is None and eng.state.consts.get(mem.base) is not None \
+                and r.name != "xzr" and self._wide.get(r.name) is not False:
+            # 32-bit store to a global of a value not known to be 32-bit (64-bit, or a call
+            # result): linked to sign-extending reloads of the global used as sizes
+            self._global_stores.setdefault(eng.state.consts[mem.base] + mem.offset, []).append(
+                (fva, insn.address, "64-bit" if self._wide.get(r.name) else "call-result"))
         if r.name in ("xzr",) or not self._wide.get(r.name):
             return
         t = eng.state.get(r.name)
@@ -364,9 +405,35 @@ class ARM64ConversionLengthScanner(ARM64TaggingScanner):
             f"the high half is dropped; a reload (ldrsw / ldr w) sees a different length",
             ",".join(sorted(src))))
 
+    @staticmethod
+    def _lower_bound(c: "_Cmp") -> bool:
+        """A test that excludes negative values: signed compare with 0 / 1, or the sign bit
+        (tbz / tbnz #31|#63). cbz / cbnz (== 0 only) are not."""
+        return c.zero and (c.cond in _SIGNED or c.cond == "sign")
+
+    def _in_length_wrapper(self, fva: int) -> bool:
+        w = self._wrappers.get(fva)
+        return w is not None and "length" in w.kinds
+
+    def _param_only(self, st, regs, insn) -> bool:
+        """Every non-constant operand comes from the function's own parameters (tagged
+        %p<i> in length wrappers): a clamp / extension of the caller's argument, whose
+        finding belongs at the wrapper's call sites. A global or a callee result mixed in
+        (min(rem, cap)) keeps the finding here."""
+        if not regs:
+            return False
+        for r in regs:
+            if r in ("xzr", "wzr") or st.consts.get(r) is not None:
+                continue
+            if not any(l.startswith(f"{TAG}p") and l[len(TAG) + 1:].isdigit() for l in st.get(r).labels):
+                return False
+        return True
+
     def _check_clamp(self, label, site, t, insn, callee, arg) -> bool:
+        if site.extra.get("param_only"):
+            return True
         g = self._guards_on(label, site)
-        if any(c.cond in _UNSIGNED for c in g) or any(c.zero and c.va != site.va for c in g):
+        if any(c.cond in _UNSIGNED for c in g) or any(self._lower_bound(c) for c in g):
             return False
         src = attacker(t.labels)
         self._add(self._snprintf(ConversionFinding(
@@ -393,12 +460,12 @@ class ARM64ConversionLengthScanner(ARM64TaggingScanner):
                 and any(l in self._trunc_checked for l in labels))
 
     def _check_sext(self, label, site, t, insn, callee, arg, fva) -> None:
-        if self._trunc_bounded(t.labels):
+        if self._trunc_bounded(t.labels) or site.extra.get("param_only"):
             return
         g = self._guards_on(label, site)
         unsigned = any(c.cond in _UNSIGNED for c in g)
         upper = [c for c in g if c.cond in _SIGNED and not c.zero]
-        lower = [c for c in g if c.zero and (c.cond in _SIGNED or c.cond == "")]
+        lower = [c for c in g if self._lower_bound(c)]
         src = attacker(t.labels)
         if unsigned or (upper and lower):
             return

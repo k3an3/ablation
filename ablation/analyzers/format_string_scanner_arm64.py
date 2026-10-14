@@ -396,9 +396,11 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
                     if first is not None and first + idx < 8:
                         labels |= self._arg_taint.get((call.site_va, f"x{first + idx}"), set())
             else:
-                hits = [(f"x{first + idx}", spec) for idx, spec in convs
-                        if first is not None and first + idx < 8
-                        and self._on_stack(call.args.get(f"x{first + idx}"))]
+                def where_arg(idx: int) -> str:
+                    n = first + idx                      # GP argument number
+                    return f"x{n}" if n < 8 else f"stack+{8 * (n - 8):#x}"
+                hits = [(where_arg(idx), spec) for idx, spec in convs
+                        if first is not None and self._on_stack(call.args.get(where_arg(idx)))]
                 if not hits:
                     continue
                 if io_reg:
@@ -407,11 +409,14 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
                     labels.add("stdin")
             sev = "HIGH" if labels else "MEDIUM"
             src = f" from {','.join(sorted(labels))}" if labels else ""
-            dests, budgets = [], []
+            dests, budgets, sizes = [], [], []
             for reg, spec in hits:
                 text, lr = self._dest_extent(fva, call.args.get(reg), budget=True)
                 if text:
                     dests.append(f"{spec} -> {reg} {text}")
+                    m = re.search(r": (\d+) bytes to the", text)
+                    if m:
+                        sizes.append((int(m.group(1)), spec, reg))
                 if lr is not None:
                     budgets.append((lr, spec, reg))
             tgt, spec = hits[0]
@@ -419,10 +424,14 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
             if budgets:
                 lr, bspec, breg = min(budgets)
                 details["budget"] = f"{lr} bytes from {bspec} ({breg}) to a saved x30"
+            if sizes:
+                n, sspec, sreg = min(sizes)
+                details["smallest"] = f"{sspec} ({sreg}): {n} bytes before the next stack object"
             many = f"{len(hits)} width-less conversions ({', '.join(sp for _r, sp in hits)})" \
                 if len(hits) > 1 else f"'{spec}'"
             where = f"stack buffer{'s' if len(hits) > 1 else ''} " + \
-                ", ".join(call.args.get(r).display() for r, _sp in hits[:4])
+                ", ".join(call.args.get(r).display() for r, _sp in hits[:4]) + \
+                (f" (+{len(hits) - 4})" if len(hits) > 4 else "")
             out.append(FmtStringFinding(
                 fva, call.site_va, shown, tgt, "unbounded_s", sev,
                 f"{shown} {many} (no {'precision' if family == 'print' else 'width'}) "

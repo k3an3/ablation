@@ -355,6 +355,16 @@ class ARM64RegAnnotator:
                 val = RegVal.stack_addr(f"{base}+0x{imm:x}" if imm >= 0 else f"{base}-0x{-imm:x}")
             elif rd.name == 'sp':
                 return
+            else:
+                sv = bval
+                while sv is not None and sv.kind == 'copy':
+                    sv = sv.chain
+                if sv is not None and sv.is_stack_addr:      # mov x19, sp; add x2, x19, #k
+                    m = re.match(r"^(sp|x29)(?:([+-])0x([0-9a-f]+))?$", sv.str_val)
+                    if m:
+                        k = int(m.group(3), 16) * (-1 if m.group(2) == '-' else 1) if m.group(3) else 0
+                        k += imm
+                        val = RegVal.stack_addr(f"{m.group(1)}+0x{k:x}" if k >= 0 else f"{m.group(1)}-0x{-k:x}")
 
         elif mn.startswith('ld'):
             val = self._load(insn, regs)
@@ -509,6 +519,12 @@ class ARM64RegAnnotator:
             target_name=name,
             args={r: regs.get(r, RegVal.unknown()) for r in ARG_REGS},
         ))
+        # arguments past x7 (varargs, large signatures) are stored to [sp, #8k] before the
+        # call: exposed as 'stack+0x8k' when a 64-bit store to that slot is known
+        for k in range(0, 0x80, 8):
+            v = regs.get(('slot', 'sp', k))
+            if v is not None and v.kind != 'unknown':
+                result.calls[-1].args[f"stack+{k:#x}"] = v
         for r in CALLER_SAVED:
             if r.startswith('x'):
                 regs[r] = RegVal.unknown()
