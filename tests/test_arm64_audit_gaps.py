@@ -861,3 +861,140 @@ def test_egress_vendor_open_helpers(egress2_so):
     assert '"/var/log/access.log" -> read in serve_access' in eg and "send" in eg
     eg2 = fs[t["route2"]].details["egress"]
     assert eg2.startswith("(coarse: shared path literal)") and "serve_rot" in eg2
+
+
+# ── round 3: lengths false positives (zero-extended mask, truncation guard) ───
+
+_LFP_SRC = r"""
+typedef unsigned long size_t;
+extern void *memcpy(void *, const void *, size_t);
+extern int snprintf(char *, size_t, const char *, ...);
+extern int get(void);
+#define N __attribute__((noinline))
+N int rec(const unsigned char *p, char *dst, int cap) {
+    unsigned short raw; memcpy(&raw, p + 1, 2); unsigned n = __builtin_bswap16(raw);
+    if ((int)(n & 0xffff) >= cap) return -1;
+    memcpy(dst, p + 3, n & 0xffff); return 0; }
+N int two_part(char *out, const char *a, const char *b) {
+    int pre = get(); int rem = 350 - pre;
+    int r = snprintf(out + pre, rem, "%s", a);
+    if (r < 0 || rem <= r) return -1;
+    int used = pre + r; int rem2 = 440 - used;
+    return snprintf(out + used, rem2, "%s", b); }
+N void masked_bug(char *d, const char *s) { unsigned n = (unsigned)get(); if ((n & 0xffff) > 64) return; memcpy(d, s, n); }
+"""
+
+
+@pytest.fixture(scope="module")
+def lfp_so(tmp_path_factory):
+    return build_variants(tmp_path_factory, src_text=_LFP_SRC, variants={"O2": ["-O2"]})["O2"]
+
+
+def test_lengths_false_positives_fixed(lfp_so, monkeypatch):
+    from ablation.analyzers.conversion_length_arm64 import ARM64ConversionLengthScanner
+    ctx, t = _wctx(lfp_so)
+    got = {(f.func_va, f.kind) for f in ARM64ConversionLengthScanner.from_context(ctx).scan()}
+    assert (t["masked_bug"], "masked_check") in got           # the real bug stays
+    assert not any(fn == t["rec"] for fn, _k in got)            # ldurh + rev16: mask is a no-op
+    assert (t["two_part"], "sext_signed_check") not in got      # truncation check bounds rem2
+
+
+_CCMP_ASM = r"""
+    .text
+    .globl two_part_gcc
+    .type two_part_gcc, %function
+two_part_gcc:                       // gcc's snprintf truncation idiom (cmp #0; ccmp ...; b.le)
+    stp   x29, x30, [sp, #-0x40]!
+    mov   x29, sp
+    stp   x19, x20, [sp, #0x10]
+    stp   x21, x22, [sp, #0x20]
+    str   x24, [sp, #0x30]
+    mov   x20, x0
+    mov   x22, x2
+    bl    get
+    mov   w19, w0                   // prefix_len
+    mov   w21, #0x15e               // 350
+    sub   w21, w21, w0              // remaining = 350 - prefix_len
+    add   x0, x20, w19, sxtw
+    adr   x2, fmt
+    mov   x3, x22
+    sxtw  x1, w21
+    bl    vsnprintf
+    cmp   w0, #0
+    ccmp  w21, w0, #4, ge           // if ret >= 0: remaining vs ret
+    b.le  1f                        // bail on error or truncation
+    add   w19, w19, w0              // used = prefix_len + ret
+    mov   w21, #0x1b8               // 440
+    sub   w21, w21, w19
+    sxtw  x24, w21                  // flagged by 2.88
+    add   x0, x20, w19, sxtw
+    adr   x2, fmt
+    mov   x3, x22
+    mov   x1, x24
+    bl    vsnprintf
+1:  ldr   x24, [sp, #0x30]
+    ldp   x21, x22, [sp, #0x20]
+    ldp   x19, x20, [sp, #0x10]
+    ldp   x29, x30, [sp], #0x40
+    ret
+    .size two_part_gcc, .-two_part_gcc
+
+    .globl rec_gcc
+    .type rec_gcc, %function
+rec_gcc:                            // 16-bit big-endian length: ldurh + rev16 + and #0xffff
+    stp   x29, x30, [sp, #-0x20]!
+    mov   x29, sp
+    stp   x19, x20, [sp, #0x10]
+    mov   x3, x0
+    mov   w19, w2                   // capacity
+    ldurh w2, [x0, #1]
+    rev16 w2, w2
+    and   w20, w2, #0xffff          // the checked value
+    cmp   w20, w19
+    b.lt  2f
+    mov   w0, #-1
+    b     3f
+2:  mov   x0, x1
+    add   x1, x3, #3
+    and   x2, x2, #0xffff           // the memcpy length: the same value
+    bl    memcpy
+    mov   w0, #0
+3:  ldp   x19, x20, [sp, #0x10]
+    ldp   x29, x30, [sp], #0x20
+    ret
+    .size rec_gcc, .-rec_gcc
+fmt: .asciz "%s"
+"""
+
+
+@pytest.fixture(scope="module")
+def ccmp_so(tmp_path_factory):
+    d = tmp_path_factory.mktemp("ccmp")
+    (d / "t.s").write_text(_CCMP_ASM)
+    so = d / "t.so"
+    r = subprocess.run(["clang", "--target=aarch64-linux-gnu", "-shared", "-nostdlib", "-fuse-ld=lld",
+                        str(d / "t.s"), "-o", str(so)], capture_output=True, text=True)
+    if r.returncode:
+        pytest.skip(r.stderr[-200:])
+    return so
+
+
+def test_ccmp_truncation_guard(ccmp_so, monkeypatch):
+    from ablation.analyzers import conversion_length_arm64 as cl
+    ctx = BinaryContext.load_or_build(str(ccmp_so), force_rebuild=True)
+    ctx.infer_wrappers(save=False)
+    kinds = lambda: {(f.kind, f.sink) for f in cl.ARM64ConversionLengthScanner.from_context(ctx).scan()}
+    monkeypatch.setattr(cl.ARM64ConversionLengthScanner, "_trunc_bounded", lambda self, labels: False)
+    assert ("sext_signed_check", "vsnprintf") in kinds()         # 2.88 behaviour: flagged
+    monkeypatch.undo()
+    assert ("sext_signed_check", "vsnprintf") not in kinds()     # bounded by the truncation check
+
+
+def test_zero_extended_mask_not_a_check(ccmp_so, monkeypatch):
+    from ablation.analyzers import conversion_length_arm64 as cl
+    ctx = BinaryContext.load_or_build(str(ccmp_so), force_rebuild=True)
+    kinds = lambda: {(f.kind, f.sink) for f in cl.ARM64ConversionLengthScanner.from_context(ctx).scan()}
+    monkeypatch.setattr(cl.ARM64ConversionLengthScanner, "_track_zext", lambda *a: None)
+    assert ("masked_check", "memcpy") in kinds()                 # 2.88 behaviour: flagged
+    monkeypatch.undo()
+    assert ("masked_check", "memcpy") not in kinds()             # ldurh already zero-extended

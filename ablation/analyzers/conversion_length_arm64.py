@@ -25,6 +25,9 @@ Kinds
                       against a limit wider than 255: a limit above 255 never ends
   signed_clamp        min(len, MAX) done with a signed csel (lt / le / gt / ge) reaches a
                       size: a negative len passes the clamp
+  (not reported: a mask of a value already zero-extended by ldrh / ldurh / uxth, and
+   capacity - (used + ret) after the *printf return was checked against the remaining
+   capacity by a signed compare: the cmp / ccmp ... ge + b.le truncation idiom)
   narrowing_store     a 64-bit length (strlen / read / recv result, or attacker data)
                       stored with a 32-bit str: the high half is lost (attacker data:
                       any store; a library length: stores outside the stack frame)
@@ -59,6 +62,8 @@ _SIGNED = frozenset({"gt", "ge", "lt", "le", "mi", "pl"})
 _UNSIGNED = frozenset({"hi", "hs", "cs", "lo", "cc", "ls"})
 _LEN_RETURNS = frozenset({"strlen", "strnlen", "read", "recv", "recvfrom", "pread", "fread",
                           "ftell", "lseek", "readlink", "wcslen", "__strlen_chk"})
+_PRINTF_RET = frozenset({"snprintf", "vsnprintf", "sprintf", "vsprintf", "__snprintf_chk",
+                         "__vsnprintf_chk", "__sprintf_chk", "__vsprintf_chk"})
 _CSEL = frozenset({"csel", "csinc", "csinv", "csneg"})
 _SNPRINTF = frozenset({"snprintf", "vsnprintf", "__snprintf_chk", "__vsnprintf_chk"})
 # libcs whose snprintf rejects size > INT_MAX (returns -1, writes nothing): True;
@@ -120,6 +125,8 @@ class ARM64ConversionLengthScanner(ARM64TaggingScanner):
         self._found = {}
         self._wide: Dict[str, bool] = {}           # register -> last written as 64-bit
         self._wide_fva = None
+        self._zext: Dict[str, int] = {}            # register -> known zero-extended width (bits)
+        self._trunc_checked: Set[str] = set()      # printf returns tested by a signed compare
 
     # ---- public API ---------------------------------------------------------
 
@@ -160,6 +167,11 @@ class ARM64ConversionLengthScanner(ARM64TaggingScanner):
         st = eng.state
         if fva != self._wide_fva:
             self._wide, self._wide_fva = {}, fva
+            self._zext = {}
+        # capacity - x: the minuend must be a constant *before* the sub overwrites it
+        rn0 = insn.reg(1)
+        self._capsub_at = (insn.address if m == "sub" and rn0 is not None and insn.reg(2) is not None
+                           and st.consts.get(rn0.name) is not None else None)
         if m in ("str", "stur") and insn.reg(0) is not None and insn.reg(0).bits == 32:
             self._narrow_store(eng, insn, fva)
         # flag consumer: finish the pending compare with its condition
@@ -168,6 +180,9 @@ class ARM64ConversionLengthScanner(ARM64TaggingScanner):
             c.cond = m[2:] if m.startswith("b.") else insn.raw.rsplit(",", 1)[-1].strip() if insn.raw else ""
             self._cmps.append(c)
             self._pending_cmp = None
+            if c.cond in _SIGNED:
+                # snprintf truncation check (cmp / ccmp of a capacity against the return)
+                self._trunc_checked |= {l for l in c.labels if l.startswith(f"{TAG}pfret@")}
             if m.startswith("b."):
                 self._byte_loop(eng, insn, c, fva)
         if m in ("cmp", "cmn", "subs", "tst", "ccmp"):
@@ -192,6 +207,10 @@ class ARM64ConversionLengthScanner(ARM64TaggingScanner):
         st = eng.state
         rd, rn = insn.reg(0), insn.reg(1)
         masked = (m in ("uxth", "uxtb") or (m == "and" and insn.imm(2) in (0xFF, 0xFFFF)))
+        mask_w = 8 if (m == "uxtb" or insn.imm(2) == 0xFF) else 16
+        if masked and rn is not None and self._zext.get(rn.name, 64) <= mask_w:
+            masked = False                       # already zero-extended (ldrh / ldurh): a no-op
+        self._track_zext(insn, m, rd, rn, st)
         if m in _CSEL and rd is not None and rd.name != "xzr":
             cond = (insn.raw or "").rsplit(",", 1)[-1].strip()
             if cond in _SIGNED:
@@ -222,6 +241,28 @@ class ARM64ConversionLengthScanner(ARM64TaggingScanner):
             t = st.get(rd.name)
             st.regs[rd.name] = Taint(t.labels | {f"{TAG}half@{insn.address:#x}"}, t.bound)
         super()._after_step(eng, insn, fva)
+
+    def _track_zext(self, insn: Insn, m: str, rd, rn, st) -> None:
+        """Known zero-extended width of rd after insn (ldrh / ldurh / ldrb / uxth / and #imm;
+        kept by rev16 / mov copies); a capacity-minus-x subtraction is tagged %capsub."""
+        if rd is None or rd.name in ("xzr", "sp") or m.startswith(("st", "cmp", "cmn", "tst", "b", "cb", "tb")):
+            return
+        w = None
+        if m in ("ldrh", "ldurh", "uxth"):
+            w = 16
+        elif m in ("ldrb", "ldurb", "uxtb"):
+            w = 8
+        elif m == "and" and insn.imm(2) is not None and insn.imm(2) in (0xFF, 0xFFFF):
+            w = 8 if insn.imm(2) == 0xFF else 16
+        elif m in ("rev16", "mov") and rn is not None and insn.imm(1) is None:
+            w = self._zext.get(rn.name)
+        if w is None:
+            self._zext.pop(rd.name, None)
+        else:
+            self._zext[rd.name] = w
+        if getattr(self, "_capsub_at", None) == insn.address:
+            t = st.get(rd.name)
+            st.regs[rd.name] = Taint(t.labels | {f"{TAG}capsub@{insn.address:#x}"}, t.bound)
 
     # ---- byte-width loop counters ------------------------------------------
 
@@ -294,6 +335,9 @@ class ARM64ConversionLengthScanner(ARM64TaggingScanner):
         super()._on_call(eng, insn, target, callee, fva, func_name, findings, depth, enqueue)
         # 64-bit length results (size_t / ssize_t), for narrowing stores
         self._wide = {k: v for k, v in self._wide.items() if k not in ("x0", "x1")}
+        if callee in _PRINTF_RET or self._wrapper_regs(target, callee, "format"):
+            t = st.get("x0")
+            st.regs["x0"] = Taint(t.labels | {f"{TAG}pfret@{insn.address:#x}"}, t.bound)
         if callee in _LEN_RETURNS:
             t = st.get("x0")
             st.regs["x0"] = Taint(t.labels | {f"{TAG}len64@{insn.address:#x}"}, t.bound)
@@ -342,7 +386,15 @@ class ARM64ConversionLengthScanner(ARM64TaggingScanner):
                 out.append(c)                                       # its source, before
         return out
 
+    def _trunc_bounded(self, labels) -> bool:
+        """capacity - (... + printf return) after that return was truncation-checked:
+        the checked return is below the remaining capacity, so the difference is positive."""
+        return (any(l.startswith(f"{TAG}capsub@") for l in labels)
+                and any(l in self._trunc_checked for l in labels))
+
     def _check_sext(self, label, site, t, insn, callee, arg, fva) -> None:
+        if self._trunc_bounded(t.labels):
+            return
         g = self._guards_on(label, site)
         unsigned = any(c.cond in _UNSIGNED for c in g)
         upper = [c for c in g if c.cond in _SIGNED and not c.zero]
