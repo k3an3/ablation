@@ -50,6 +50,8 @@ _LENGTH_ARGS: Dict[str, Tuple[str, ...]] = {
     "malloc": ("x0",), "calloc": ("x0", "x1"), "realloc": ("x1",),
     "copy_from_user": ("x2",), "copy_to_user": ("x2",), "__memcpy": ("x2",),
     "__snprintf_chk": ("x1",), "__vsnprintf_chk": ("x1",),
+    "SSL_read": ("x2",), "SSL_peek": ("x2",), "BIO_read": ("x2",), "mbedtls_ssl_read": ("x2",),
+    "wolfSSL_read": ("x2",), "gnutls_record_recv": ("x2",), "readv": ("x2",),
 }
 
 

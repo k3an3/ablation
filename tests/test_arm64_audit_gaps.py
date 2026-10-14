@@ -769,3 +769,40 @@ def test_fmtstr_finding_carries_egress(egress_so):
     assert "write in log_event" in f.details["egress"] and "send" in f.details["egress"]
     r = _cli("egress", egress_so)
     assert "'/var/log/httpd.log'" in r.stdout and "EGRESS" in r.stdout
+
+
+# ── round 3: size-taking vendor wrappers (clamped / TLS) ─────────────────────
+
+_SIZEW_SRC = r"""
+typedef unsigned long size_t;
+extern long recv(int, void *, size_t, int);
+extern int SSL_read(void *, void *, int);
+extern int get(void);
+extern void *g_ssl;
+extern void use(void *);
+#define N __attribute__((noinline))
+struct conn { int fd; long avail; };
+N long body_read(struct conn *c, char *buf, long want) { long n = want < c->avail ? want : c->avail; return recv(c->fd, buf, n, 0); }
+N int tls_read(char *buf, int len) { return SSL_read(g_ssl, buf, len); }
+N long field_len(struct conn *c, char *buf) { return recv(c->fd, buf, c->avail, 0); }
+void h_body(struct conn *c) { char b[64]; int len = get(); if (len > 64) return; body_read(c, b, len); use(b); }
+void h_tls(void) { char b[64]; int n = get(); int m = n < 64 ? n : 64; tls_read(b, m); use(b); }
+"""
+
+
+@pytest.fixture(scope="module")
+def sizew_so(tmp_path_factory):
+    return build_variants(tmp_path_factory, src_text=_SIZEW_SRC, variants={"O2": ["-O2"]})["O2"]
+
+
+def test_size_wrappers_derived(sizew_so):
+    from ablation.analyzers.sink_wrappers import wrappers_of
+    from ablation.analyzers.conversion_length_arm64 import ARM64ConversionLengthScanner
+    ctx, t = _wctx(sizew_so)
+    w = wrappers_of(ctx)
+    assert w[t["body_read"]].kinds["length"] == ["x2"] and "length" in w[t["body_read"]].derived
+    assert w[t["tls_read"]].kinds["length"] == ["x1"]            # SSL_read x2 <- param x1
+    assert "length" not in w.get(t["field_len"], type("", (), {"kinds": {}})()).kinds   # a field, not a param
+    got = {(f.func_va, f.kind, f.sink) for f in ARM64ConversionLengthScanner.from_context(ctx).scan()}
+    assert (t["h_body"], "sext_signed_check", "body_read") in got
+    assert (t["h_tls"], "signed_clamp", "tls_read") in got

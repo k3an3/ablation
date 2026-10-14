@@ -174,7 +174,8 @@ def _ensure_wrappers(args, ctx) -> None:
         return
     from ablation.analyzers.sink_wrappers import SinkWrapperInferer, wrappers_of
     inferred = [w for w in (ctx.wrappers or {}).values() if w.get('source') == 'inferred']
-    if not inferred and not getattr(ctx, '_wrappers_done', False):
+    stale = any('derived' not in w for w in inferred)          # cached by an older version
+    if (not inferred or stale) and not getattr(ctx, '_wrappers_done', False):
         ctx.infer_wrappers()
         ctx._wrappers_done = True
     if getattr(args, 'sink_wrappers', False):

@@ -46,6 +46,7 @@ EMPTY: Labels = frozenset()
 
 _SOURCE_NAMES: frozenset = frozenset({
     "recv", "recvfrom", "recvmsg", "read", "fread", "fgets", "gets", "getchar", "fgetc",
+    "SSL_read", "SSL_peek", "BIO_read", "mbedtls_ssl_read", "wolfSSL_read", "gnutls_record_recv",
 })
 _SINK_NAMES: frozenset = frozenset({
     "system", "execve", "execl", "execvp", "execle", "execvpe", "popen",
@@ -64,6 +65,8 @@ _PLT_TOL = 16
 _SOURCE_BUFFERS: Dict[str, Tuple[str, Optional[str]]] = {
     "read": ("x1", "x2"), "recv": ("x1", "x2"), "recvfrom": ("x1", "x2"),
     "fread": ("x0", None), "fgets": ("x0", "x1"), "gets": ("x0", None),
+    "SSL_read": ("x1", "x2"), "SSL_peek": ("x1", "x2"), "BIO_read": ("x1", "x2"),
+    "mbedtls_ssl_read": ("x1", "x2"), "wolfSSL_read": ("x1", "x2"), "gnutls_record_recv": ("x1", "x2"),
 }
 # Sink args whose pointee (not the register) carries the attacker data
 _SINK_POINTER_ARGS: Dict[str, Tuple[str, ...]] = {

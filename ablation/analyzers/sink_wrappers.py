@@ -18,7 +18,8 @@ Why this exists
 What it infers (fixpoint: wrappers of wrappers too)
   format   param -> the format argument of a printf / v*printf (or format wrapper)
   exec     param -> system / popen / exec* command arguments
-  length   param -> a length argument (memcpy x2, read x2, malloc x0, snprintf x1 ...)
+  length   param -> a length argument (memcpy x2, read x2, SSL_read x2, malloc x0,
+           snprintf x1 ...), also after arithmetic / masks / csel clamps ("derived")
   copy     param -> a pointer argument whose pointee must not be attacker data
            (strcpy src, memcpy src, sprintf args ...)
 
@@ -84,6 +85,7 @@ class SinkWrapper:
     vr_offs: Optional[int] = None
     source: str = "inferred"                     # or "sink-map"
     chk_flag: Optional[int] = None               # FORTIFY flag when the chain ends in __*printf_chk
+    derived: List[str] = field(default_factory=list)   # kinds reached only through arithmetic / clamps
 
     @property
     def fmt_reg(self) -> Optional[str]:
@@ -104,7 +106,8 @@ class SinkWrapper:
         return cls(**d)
 
     def fmt(self) -> str:
-        kinds = ", ".join(f"{k} {'/'.join(v)}" for k, v in self.kinds.items())
+        kinds = ", ".join(f"{k} {'/'.join(v)}" + (" (derived)" if k in self.derived else "")
+                          for k, v in self.kinds.items())
         va = ""
         if self.varargs:
             gp = f"{-self.gr_offs // 8} GP" if self.gr_offs is not None else "? GP"
@@ -112,6 +115,44 @@ class SinkWrapper:
             va = f"  varargs ({gp}{vr} slots saved)"
         via = f" via {self.via}" if self.via != self.wraps else ""
         return f"  0x{self.va:x}  {self.name:<24s} -> {self.wraps}{via}  [{kinds}]{va}  ({self.source})"
+
+
+def _value_flow_engine():
+    """TaintEngine that follows values only: a load through a tainted pointer does not
+    taint the result (a struct parameter's fields are not 'derived from' the parameter)."""
+    from .taint_tracker_arm64 import Taint, TaintEngine
+
+    class _ValueFlow(TaintEngine):
+        def _load_value(self, rb, off, exact, bt, nbytes, signed):
+            return super()._load_value(rb, off, exact, Taint(frozenset(), None), nbytes, signed)
+    return _ValueFlow()
+
+
+def derived_param_args(insns, fva: int, fend: int) -> Dict[int, Dict[str, Set[int]]]:
+    """call site -> {arg reg: parameter indexes its value is computed from}, following
+    register / stack-slot dataflow through arithmetic, masks and csel clamps."""
+    eng = _value_flow_engine()
+    for i in range(8):
+        eng.taint_register(f"x{i}", f"%a{i}")
+    out: Dict[int, Dict[str, Set[int]]] = {}
+    for insn in insns:
+        m = insn.mnemonic
+        target = insn.imm(0) if m in ("bl", "b") else None
+        if target is not None and (m == "bl" or not fva <= target < fend):
+            row = {}
+            for k in range(8):
+                ls = {int(l[2:]) for l in eng.state.get(f"x{k}").labels if l.startswith("%a")}
+                if ls:
+                    row[f"x{k}"] = ls
+            if row:
+                out[insn.address] = row
+            eng._call_effects(insn, target)
+            continue
+        try:
+            eng.step(insn)
+        except Exception:
+            pass
+    return out
 
 
 def _arg_index(v) -> int:
@@ -170,6 +211,13 @@ class SinkWrapperInferer:
         self._ctx = ctx
         self._max_rounds = max_rounds
 
+    @staticmethod
+    def _code(regions, va: int, end: int) -> bytes:
+        for rva, data in regions:
+            if 0 <= va - rva < len(data):
+                return data[va - rva:end - rva]
+        return b""
+
     def infer(self, apply: bool = True) -> Dict[int, SinkWrapper]:
         from .arm64_reg_annotator import ARM64RegAnnotator
         ctx = self._ctx
@@ -185,9 +233,12 @@ class SinkWrapperInferer:
                 continue                       # libc functions themselves are not wrappers
             end = starts[i + 1] if i + 1 < len(starts) and starts[i + 1] - fva <= _MAX_FUNC else fva + _MAX_FUNC
             rows = []
+            insns = list(from_capstone(self._code(regions, fva, end), fva))
+            dm_all = derived_param_args(insns, fva, end)
             for c in ra.annotate_calls(fva, end).calls:
                 pm = {r: _arg_index(v) for r, v in c.args.items() if _arg_index(v) >= 0}
-                if pm:
+                dm = dm_all.get(c.site_va, {})
+                if pm or dm:
                     # -fPIC: a call to this binary's own export goes through its PLT stub
                     tva = ctx.exports.get(c.target_name, c.target_va) if c.target_name else c.target_va
                     flag = None
@@ -195,7 +246,7 @@ class SinkWrapperInferer:
                     fv = c.args.get(freg) if freg else None
                     if fv is not None and fv.kind in ("const", "zero"):
                         flag = fv.int_val if fv.kind == "const" else 0
-                    rows.append((tva, c.target_name, c.site_va, pm, flag))
+                    rows.append((tva, c.target_name, c.site_va, pm, flag, dm))
             if rows:
                 compact[fva] = rows
 
@@ -204,7 +255,7 @@ class SinkWrapperInferer:
         for _ in range(self._max_rounds):
             changed = False
             for fva, rows in compact.items():
-                for tva, tname, site, pm, flag in rows:
+                for tva, tname, site, pm, flag, dm in rows:
                     inner = wrappers.get(tva)
                     if inner is not None:
                         sargs = {k: tuple(v) for k, v in inner.kinds.items()}
@@ -214,6 +265,12 @@ class SinkWrapperInferer:
                         wraps = via = tname or names.get(tva, "")
                     for kind, regs in sargs.items():
                         mapped = sorted({f"x{pm[r]}" for r in regs if r in pm})
+                        derived = False
+                        if kind == "length":
+                            # a size may reach the sink after a clamp / arithmetic
+                            extra = sorted({f"x{i}" for r in regs for i in dm.get(r, ())} - set(mapped))
+                            derived = bool(extra) and not mapped
+                            mapped = sorted(set(mapped) | set(extra))
                         if not mapped:
                             continue
                         w = wrappers.get(fva)
@@ -223,6 +280,8 @@ class SinkWrapperInferer:
                             changed = True
                         if kind == "format" and flag is not None:
                             w.chk_flag = flag
+                        if derived and kind not in w.derived and kind not in w.kinds:
+                            w.derived.append(kind)
                         cur = set(w.kinds.get(kind, ()))
                         if not set(mapped) <= cur:
                             w.kinds[kind] = sorted(cur | set(mapped))
