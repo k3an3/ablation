@@ -17,8 +17,9 @@ What it computes
   address-taken   function starts appearing as an 8-byte word anywhere in the image
                   (relocations applied, so .data.rel.ro / init_array / GOT count) or
                   materialised in code by ADR / ADRP+ADD
-  live            closure over call edges from exports, the ELF entry point and every
-                  address-taken function
+  live            closure over call edges from the ELF entry point, every address-taken
+                  function, and dynamic exports when they can be entries (a shared
+                  library, or a program importing dlopen / dlsym)
   registrations   handler address + string literal arguments of one call
                   (setter(key, handler)), or a data word -> handler next to a word -> string
   gate            the nearest conditional branch every path to the site must take,
@@ -116,14 +117,18 @@ class Reachability:
         starts = self._starts
         if _NP and starts:
             sarr = np.array(starts, dtype=np.uint64)
+            skip = self._metadata_ranges()
             for va, data in self._regions:
-                for align in range(0, 8, 8):
-                    n = (len(data) - align) // 8
-                    if n <= 0:
-                        continue
-                    w = np.frombuffer(data[align:align + n * 8], dtype="<u8")
-                    hit = np.isin(w, sarr)
-                    taken.update(int(x) for x in w[hit])
+                n = len(data) // 8
+                if n <= 0:
+                    continue
+                w = np.frombuffer(data[: n * 8], dtype="<u8")
+                hit = np.isin(w, sarr)
+                for lo, hi in skip:                      # symbol tables are not references
+                    a, b = max(0, (lo - va) // 8), min(n, (hi - va + 7) // 8)
+                    if a < b:
+                        hit[a:b] = False
+                taken.update(int(x) for x in w[hit])
         for cva, code in self._code_regions():
             for site, target in self._materialisations(cva, code):
                 if target in self._start_set:
@@ -131,6 +136,26 @@ class Reachability:
                     self._materialised.setdefault(target, []).append(site)
         self._taken = taken
         return taken
+
+    def _metadata_ranges(self) -> List[Tuple[int, int]]:
+        """VA ranges of ELF sections holding addresses that are not references: symbol
+        tables (st_value), relocation records (their targets are in the relocated slots
+        anyway), hash / version tables, unwind tables, notes, debug info."""
+        if getattr(self._ctx, "raw", None):
+            return []
+        out = []
+        try:
+            import lief
+            b = lief.parse(self._ctx.path)
+            for sec in b.sections:
+                name = sec.name
+                if (name in (".dynsym", ".symtab", ".hash", ".gnu.hash", ".eh_frame", ".eh_frame_hdr",
+                             ".gnu.version", ".gnu.version_r", ".gnu.version_d", ".dynstr", ".strtab")
+                        or name.startswith((".rela", ".rel.", ".note", ".debug"))) and sec.virtual_address:
+                    out.append((int(sec.virtual_address), int(sec.virtual_address) + int(sec.size)))
+        except Exception:
+            pass
+        return out
 
     def _materialisations(self, cva: int, code: bytes):
         """(site, value) for ADR and ADRP + ADD (same register, within 8 words)."""
@@ -165,8 +190,9 @@ class Reachability:
                     break
 
     def roots(self) -> Set[int]:
-        """Entry point, dynamically exported functions (ELF; .symtab names are not
-        entries), every named function of a raw image (vector table / symbols file)."""
+        """Entry point; dynamically exported functions for a shared library or a program
+        that imports dlopen / dlsym (an executable's -rdynamic exports are otherwise not
+        entries; .symtab names never are); every named function of a raw image."""
         ctx = self._ctx
         r: Set[int] = set()
         if getattr(ctx, "raw", None):
@@ -175,9 +201,15 @@ class Reachability:
             try:
                 import lief
                 b = lief.parse(ctx.path)
-                for sym in b.exported_functions:
-                    if int(sym.address) in self._start_set:
-                        r.add(int(sym.address))
+                # an executable's .dynsym exports are entries only if something can look them
+                # up by name: a shared library, or a program importing dlopen / dlsym
+                imports = {s.name for s in b.imported_symbols}
+                self.exports_are_roots = (not b.has_interpreter
+                                          or any(n.startswith(("dlsym", "dlvsym", "dlopen")) for n in imports))
+                if self.exports_are_roots:
+                    for sym in b.exported_functions:
+                        if int(sym.address) in self._start_set:
+                            r.add(int(sym.address))
             except Exception:
                 r = set(ctx.exports.values()) & self._start_set
         entry = self._entry()

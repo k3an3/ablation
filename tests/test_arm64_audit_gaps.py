@@ -1056,3 +1056,36 @@ def test_widthless_scanf_budget_into_caller(validator_so, tmp_path):
     r = _cli("lengths", validator_so, "--json", out)
     assert r.returncode == 0, r.stderr[-300:]
     assert json.loads(out.read_text())["unbounded"][0]["details"]["budget"].startswith("24 bytes")
+
+
+_EXE_SRC = r"""
+typedef unsigned long size_t;
+extern int printf(const char *, ...);
+extern long recv(int, void *, size_t, int);
+extern void http_register(const char *path, void (*h)(int));
+#define N __attribute__((noinline))
+N void h_live(int fd) { char r[64]; recv(fd, r, 63, 0); r[63] = 0; printf(r); }
+N void h_dead(int fd) { char r[64]; recv(fd, r, 63, 0); r[63] = 0; printf(r); }
+N void h_dead_caller(int fd) { h_dead(fd); }
+void _start(void) { http_register("/live", h_live); for (;;) {} }
+"""
+
+
+def test_executable_exports_not_roots(tmp_path):
+    (tmp_path / "e.c").write_text(_EXE_SRC)
+    exe = tmp_path / "e"
+    r = subprocess.run(["clang", "--target=aarch64-linux-gnu", "-O2", "-fPIE", "-pie", "-nostdlib",
+                        "-fuse-ld=lld", "-Wno-format-security", "-Wl,--export-dynamic",
+                        "-Wl,-dynamic-linker,/lib/ld-linux-aarch64.so.1",
+                        "-Wl,--unresolved-symbols=ignore-all", "-o", str(exe), str(tmp_path / "e.c")],
+                       capture_output=True, text=True)
+    if r.returncode:
+        pytest.skip(r.stderr[-200:])
+    from ablation.analyzers.reachability_arm64 import Reachability
+    ctx = BinaryContext.load_or_build(str(exe), force_rebuild=True)
+    t = symbols(exe)
+    R = Reachability(ctx)
+    assert R.function_status(t["h_live"]) is None                       # address taken
+    assert R.function_status(t["h_dead_caller"]) == "unreachable: no callers, address never taken"
+    assert R.function_status(t["h_dead"]).startswith("unreachable: only called from unreachable code")
+    assert not R.exports_are_roots                                      # -rdynamic, no dl* imports
