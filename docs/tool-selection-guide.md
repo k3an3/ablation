@@ -37,6 +37,7 @@ Task-to-tool lookup. For constructor patterns and key methods, see `docs/module-
 | "Which vendor functions wrap printf / system / memcpy (log(fmt, ...) -> vsnprintf)?" | `ctx.infer_wrappers()` / `ablation wrappers <bin>` (automatic in fmtstr / taint / lengths) |
 | "What does this format-string bug leak (saved x30 = base+K)? How big is the %s destination?" | `ARM64FormatStringScanner ... f.details['slots' / 'leak' / 'dest']` |
 | "Is this leak's output served back to the client?" | `EgressMap(ctx).couple({func})` / `ablation egress <bin>` / `f.details['egress']` |
+| "Why is (or isn't) this printf call site reported?" | `ablation fmtstr <bin> --explain 0xSITE` |
 | "Is this finding's code reachable / registered / gated on unset config?" | `Reachability(ctx).classify(func, site)` / `ablation reach <bin>` / `--show-suppressed` |
 | "Stripped / static / raw image: which function is memcpy, sprintf, sscanf?" | `LibcRoleInferer(ctx).infer()` (automatic in the CLI when no sink resolves; `--sink-map` to name by hand) |
 | "ARM64: length checked signed / masked / byte-wide but used wider" | `ARM64ConversionLengthScanner.from_context(ctx).scan()` (or `ablation lengths <bin> --libc musl`) |

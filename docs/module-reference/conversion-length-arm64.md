@@ -63,6 +63,13 @@ Validated on clang `-O1` / `-O2` fixtures: six bugs are found at both levels, an
 controls stay silent (`n > 64 || n < 0`, an unsigned compare, mask-then-check-then-use, a
 16-bit counter). See `tests/test_arm64_audit_gaps.py`.
 
+**Not reported** (guards that are modelled):
+- A mask of a value already zero-extended (`ldrh` / `ldurh` / `ldrb` / `uxth`, kept through
+  `rev16` and copies): the masked and copied lengths are the same value.
+- `capacity - (used + ret)` after the `*printf` return was checked against the remaining
+  capacity by a signed compare. This covers gcc's `cmp w0, #0; ccmp wR, w0, #4, ge; b.le`
+  truncation idiom.
+
 ## Limits
 
 - The guard search is linear and per function, like the other tag scanners. A check in the

@@ -2,6 +2,36 @@
 
 ---
 
+## v2.89.0
+
+**Third round from an AArch64 daemon audit: size-taking wrappers, egress through vendor
+helpers, two `lengths` false positives, width-less `%s` budgets, reachability roots.**
+
+- **Size-taking wrappers.** Length wrappers follow the size parameter through clamps, masks
+  and arithmetic (`length x2 (derived)`). TLS reads (`SSL_read` & co.) are size sinks and
+  sources. Wrappers cached by 2.88 are re-inferred.
+- **Egress.**
+  - Vendor open helpers are inferred (`open` wrappers, with their mode).
+  - PLT-routed helpers are followed, and emitters are searched three calls deep.
+  - A coarse shared-path-literal fallback is labelled as such.
+- **lengths false positives fixed.**
+  - `masked_check` on a value already zero-extended by `ldrh` / `ldurh`.
+  - `sext_signed_check` after the `*printf` truncation guard (`cmp; ccmp ... ge; b.le`).
+- **Width-less `%s` / `%[`.**
+  - Every conversion is listed, including through vendor `sscanf` wrappers.
+  - `details.budget` gives the bytes to a saved `x30`, into the caller's frame when the
+    frame record sits below the buffer.
+  - `lengths` shows them, under `"unbounded"` in `--json`.
+- **Reachability.**
+  - Symbol tables are no longer scanned as address references; `.dynsym` `st_value` made
+    every export look address-taken.
+  - An executable's exports are roots only when it imports `dlopen` / `dlsym`.
+- **fmtstr.**
+  - `writable_format`: a format in `.data` / `.bss`.
+  - `--explain VA` shows why one call site is or is not reported.
+
+---
+
 ## v2.88.0
 
 **Second round from an AArch64 firmware audit: vendor sink wrappers, what a format string

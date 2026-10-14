@@ -92,6 +92,16 @@ This works through wrappers too. All `__*printf_chk` variants are format sinks.
 
 **Egress (`details.egress`).** See [reachability-egress.md](reachability-egress.md).
 
+**Writable formats.** A format in writable memory (`.data` / `.bss`) is `writable_format`
+MEDIUM, with its initial text: code can change it.
+
+**`--explain VA`.** For one call site, `ablation fmtstr --explain 0xSITE` prints:
+- the callee, and whether it is a printf name or a format wrapper;
+- the format register's value;
+- the classification, or why the site is skipped;
+- the taint at the call;
+- reachability and registration.
+
 **Unbounded `%s`.** For a literal format, `%s` with no precision (print family) or
 `%s` / `%[` with no width (scan family, skipping `%*s` and `%ms`) is checked. It is flagged
 when it writes into a stack buffer:
@@ -103,7 +113,11 @@ when it writes into a stack buffer:
 | `scanf` | same | always (stdin) |
 | `fscanf` | same | never (MEDIUM) |
 
-The other cases are MEDIUM. `details.dest` gives the byte budget: the bytes to the next stack
+The other cases are MEDIUM. Every width-less conversion with a stack destination is listed,
+and vendor wrappers of the scan family are checked too. `ablation lengths` shows them as well
+(under `"unbounded"` with `--json`). `details.budget` gives the bytes from the nearest
+conversion to a saved `x30`. When the frame record sits below the buffer, the budget continues
+into each caller's frame. `details.dest` gives the per-destination byte budget: the bytes to the next stack
 object or saved register, and to this frame's saved `x30`. A note is added when the frame
 record sits below the buffer, where an overflow runs into the caller's frame. `__sprintf_chk` is not flagged, because it aborts on overflow.
 `unbounded_conversions(fmt, family)` exposes the parser.

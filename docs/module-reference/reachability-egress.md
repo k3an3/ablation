@@ -55,6 +55,13 @@ own: one looked like local logging, the other like static file serving.
 on a never-written global)` on every run. `--show-suppressed` lists those findings, marked
 `SUPPRESSED` and with their reasons. Nothing is dropped silently.
 
+**Roots and address-taken.**
+- A program's `.dynsym` exports are entry points only for a shared library, or a program
+  importing `dlopen` / `dlsym` (`Reachability.exports_are_roots`). An executable built with
+  `-rdynamic` is not.
+- Symbol tables, relocation records and hash / version / unwind / note / debug sections are
+  not scanned for address words: a function's own `st_value` is not a reference.
+
 ## Egress coupling (`EgressMap`)
 
 - **writers / readers per path literal.** Classified from the `fopen` mode, the `open` flags
@@ -69,6 +76,14 @@ on a never-written global)` on every run. `--show-suppressed` lists those findin
 ```
 egress: write in log_event (0x10754) -> "/var/log/httpd.log" -> read in serve_log (0x107b8) -> send (0x107f8)
 ```
+
+Vendor open helpers (`open_log(path, mode)` → `fopen`) are inferred as `open` wrappers with
+their mode. Calls through `-fPIC` PLT stubs are followed to the binary's own exports.
+
+**Coarse fallback.** It is used when nothing pairs exactly (a runtime-built path, an
+unmodelled helper). It pairs two functions that reference the same path literal: one near the
+finding that writes or opens within two calls, and one that reaches a send. Such chains are
+labelled `(coarse: shared path literal)`.
 
 `ablation egress <bin>` lists every path with its writers and readers, and marks `EGRESS` where
 both exist.

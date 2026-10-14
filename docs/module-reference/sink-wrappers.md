@@ -35,6 +35,15 @@ binary's own exports. Inference runs to a fixpoint, so wrappers of wrappers are 
 | `exec` | `system` / `popen` / `exec*` command arguments |
 | `length` | length arguments: `memcpy` x2, `read` x2, `malloc` x0, `snprintf` x1 ... |
 | `copy` | pointer arguments whose pointee must not be attacker data |
+| `open` | the path of `fopen` / `open` / `openat` / `creat`; the inner mode is recorded (`mode:a`, `flags:0x0`, `param:x1`), used by egress coupling |
+
+**Derived lengths.** A size parameter often reaches `recv` / `read` / `SSL_read` only after a
+clamp (`n = want < avail ? want : avail`), a mask or arithmetic. Length wrappers therefore
+also accept a value-flow mapping, which is shown as `length x2 (derived)`. This is a taint
+pass with each parameter labelled. A load through a parameter pointer does not count, so a
+struct parameter's field is not "derived" from it. Format, exec and copy kinds stay exact
+passthrough. TLS reads are size sinks and buffer-filling sources: `SSL_read`, `SSL_peek`,
+`BIO_read`, `mbedtls_ssl_read`, `wolfSSL_read`, `gnutls_record_recv`.
 
 For varargs wrappers, the AAPCS64 register save area is recorded:
 - `gr_offs = -8 × GP slots saved` (6 slots → `-0x30`), from `stp x(n)..x7` to consecutive
