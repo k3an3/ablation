@@ -922,6 +922,16 @@ def cmd_fmtstr(args):
         scanner = FormatStringScanner.from_context(ctx)
     findings = scanner.scan()
     findings = _reach_filter(args, ctx, findings, 'call_va')
+    if getattr(args, 'explain', None) and ctx.arch == 'arm64':
+        site = int(args.explain, 16)
+        print(scanner.explain(site))
+        from ablation.analyzers.reachability_arm64 import Reachability
+        f = ctx.func_containing(site)
+        if f is not None:
+            label, sup, reg = Reachability(ctx).classify(f, site)
+            print(f"  reach: {label or 'live'}{' (suppressed)' if sup else ''}"
+                  + (f"; {reg}" if reg else ""))
+        return
 
     if args.json:
         import json
@@ -1533,6 +1543,8 @@ def main():
     # fmtstr
     p_fmtstr = sub.add_parser('fmtstr', help='format string vulnerability scan (printf/syslog/err with non-literal format arg)')
     p_fmtstr.add_argument('binary')
+    p_fmtstr.add_argument('--explain', metavar='VA', help='ARM64: why the call at VA is or is not '
+                          'reported (callee, format register, value, classification, reach)')
     _add_raw_args(p_fmtstr)
     _add_taint_args(p_fmtstr)
     p_fmtstr.add_argument('--json', metavar='FILE', default=None, help='write JSON to FILE')

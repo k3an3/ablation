@@ -396,7 +396,7 @@ class ARM64RegAnnotator:
 
     def _const_or_string(self, v: int) -> RegVal:
         s = self._strings.get(v)
-        return RegVal.string(s) if s else RegVal.const(v)
+        return RegVal(kind='string', str_val=s, int_val=v) if s else RegVal.const(v)
 
     def _addr_val(self, va: Optional[int]) -> RegVal:
         if va is None:

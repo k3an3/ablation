@@ -1089,3 +1089,41 @@ def test_executable_exports_not_roots(tmp_path):
     assert R.function_status(t["h_dead_caller"]) == "unreachable: no callers, address never taken"
     assert R.function_status(t["h_dead"]).startswith("unreachable: only called from unreachable code")
     assert not R.exports_are_roots                                      # -rdynamic, no dl* imports
+
+
+_WFMT_SRC = r"""
+extern int printf(const char *, ...);
+extern void set_fmt(char *);
+char g_fmt[32] = "default %d\n";
+void use_wfmt(void) { printf(g_fmt, 1); }
+void use_lit(void) { printf("lit %d\n", 1); }
+"""
+
+
+@pytest.fixture(scope="module")
+def wfmt_so(tmp_path_factory):
+    return build_variants(tmp_path_factory, src_text=_WFMT_SRC,
+                          variants={"O2": ["-O2", "-Wno-format-security"]})["O2"]
+
+
+def test_writable_format_and_explain(wfmt_so, wrap_bins):
+    from ablation.analyzers.format_string_scanner_arm64 import ARM64FormatStringScanner
+    ctx, t = _wctx(wfmt_so)
+    s = ARM64FormatStringScanner.from_context(ctx)
+    fs = {f.func_va: f for f in s.scan()}
+    f = fs[t["use_wfmt"]]
+    assert f.provenance == "writable_format" and "initially 'default %d" in f.description
+    assert t["use_lit"] not in fs
+    lit_site = next(c.site_va for _f, c in s._site_calls.values() if _f == t["use_lit"])
+    assert "literal (not reported)" in s.explain(lit_site)
+    ctx2, t2 = _wctx(wrap_bins["O2"])
+    s2 = ARM64FormatStringScanner.from_context(ctx2)
+    s2.scan()
+    bad_site = next(f.call_va for f in s2.scan() if f.func_va == t2["h_bad"])
+    ex = s2.explain(bad_site)
+    assert "wrapper of vsnprintf" in ex and "taint at the call: recv" in ex
+    inner = s2.explain(next(site for site, (fv, c) in s2._site_calls.items()
+                            if fv == t2["log_event"] and c.target_name == "vsnprintf"))
+    assert "forwarding inside the format wrapper log_event" in inner
+    r = _cli("fmtstr", wrap_bins["O2"], "--explain", hex(bad_site))
+    assert "taint at the call: recv" in r.stdout and "reach:" in r.stdout

@@ -624,10 +624,20 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
         if v.kind == "copy" and v.chain is not None:
             return self._classify(v.chain, reg)
         if v.kind == "string":
+            if v.int_val and self._writable(v.int_val):
+                return ("writable_format", "MEDIUM",
+                        f"format in {reg} is text in writable memory at 0x{v.int_val:x} "
+                        f"(initially {v.display()}): code can change it")
             return None, "", ""                                    # literal: safe
         if v.kind == "const":
             if self._is_rodata(v.int_val):
                 return None, "", ""                                # address inside .rodata
+            if self._writable(v.int_val):
+                init = self._cstr(v.int_val)
+                shown = f" (initially '{init[:40]}')" if init else ""
+                return ("writable_format", "MEDIUM",
+                        f"format in {reg} is a buffer in writable memory at 0x{v.int_val:x}{shown}: "
+                        f"code can change it")
             return "register", "MEDIUM", f"format in {reg} is constant 0x{v.int_val:x} outside .rodata"
         if v.kind == "arg":
             return "arg_passthrough", "HIGH", f"format in {reg} is the caller's {v.display()}"
@@ -644,6 +654,55 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
         if v.kind == "ret":
             return "call_result", "MEDIUM", f"format in {reg} is the return value of {v.str_val}"
         return "register", "MEDIUM", f"format in {reg} = {v.display()}"
+
+    def _writable(self, va: int) -> bool:
+        """va is in a writable ELF section (.data / .bss ...), not read-only data."""
+        ranges = getattr(self, "_rw", None)
+        if ranges is None:
+            ranges = []
+            if not getattr(self._ctx, "raw", None):
+                try:
+                    import lief
+                    binary = lief.parse(self._ctx.path)
+                    for sec in binary.sections:
+                        if int(sec.flags) & 0x1 and sec.size and not sec.name.startswith(".data.rel.ro") \
+                                and sec.name not in (".got", ".got.plt", ".dynamic"):
+                            lo = int(sec.virtual_address)
+                            ranges.append((lo, lo + int(sec.size)))
+                except Exception:
+                    pass
+            self._rw = ranges
+        return any(lo <= va < hi for lo, hi in ranges)
+
+    def explain(self, site: int) -> str:
+        """Why the call at `site` is or is not a format finding (after scan())."""
+        fc = getattr(self, "_site_calls", {}).get(site)
+        if fc is None:
+            return (f"0x{site:x}: not a call the annotator saw (not in a known function, or "
+                    f"an indirect call it could not resolve)")
+        fva, call = fc
+        exports = self._ctx.exports
+        wrap = self._fwraps.get(call.target_va) or self._fwraps.get(exports.get(call.target_name, -1))
+        reg = fmt_reg(call.target_name) or (wrap.fmt_reg if wrap else None)
+        lines = [f"0x{site:x} in {self._fn(fva)} (0x{fva:x}): call {call.target_name or hex(call.target_va)}"]
+        if reg is None:
+            lines.append("  callee is neither a printf-family name nor an inferred / sink-map format "
+                         "wrapper: not checked (see --sink-wrappers; add one with --sink-map "
+                         "'{\"0xVA\": \"format:xN\"}')")
+            return "\n".join(lines)
+        v = call.args.get(reg)
+        lines.append(f"  format register {reg}" + (f" (wrapper of {wrap.wraps})" if wrap else ""))
+        lines.append(f"  value: {v.display() if v is not None else '? (no definition)'}")
+        own = self._fwraps.get(fva)
+        if own is not None and f"x{self._arg_index(v)}" == own.fmt_reg:
+            lines.append(f"  -> forwarding inside the format wrapper {own.name}: checked at its call sites")
+            return "\n".join(lines)
+        prov, sev, desc = self._classify(v, reg)
+        lines.append(f"  -> {prov or 'literal (not reported)'} {sev} {desc}".rstrip())
+        labels = self._arg_taint.get((site, reg))
+        if labels:
+            lines.append(f"  taint at the call: {','.join(sorted(labels))}")
+        return "\n".join(lines)
 
     def _is_rodata(self, va: int) -> bool:
         ranges = getattr(self, "_rodata", None)
