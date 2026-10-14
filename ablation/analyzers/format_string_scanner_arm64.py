@@ -212,6 +212,7 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
             f.provenance, f.severity = "tainted", "HIGH"
             f.description = f"format string in {reg} carries received data ({src}){note}"
         self._slot_details(findings)
+        self._egress_details(findings)
         for f in findings.values():
             f.details["bucket"] = bucket(f)
         return sorted(findings.values(), key=lambda f: (f.func_va, f.call_va))
@@ -500,6 +501,35 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
                     # the map reached this frame's saved x30 and found nothing worse
                     f.severity = "MEDIUM"
                     f.description += "; renders only stale registers / locals"
+
+    def _egress_details(self, findings: Dict[int, FmtStringFinding]) -> None:
+        """details.egress: the rendered output is written to a path that another function
+        reads and sends to a peer (egress_arm64)."""
+        live = [f for f in findings.values() if f.provenance != "unbounded_s" and f.severity != "LOW"]
+        if not live:
+            return
+        from .egress_arm64 import EgressMap
+        em = EgressMap(self._ctx, getattr(self, "extra_egress", None))
+        exports = self._ctx.exports
+        for f in live:
+            fvas = {f.func_va}
+            fc = self._site_calls.get(f.call_va)
+            if fc is not None:
+                call = fc[1]
+                w = self._fwraps.get(call.target_va) or self._fwraps.get(exports.get(call.target_name, -1))
+                for _ in range(6):                       # the wrapper chain writes the output
+                    if w is None:
+                        break
+                    fvas.add(w.va)
+                    inner = self._site_calls.get(w.site)
+                    if inner is None:
+                        break
+                    ic = inner[1]
+                    w = self._fwraps.get(ic.target_va) or self._fwraps.get(exports.get(ic.target_name, -1))
+            chains = em.couple(fvas)
+            if chains:
+                f.details["egress"] = "; ".join(chains[:2])
+                f.description += "; the output is served back to clients (see egress)"
 
     def _dest_extent(self, fva: int, v) -> str:
         while v is not None and v.kind == "copy":

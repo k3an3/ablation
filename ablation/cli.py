@@ -460,6 +460,18 @@ def cmd_reach(args):
         print(f"  0x{f:x}  {ctx.name(f):<32} {R.function_status(f)}")
 
 
+def cmd_egress(args):
+    """ARM64: file paths written and read back to a peer (egress coupling)."""
+    p = str(_require_binary(args.binary))
+    ctx = _load_ctx(args, p)
+    if ctx.arch != 'arm64':
+        print(f"egress supports ARM64 (binary arch: {ctx.arch})")
+        return
+    from ablation.analyzers.egress_arm64 import EgressMap
+    extra = {n for n in (args.egress or '').split(',') if n}
+    print(EgressMap(ctx, extra).report())
+
+
 def cmd_window(args):
     """Annotated disassembly window around a VA: suitable for pasting into claude.ai."""
     from ablation.analyzers.window_analyzer import WindowAnalyzer
@@ -1435,6 +1447,13 @@ def main():
     _add_raw_args(p_reach)
     p_reach.add_argument('--limit', type=int, default=50)
     p_reach.set_defaults(func=cmd_reach)
+
+    p_eg = sub.add_parser('egress', help='ARM64 egress coupling: paths written by one function and '
+                                         'read back to a peer (send / sendfile / SSL_write) by another')
+    p_eg.add_argument('binary')
+    _add_raw_args(p_eg)
+    p_eg.add_argument('--egress', metavar='NAME[,NAME]', help='extra response-emit functions')
+    p_eg.set_defaults(func=cmd_egress)
 
     p_window = sub.add_parser('window', help='annotated disassembly window around a VA')
     p_window.add_argument('binary')

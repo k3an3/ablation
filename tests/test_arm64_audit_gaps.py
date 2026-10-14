@@ -717,3 +717,55 @@ def test_cli_show_suppressed(reach_so):
     assert r.stdout.count("SUPPRESSED") == 2 and "unreachable: only called" in r.stdout
     r = _cli("reach", reach_so)
     assert "'/live'" in r.stdout and "'/tbl'" in r.stdout
+
+
+# ── round 2: egress coupling ─────────────────────────────────────────────────
+
+_EGRESS_SRC = r"""
+typedef unsigned long size_t; typedef __builtin_va_list va_list; typedef struct FILE FILE;
+extern FILE *fopen(const char *, const char *);
+extern int fputs(const char *, FILE *);
+extern int vsnprintf(char *, size_t, const char *, va_list);
+extern size_t fread(void *, size_t, size_t, FILE *);
+extern long send(int, const void *, size_t, int);
+extern long recv(int, void *, size_t, int);
+extern int open(const char *, int, ...);
+extern long read(int, void *, size_t);
+#define N __attribute__((noinline))
+#define LOG "/var/log/httpd.log"
+static FILE *g_log;
+N void log_init(void) { g_log = fopen(LOG, "a"); }
+N void log_event(int kind, const char *fmt, ...) { char buf[0x600]; va_list ap; __builtin_va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap); __builtin_va_end(ap); fputs(buf, g_log); (void)kind; }
+N void serve_log(int sock) { int fd = open(LOG, 0); char b[512]; long n = read(fd, b, sizeof b); send(sock, b, n, 0); }
+N void serve_motd(int sock) { FILE *f = fopen("/etc/motd", "r"); char b[64]; fread(b, 1, 64, f); send(sock, b, 64, 0); }
+N void cfg_write(const char *v) { FILE *f = fopen("/etc/app.conf", "w"); fputs(v, f); }
+void h_req(int sock) { char r[256]; recv(sock, r, 255, 0); r[255] = 0; log_event(1, r); }
+"""
+
+
+@pytest.fixture(scope="module")
+def egress_so(tmp_path_factory):
+    return build_variants(tmp_path_factory, src_text=_EGRESS_SRC, variants={"O2": ["-O2"]})["O2"]
+
+
+def test_egress_map(egress_so):
+    from ablation.analyzers.egress_arm64 import EgressMap
+    ctx, t = _wctx(egress_so)
+    em = EgressMap(ctx).build()
+    assert em.writers["/var/log/httpd.log"] == {t["log_init"], t["log_event"]}   # via the FILE* global
+    assert em.readers["/var/log/httpd.log"] == {t["serve_log"]}
+    assert em.writers["/etc/app.conf"] == {t["cfg_write"]} and "/etc/app.conf" not in em.readers
+    chains = em.couple({t["log_event"]})
+    assert len(chains) == 1 and '"/var/log/httpd.log" -> read in serve_log' in chains[0] and "send" in chains[0]
+    assert em.couple({t["cfg_write"]}) == []                 # written, never served
+
+
+def test_fmtstr_finding_carries_egress(egress_so):
+    from ablation.analyzers.format_string_scanner_arm64 import ARM64FormatStringScanner
+    ctx, t = _wctx(egress_so)
+    (f,) = [f for f in ARM64FormatStringScanner.from_context(ctx).scan() if f.func_va == t["h_req"]]
+    assert f.severity == "HIGH" and "served back to clients" in f.description
+    assert "write in log_event" in f.details["egress"] and "send" in f.details["egress"]
+    r = _cli("egress", egress_so)
+    assert "'/var/log/httpd.log'" in r.stdout and "EGRESS" in r.stdout

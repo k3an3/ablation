@@ -369,63 +369,57 @@ class Reachability:
                     break
         return None
 
-    def _def_location(self, insns, k: int, reg: str) -> Optional[Tuple[int, Optional[int]]]:
-        """(global address, field offset or None) the tested register was loaded from.
-        Follows the load chain back to an ADRP page: ldr reg, [G]; ldr reg, [*G + off];
-        either through a GOT slot (adrp; ldr xP, [GOT]; ldr reg, [xP ...])."""
-        def defn(r: str, upto: int) -> Optional[int]:
-            for j in range(upto - 1, max(upto - 48, -1), -1):
-                rd = insns[j].reg(0)
-                if rd is not None and rd.name == r and not insns[j].mnemonic.startswith(("st", "cmp", "tst", "cb", "tb", "b")):
-                    return j
-            return None
+    @staticmethod
+    def _defn(insns, r: str, upto: int) -> Optional[int]:
+        """Index of the last instruction before `upto` that writes register r."""
+        for j in range(upto - 1, max(upto - 48, -1), -1):
+            rd = insns[j].reg(0)
+            if rd is not None and rd.name == r and not insns[j].mnemonic.startswith(
+                    ("st", "cmp", "tst", "cb", "tb", "b")):
+                return j
+        return None
 
-        def address(r: str, upto: int, depth: int = 0) -> Optional[Tuple[str, int, Optional[int]]]:
-            """('addr', A) when r holds address A; ('val', A, None) when r holds *A."""
-            j = defn(r, upto)
-            if j is None or depth > 4:
-                return None
-            x = insns[j]
-            m = x.mnemonic
-            if m == "adrp":
-                return ("addr", x.imm(1), None)
-            if m == "add" and x.reg(1) is not None and x.imm(2) is not None:
-                inner = address(x.reg(1).name, j, depth + 1)
-                if inner and inner[0] == "addr":
-                    return ("addr", inner[1] + x.imm(2), None)
-                return None
-            if m.startswith("ldr") and x.first_mem() is not None and x.first_mem().index is None:
-                mem = x.first_mem()
-                inner = address(mem.base, j, depth + 1)
-                if inner is None:
-                    return None
-                if inner[0] == "addr":
-                    a = inner[1] + mem.offset
-                    if a in self._got:                       # GOT slot: r = &global
-                        return ("addr", self._got[a], None)
-                    return ("val", a, None)                  # r = *global
-                if inner[0] == "val":                        # r = (*global)->field
-                    return ("field", inner[1], mem.offset)
-            return None
-
-        loc = address(reg, k + 1) if False else None
-        j = defn(reg, k)
-        if j is None:
+    def addr_chain(self, insns, upto: int, r: str, depth: int = 0):
+        """What register r holds just before insns[upto]: ('addr', A) an address,
+        ('val', A) the 8 bytes at A (a global's value), ('field', A, off) a field of the
+        object *A points at; None if not a global. GOT slots are dereferenced."""
+        j = self._defn(insns, r, upto)
+        if j is None or depth > 5:
             return None
         x = insns[j]
+        m = x.mnemonic
+        if m == "adrp":
+            return ("addr", x.imm(1))
+        if m == "mov" and x.reg(1) is not None and x.imm(1) is None:
+            return self.addr_chain(insns, j, x.reg(1).name, depth + 1)
+        if m == "add" and x.reg(1) is not None and x.imm(2) is not None:
+            inner = self.addr_chain(insns, j, x.reg(1).name, depth + 1)
+            if inner and inner[0] == "addr":
+                return ("addr", inner[1] + x.imm(2))
+            return None
         mem = x.first_mem()
-        if not x.mnemonic.startswith("ldr") or mem is None or mem.index is None and False:
+        if m.startswith("ldr") and mem is not None and mem.index is None:
+            inner = self.addr_chain(insns, j, mem.base, depth + 1)
+            if inner is None:
+                return None
+            if inner[0] == "addr":
+                a = inner[1] + mem.offset
+                if a in self._got:                       # GOT slot: r = &global
+                    return ("addr", self._got[a])
+                return ("val", a)                        # r = *global
+            if inner[0] == "val":
+                return ("field", inner[1], mem.offset)
+        return None
+
+    def _def_location(self, insns, k: int, reg: str) -> Optional[Tuple[int, Optional[int]]]:
+        """(global address, field offset or None) a tested register was loaded from."""
+        c = self.addr_chain(insns, k, reg)
+        if c is None:
             return None
-        inner = address(mem.base, j)
-        if inner is None:
-            return None
-        if inner[0] == "addr":
-            a = inner[1] + mem.offset
-            if a in self._got:
-                return None                                  # tested a pointer to a global
-            return a, None                                   # the global itself
-        if inner[0] == "val":
-            return inner[1], mem.offset                      # field of the object *global
+        if c[0] == "val":
+            return c[1], None
+        if c[0] == "field":
+            return c[1], c[2]
         return None
 
     def _adrp_index(self):
