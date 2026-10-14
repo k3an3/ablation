@@ -158,7 +158,7 @@ class FmtStringFinding:
             f"  {self.callee}({self.fmt_reg}={'stack' if self.provenance == 'unbounded_s' else 'user?'})"
             f"  {self.description}"
             + "".join(f"\n      {k}: {v}" for k, v in self.details.items()
-                      if k not in ("slots",) and v)
+                      if k not in ("slots", "bucket") and v)
             + (("\n      slots: " + "; ".join(self.details["slots"])) if self.details.get("slots") else "")
         )
 

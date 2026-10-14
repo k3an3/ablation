@@ -114,6 +114,8 @@ class RegVal:
             return "0"
         if self.kind == 'mem':
             return f"[{self.str_val}]"
+        if self.kind == 'unknown' and self.str_val:
+            return f"? ({self.str_val})"
         return "?"
 
     @staticmethod
@@ -151,6 +153,11 @@ class RegVal:
     @property
     def is_stack_addr(self) -> bool:
         return self.kind == 'mem' and self.int_val == 1
+
+    @staticmethod
+    def unresolved(reason: str) -> "RegVal":
+        """Unknown, with why (e.g. different definitions reach on different paths)."""
+        return RegVal(kind='unknown', str_val=reason)
 
     @staticmethod
     def unknown() -> "RegVal":

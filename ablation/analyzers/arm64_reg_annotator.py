@@ -147,6 +147,121 @@ class ARM64RegAnnotator:
             self._step(insn, regs, result)
         return result
 
+    def annotate_calls_cfg(
+        self,
+        func_va: int,
+        func_end_va: int = 0,
+        window: int = 2048,
+        seed_args: bool = True,
+        entry_regs: Optional[Dict[str, RegVal]] = None,
+    ) -> AnnotationResult:
+        """Path-sensitive annotate_calls: values flow along the CFG and meet at joins.
+
+        A register or stack slot that reaches a join with different definitions (or is
+        set on some incoming paths only) becomes RegVal.unresolved(reason) instead of
+        whichever store came last in address order. Blocks the CFG does not reach from
+        the entry (jump-table targets behind a br) start from the state of the block
+        before them, as in the linear pass.
+        """
+        from .cfg_arm64 import build_cfg
+        if func_end_va <= func_va:
+            func_end_va = func_va + window
+        result = AnnotationResult(func_va=func_va, func_end_va=func_end_va)
+        code = self._read(func_va, func_end_va - func_va)
+        if not code:
+            return result
+        insns = []
+        for ci in self._md.disasm(code, func_va):
+            if ci.address >= func_end_va or (ci.address in self._plt and ci.address != func_va):
+                break
+            insns.append(make_insn(ci.address, ci.mnemonic, ci.op_str, size=ci.size))
+        try:
+            cfg = build_cfg(insns, entry=func_va)
+        except (ValueError, IndexError):
+            return self.annotate_calls(func_va, func_end_va, window, seed_args, entry_regs)
+        entry: Dict = {}
+        if entry_regs is not None:
+            entry.update(entry_regs)
+        elif seed_args:
+            for i, r in enumerate(ARG_REGS):
+                entry[r] = RegVal.arg(i, r)
+
+        order: List[int] = []
+        seen = set()
+
+        def dfs(b: int) -> None:
+            stack = [(b, iter(cfg.blocks[b].succs))]
+            seen.add(b)
+            while stack:
+                node, it = stack[-1]
+                nxt = next((s for s in it if s in cfg.blocks and s not in seen), None)
+                if nxt is None:
+                    order.append(node)
+                    stack.pop()
+                else:
+                    seen.add(nxt)
+                    stack.append((nxt, iter(cfg.blocks[nxt].succs)))
+        dfs(cfg.entry)
+        order.reverse()
+        rest = sorted(b for b in cfg.blocks if b not in seen)
+        allb = sorted(cfg.blocks)
+
+        out: Dict[int, Dict] = {}
+
+        def run(record: bool) -> None:
+            for b in order + rest:
+                blk = cfg.blocks[b]
+                ins = [out[p] for p in blk.preds if p in out]
+                if b == cfg.entry:
+                    ins = [entry] + ins
+                elif not ins:
+                    i = allb.index(b)
+                    ins = [out.get(allb[i - 1], entry)] if i > 0 else [entry]
+                st = self._join(ins)
+                res = result if record else AnnotationResult(func_va=func_va, func_end_va=func_end_va)
+                for insn in blk.insns:
+                    self._step(insn, st, res)
+                out[b] = st
+
+        run(False)
+        run(False)            # loops: back-edge states joined in
+        run(True)
+        result.calls.sort(key=lambda c: c.site_va)
+        return result
+
+    @staticmethod
+    def _canon(v: Optional[RegVal]):
+        while v is not None and v.kind == 'copy' and v.chain is not None:
+            v = v.chain
+        if v is None or v.kind == 'unknown':
+            return None
+        return (v.kind, v.int_val, v.str_val)
+
+    @classmethod
+    def _join(cls, states: List[Dict]) -> Dict:
+        if len(states) == 1:
+            return dict(states[0])
+        out: Dict = {}
+        keys = set().union(*states)
+        for k in keys:
+            vals = [s.get(k) for s in states]
+            canon = [cls._canon(v) for v in vals]
+            if all(c is not None for c in canon) and len(set(canon)) == 1:
+                out[k] = vals[0]
+                continue
+            defined = [v for v, c in zip(vals, canon) if c is not None]
+            if not defined:
+                if any(v is not None and v.kind == 'unknown' and v.str_val for v in vals):
+                    out[k] = next(v for v in vals if v is not None and v.str_val)
+                continue
+            shown = sorted({v.display() for v in defined})
+            if len({cls._canon(v) for v in defined}) == 1:
+                out[k] = RegVal.unresolved(f"set on some paths only ({shown[0]})")
+            else:
+                out[k] = RegVal.unresolved("different definitions reach on different paths: "
+                                           + " | ".join(shown[:3]))
+        return out
+
     def fmt_calls(self, func_va: int, func_end_va: int = 0, window: int = 2048) -> str:
         return self.annotate_calls(func_va, func_end_va, window).fmt()
 

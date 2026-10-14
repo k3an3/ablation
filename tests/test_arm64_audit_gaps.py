@@ -617,3 +617,36 @@ def test_scanf_destination_extent(dest_so):
     n = int(_re.search(r": (\d+) bytes to the", dest).group(1))
     assert 5 <= n <= 8                          # char m[5] (allocation rounding), not the frame
     assert "bytes to saved x30" in dest
+
+
+# ── round 2: path-sensitive resolution, unresolved verdict ───────────────────
+
+_PATH_SRC = r"""
+typedef unsigned long size_t;
+extern void *calloc(size_t, size_t);
+extern int printf(const char *, ...);
+void two_paths(int c) { const char *f; if (c) f = calloc(1, 16); else f = "lit %d\n"; printf(f, 1); }
+void same_lit(int c) { const char *f = "a %d\n"; if (c) f = "a %d\n"; printf(f, 1); }
+"""
+
+
+@pytest.fixture(scope="module")
+def path_so(tmp_path_factory):
+    return build_variants(tmp_path_factory, src_text=_PATH_SRC, variants={"O0": ["-O0"]})["O0"]
+
+
+def test_path_sensitive_slot_resolution(path_so):
+    from ablation.analyzers.arm64_reg_annotator import ARM64RegAnnotator
+    from ablation.analyzers.format_string_scanner_arm64 import ARM64FormatStringScanner
+    ctx, t = _wctx(path_so)
+    ra = ARM64RegAnnotator.from_context(ctx)
+    end = min(v for v in ctx.func_starts if v > t["two_paths"])
+    lin = [c for c in ra.annotate_calls(t["two_paths"], end).calls if c.target_name == "printf"][0]
+    cfg = [c for c in ra.annotate_calls_cfg(t["two_paths"], end).calls if c.target_name == "printf"][0]
+    assert lin.args["x0"].kind == "string"                 # linear: last store in address order
+    assert cfg.args["x0"].kind == "unknown" and "different definitions" in cfg.args["x0"].str_val
+    fs = {f.func_va: f for f in ARM64FormatStringScanner.from_context(ctx).scan()}
+    f = fs[t["two_paths"]]
+    assert f.provenance == "unresolved" and f.details["bucket"] == "unresolved"
+    assert "ret(calloc)" in f.description and "lit %d" in f.description
+    assert t["same_lit"] not in fs                          # same literal on both paths

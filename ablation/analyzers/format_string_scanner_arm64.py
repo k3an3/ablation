@@ -80,6 +80,12 @@ _MAX_FUNC_BYTES = 4096
 _STRING_ACCESSOR = __import__("re").compile(r"basic_string.*(c_str|data)|^_ZNKSs(5c_str|4data)Ev")
 
 
+def bucket(f) -> str:
+    """'literal' (needs no work: never reported), 'externally-influenced' (a finding) or
+    'unresolved' (the value could not be determined: a to-do list)."""
+    return "unresolved" if f.provenance == "unresolved" else "externally-influenced"
+
+
 def fmt_reg(name: str) -> Optional[str]:
     """Format register of a printf-family callee; '__fmt_x<k>' is an inferred logger
     (libc_roles) whose format is in xk."""
@@ -206,6 +212,8 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
             f.provenance, f.severity = "tainted", "HIGH"
             f.description = f"format string in {reg} carries received data ({src}){note}"
         self._slot_details(findings)
+        for f in findings.values():
+            f.details["bucket"] = bucket(f)
         return sorted(findings.values(), key=lambda f: (f.func_va, f.call_va))
 
     def report(self, findings: List[FmtStringFinding]) -> str:
@@ -213,7 +221,13 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
             return "ARM64 format string scan: no findings."
         high = sum(1 for f in findings if f.severity == "HIGH")
         lines = [f"ARM64 format string scan: {len(findings)} finding(s) ({high} HIGH)"]
-        lines += [f.fmt() for f in findings]
+        found = [f for f in findings if bucket(f) != "unresolved"]
+        todo = [f for f in findings if bucket(f) == "unresolved"]
+        lines += [f.fmt() for f in found]
+        if todo:
+            lines.append(f"unresolved ({len(todo)}): format value not determined statically -- to-do, "
+                         f"not cleared")
+            lines += [f.fmt() for f in todo]
         return "\n".join(lines)
 
     # ---- pass 1: provenance -------------------------------------------------
@@ -239,7 +253,7 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
                 continue
             i = bisect.bisect_right(starts, fva)
             end = starts[i] if i < len(starts) and starts[i] - fva <= _MAX_FUNC_BYTES else fva + _MAX_FUNC_BYTES
-            for call in ra.annotate_calls(fva, end).calls:
+            for call in ra.annotate_calls_cfg(fva, end).calls:
                 tva = ctx.exports.get(call.target_name, call.target_va)
                 self._callers.setdefault(tva, []).append((fva, call))
                 self._site_calls[call.site_va] = (fva, call)
@@ -532,8 +546,10 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
         return v is not None and getattr(v, "is_stack_addr", False)
 
     def _classify(self, v, reg: str) -> Tuple[Optional[str], str, str]:
+        if v is not None and v.kind == "unknown" and v.str_val:
+            return "unresolved", "LOW", f"format in {reg} unresolved: {v.str_val}"
         if v is None or v.kind == "unknown":
-            return "unknown", "MEDIUM", f"format in {reg} has unknown provenance"
+            return "unresolved", "LOW", f"format in {reg} unresolved: no definition reaches the call"
         if v.kind == "copy" and v.chain is not None:
             return self._classify(v.chain, reg)
         if v.kind == "string":
