@@ -1129,43 +1129,181 @@ def test_writable_format_and_explain(wfmt_so, wrap_bins):
     assert "taint at the call: recv" in r.stdout and "reach:" in r.stdout
 
 
-# ── round 4: the abl_repro corpus (lengths through a vendor body_read; nine %s) ─
+# ── round 4: the reporter's abl_repro.c corpus, verbatim (cases 1-6) ─
 
 _REPRO_SRC = r'''
-/* ablation lengths / width-less %s corpus (synthetic; rebuilt from the round-4 description).
- * The size sink is a vendor wrapper: body_read(conn, dst, len) saturates len up to INT_MAX
- * and forwards it to read(). Nothing calls read() directly with an attacker length. */
+/* ablation test corpus: conversion-length and varargs-wrapper shapes.
+ *
+ * Synthetic. Written to exhibit instruction shapes, not to do anything useful.
+ * Build (no sysroot needed):
+ *   clang --target=aarch64-linux-gnu -nostdlib -static -O2 \
+ *         -fno-stack-protector -fomit-frame-pointer abl_repro.c -o abl_repro
+ *
+ * Cases 1-4 are the conversion-length shapes `lengths` currently misses, and
+ * the thing they have in common is that the SINK IS A VENDOR WRAPPER, not a
+ * libc name: body_read()'s 3rd argument flows into read(). Case 4 is a
+ * negative control that must NOT be reported.
+ * Case 5 is a width-less scanf whose destinations spill past x7.
+ * Case 6 is a varargs format wrapper called with a runtime string.
+ */
+
 typedef unsigned long size_t;
 typedef long ssize_t;
-#define N __attribute__((noinline))
-#define INT_MAX 0x7fffffff
-struct conn { int fd; long avail; };
-N ssize_t read(int fd, void *buf, size_t n) { register long x0 __asm__("x0") = fd; register void *x1 __asm__("x1") = buf;
-    register size_t x2 __asm__("x2") = n; register long x8 __asm__("x8") = 63;
-    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x8) : "memory"); return x0; }
-N int sscanf(const char *s, const char *f, ...) { __asm__ volatile("" :: "r"(s), "r"(f) : "memory"); return 0; }
-N long hdr_int(struct conn *c) { long v; read(c->fd, &v, sizeof v); return v; }
-N ssize_t body_read(struct conn *c, char *dst, long len) { if (len > INT_MAX) len = INT_MAX; return read(c->fd, dst, (size_t)len); }
-N void sink(void *p) { __asm__ volatile("" :: "r"(p) : "memory"); }
-int g_truncated_len;
-volatile long g_consumed;
-/* 1: zero-only cbz, then a SIGNED cap check, then sxtw into the wrapper */
-N void case1(struct conn *c) { char buf[6001]; int len = (int)hdr_int(c); if (len == 0) return; if (len >= 6001) return; body_read(c, buf, len); sink(buf); }
-/* 2: 64 -> 32 truncating store to a global, used as a size in another function */
-N void case2_store(struct conn *c) { long total = hdr_int(c); g_truncated_len = (int)total; }
-N void case2_use(struct conn *c) { char buf[256]; body_read(c, buf, g_truncated_len); sink(buf); }
-/* 3: signed csel min that keeps a negative, guarded only by cbz */
-N void case3(struct conn *c, int cap) { char buf[256]; long rem = g_truncated_len - g_consumed; int n = rem < cap ? (int)rem : cap;
-    if (n == 0) return; body_read(c, buf, n); sink(buf); }
-/* 4 (negative control): reject <= 0, then a true clamp to the cap */
-N void case4(struct conn *c, int cap) { char buf[256]; int n = (int)hdr_int(c); if (n <= 0) return; if (n > cap) n = cap;
-    body_read(c, buf, n); sink(buf); }
-/* 5: nine width-less %s: destinations 1-6 in x2-x7, 7-9 on the stack (the smallest) */
-N void case5(struct conn *c) { char req[256]; char a[64], b2[48], c3[32], d[24], e[16], f[12], g[8], h[5], i[4];
-    read(c->fd, req, 255); req[255] = 0;
-    sscanf(req, "%s %s %s %s %s %s %s %s %s", a, b2, c3, d, e, f, g, h, i);
-    sink(a); sink(b2); sink(c3); sink(d); sink(e); sink(f); sink(g); sink(h); sink(i); }
-void _start(void) { struct conn c = { 0, 0 }; case1(&c); case2_store(&c); case2_use(&c); case3(&c, 64); case4(&c, 64); case5(&c); for (;;) {} }
+typedef __builtin_va_list va_list;
+
+/* ---- stubs so the names exist in .symtab and nothing needs libc ---- */
+__attribute__((noinline)) ssize_t read(int fd, void *b, size_t n)
+{ __asm__ volatile("" :: "r"(fd), "r"(b), "r"(n) : "memory"); return (ssize_t)n; }
+__attribute__((noinline)) void *memcpy(void *d, const void *s, size_t n)
+{ __asm__ volatile("" :: "r"(d), "r"(s), "r"(n) : "memory"); return d; }
+__attribute__((noinline)) int vsnprintf(char *b, size_t n, const char *f, va_list a)
+{ (void)a; __asm__ volatile("" :: "r"(b), "r"(n), "r"(f) : "memory"); return 0; }
+__attribute__((noinline)) int sscanf(const char *s, const char *f, ...)
+{ __asm__ volatile("" :: "r"(s), "r"(f) : "memory"); return 9; }
+__attribute__((noinline)) int strcmp(const char *a, const char *b)
+{ __asm__ volatile("" :: "r"(a), "r"(b) : "memory"); return 0; }
+__attribute__((noinline)) void err_response(int code)
+{ __asm__ volatile("" :: "r"(code) : "memory"); }
+
+/* ================= THE VENDOR READ WRAPPER =================
+ * This is the whole point of cases 1-4. Its 3rd argument becomes read()'s
+ * size, after an INT_MAX saturation (note: saturating UP, like civetweb's
+ * mg_read, not rejecting). A size-sink inference should name this
+ * `body_read [size x2]` the way --sink-wrappers already names format
+ * wrappers, and then the conversion detector should key on it. */
+__attribute__((noinline))
+ssize_t body_read(int conn, void *dst, size_t len)
+{
+    size_t cap = 0x7fffffffUL;
+    if (len > cap) len = cap;          /* csel, UNSIGNED: (size_t)-1 -> INT_MAX */
+    if (!len) return 0;
+    return read(conn, dst, len);
+}
+
+/* ---- request state ---- */
+struct req { long content_length; int fd; };
+static int g_truncated_len;            /* the 64->32 store lands here */
+static int g_consumed;
+
+/* ================= CASE 1 ================= */
+__attribute__((noinline))
+int case1_signed_then_sxtw(struct req *r, void *buf)
+{
+    int n = (int)r->content_length;    /* 64 -> 32 */
+    if (!n)                            /* cbnz-only: rejects 0, not negatives */
+        return -1;
+    if (n > 6000) {                    /* SIGNED compare */
+        err_response(400);
+        return -1;
+    }
+    return (int)body_read(r->fd, buf, (size_t)(ssize_t)n);  /* sxtw */
+}
+
+/* ================= CASE 2 ================= */
+__attribute__((noinline))
+void case2a_store_truncated(struct req *r)
+{
+    g_truncated_len = (int)r->content_length;   /* str w, no check at all */
+}
+
+__attribute__((noinline))
+int case2b_use_truncated(int conn, void *buf)
+{
+    int n = g_truncated_len;
+    if (!n)
+        return 0;
+    return (int)body_read(conn, buf, (size_t)(ssize_t)n);
+}
+
+/* ================= CASE 3 ================= */
+__attribute__((noinline))
+int case3_signed_min(int conn, void *buf, int want)
+{
+    int rem = g_truncated_len - g_consumed;   /* 32-bit, may be negative */
+    int n = (rem < want) ? rem : want;        /* csel, signed */
+    if (n == 0)                               /* cbz misses negatives */
+        return 0;
+    return (int)body_read(conn, buf, (size_t)(ssize_t)n);
+}
+
+/* ================= CASE 4 — NEGATIVE CONTROL ================= */
+__attribute__((noinline))
+int case4_properly_clamped(struct req *r, void *buf)
+{
+    int n = (int)r->content_length;
+    if (n <= 0) {                      /* rejects negatives AND zero */
+        err_response(400);
+        return -1;
+    }
+    if (n > 6000)
+        n = 6000;                      /* true clamp, not an error */
+    return (int)body_read(r->fd, buf, (size_t)n);
+}
+
+/* ================= CASE 5 ================= */
+__attribute__((noinline))
+int case5_scanf_stack_dests(const char *q)
+{
+    char d1[32], d2[32], d3[32], d4[32], d5[32], d6[32];
+    char d7[8], d8[5], d9[4];          /* the spilled, and the smallest */
+    int n = sscanf(q, "%s %s %s %s %s %s %s %s %s",
+                   d1, d2, d3, d4, d5, d6, d7, d8, d9);
+    if (n != 9)
+        return -1;
+    return strcmp(d9, ".MP4") == 0;    /* use them so nothing is dropped */
+}
+
+/* ================= CASE 6 ================= */
+__attribute__((noinline))
+void access_log(int kind, const char *fmt, ...)
+{
+    char line[300];
+    va_list ap;
+    __builtin_va_start(ap, fmt);
+    vsnprintf(line, sizeof line, fmt, ap);   /* plain, not __vsnprintf_chk */
+    __builtin_va_end(ap);
+    __asm__ volatile("" :: "r"(kind), "r"(line) : "memory");
+}
+
+__attribute__((noinline))
+void case6a_literal_format(void)
+{
+    access_log(1, "fixed literal, no conversions");   /* must NOT be reported */
+}
+
+__attribute__((noinline))
+void case6b_runtime_format(const char *param)
+{
+    char copy[256];
+    memcpy(copy, param, 255);
+    copy[255] = 0;
+    access_log(2, copy);               /* stack buffer AS THE FORMAT */
+}
+
+__attribute__((noinline))
+void case6c_indirect_format(const char **slot)
+{
+    const char *p = *slot;             /* loaded from memory, not a literal */
+    access_log(2, p);
+}
+
+/* ---- entry point; keeps everything reachable ---- */
+void _start(void)
+{
+    static struct req r;
+    static char buf[8192];
+    static const char *slot = "x";
+    case1_signed_then_sxtw(&r, buf);
+    case2a_store_truncated(&r);
+    case2b_use_truncated(r.fd, buf);
+    case3_signed_min(r.fd, buf, 1);
+    case4_properly_clamped(&r, buf);
+    case5_scanf_stack_dests(buf);
+    case6a_literal_format();
+    case6b_runtime_format(buf);
+    case6c_indirect_format(&slot);
+    for (;;) { }
+}
 '''
 
 
@@ -1190,26 +1328,39 @@ def test_repro_corpus_lengths(repro_bin):
     e = ctx.exports
     w = wrappers_of(ctx)
     assert w[e["body_read"]].kinds["length"] == ["x2"]
-    assert e["case1"] not in w                         # a callee's result is not a parameter
+    assert e["case1_signed_then_sxtw"] not in w            # a load from *r is not a parameter
+    # varargs/va_list past the format are not "copy" sources (no case6* passthrough noise)
+    assert w[e["access_log"]].kinds == {"format": ["x1"], "copy": ["x1"]}
+    assert not any(ctx.name(va).startswith("case6") for va in w)
     got = {(f.func_va, f.kind, f.sink) for f in ARM64ConversionLengthScanner.from_context(ctx).scan()}
     assert got == {
-        (e["case1"], "sext_signed_check", "body_read"),     # cbz is not a lower bound
-        (e["case2_use"], "narrowing_store", "body_read"),   # linked to case2_store's 32-bit store
-        (e["case3"], "signed_clamp", "body_read"),          # min(rem, cap) keeps a negative
-    }                                                       # case4 (<= 0 rejected) and body_read's
-                                                            # own INT_MAX saturation: silent
+        (e["case1_signed_then_sxtw"], "sext_signed_check", "body_read"),  # cbnz is not a lower bound
+        (e["case2b_use_truncated"], "narrowing_store", "body_read"),      # linked to case2a's store
+        (e["case3_signed_min"], "signed_clamp", "body_read"),             # signed min keeps a negative
+    }                                       # case4 (<= 0 rejected, then clamped) and body_read's
+                                            # own unsigned INT_MAX saturation: silent
 
 
 def test_repro_corpus_nine_dests(repro_bin):
     from ablation.analyzers.format_string_scanner_arm64 import ARM64FormatStringScanner
     ctx = BinaryContext.load_or_build(str(repro_bin), force_rebuild=True)
     ctx.infer_wrappers(save=False)
-    (f,) = [f for f in ARM64FormatStringScanner.from_context(ctx).scan() if f.provenance == "unbounded_s"]
+    e = ctx.exports
+    found = ARM64FormatStringScanner.from_context(ctx).scan()
+    (f,) = [f for f in found if f.provenance == "unbounded_s"]
+    assert f.func_va == e["case5_scanf_stack_dests"]
     assert "9 width-less conversions" in f.description
     dest = f.details["dest"]
-    for reg in ("x2", "x7", "stack+0x0", "stack+0x8", "stack+0x10"):
+    for reg in ("x2", "x3", "x4", "x5", "x6", "x7", "stack+0x0", "stack+0x8", "stack+0x10"):
         assert f"-> {reg} [sp+" in dest
+    assert dest.count("saved x30") == 9                     # one x30 clause per dest, never doubled
+    assert "caller's saved x30 (_start)" in dest            # d7 sits above this frame's x30
     assert f.details["smallest"] == "%s (stack+0x10): 4 bytes before the next stack object"
+    # case 6: the runtime-format wrapper calls are reported, the literal one is not
+    prov = {f.func_va: f.provenance for f in found if f.provenance != "unbounded_s"}
+    assert prov.get(e["case6b_runtime_format"]) == "runtime_buffer"
+    assert prov.get(e["case6c_indirect_format"]) == "memory_load"
+    assert e["case6a_literal_format"] not in prov
 
 
 _SPCOPY_ASM = r"""

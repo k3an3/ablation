@@ -47,7 +47,7 @@ from .insn_arm64 import from_capstone
 _MAX_FUNC = 8192
 # bump when inference changes: older inferred records in a cached context are ignored and
 # re-inferred (sink-map records are kept)
-WRAPPERS_VERSION = 3
+WRAPPERS_VERSION = 4
 
 _EXEC_ARGS: Dict[str, Tuple[str, ...]] = {
     "system": ("x0",), "popen": ("x0",), "execve": ("x0", "x1"), "execv": ("x0", "x1"),
@@ -71,7 +71,13 @@ def base_sink_args(name: str) -> Dict[str, Tuple[str, ...]]:
     if name in _LENGTH_ARGS:
         out["length"] = _LENGTH_ARGS[name]
     if name in _SINK_POINTER_ARGS and name not in _EXEC_ARGS:
-        out["copy"] = _SINK_POINTER_ARGS[name]
+        regs = _SINK_POINTER_ARGS[name]
+        if r:
+            # printf family: past the format are varargs / a va_list; a caller that never
+            # set x3 still "passes" its arg3 there, so only the format itself counts
+            regs = tuple(x for x in regs if int(x[1:]) <= int(r[1:]))
+        if regs:
+            out["copy"] = regs
     from .egress_arm64 import OPEN_FUNCS
     if name in OPEN_FUNCS:
         out["open"] = (OPEN_FUNCS[name][0],)

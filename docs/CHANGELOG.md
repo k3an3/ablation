@@ -2,6 +2,23 @@
 
 ---
 
+## v2.89.2
+
+**The reporter's own `abl_repro.c` (cases 1-6) is now the corpus test, verbatim.**
+
+- Wrapper inference: for printf-family sinks only the format register counts as a `copy`
+  source. A varargs / `va_list` slot past it was being counted, so every caller of a format
+  wrapper (`access_log(2, copy)`) looked like a "copy x3" wrapper itself. Bumps the wrapper
+  version, so cached records are re-inferred.
+- Width-less `%s` destination text no longer repeats the saved-x30 distance for the
+  destination closest to it.
+- `tests/test_arm64_audit_gaps.py` builds the reporter's corpus and pins every expectation:
+  case1 `sext_signed_check` -> `body_read`; case2 `narrowing_store` linked to case2a's store;
+  case3 `signed_clamp`; case4 silent; case5 all nine destinations (smallest 4 bytes, `d7`
+  above the frame's saved x30); case6b / 6c reported, case6a not; no case6* wrappers.
+
+---
+
 ## v2.89.1
 
 **The abl_repro corpus: four lengths cases through a vendor `body_read`, nine width-less

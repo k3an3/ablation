@@ -573,7 +573,7 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
             return ("", None) if budget else ""
         n, what, lr, note = lay.extent(off)
         if lr is not None:
-            tail = f"; {lr} bytes to saved x30"
+            tail = "" if what == "saved x30" else f"; {lr} bytes to saved x30"
         else:
             via = []
             for caller, c in self._callers.get(fva, []):
