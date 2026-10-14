@@ -160,6 +160,9 @@ def _add_taint_args(p) -> None:
                         'what it points at), :val (scalar result), :xN (fills buffer at xN)')
     p.add_argument('--sinks', metavar='SPEC[,SPEC]',
                    help='extra sinks, NAME or 0xVA, optional :xN[+xM] = guarded arguments')
+    p.add_argument('--show-suppressed', action='store_true',
+                   help='also list findings suppressed as unreachable (no caller, address never '
+                        'taken) or gated on a global this binary never writes, with the reason')
     p.add_argument('--summarise-opaque', action='store_true',
                    help='a call with no model that receives attacker data taints its result '
                         '(findings through it are marked lower confidence)')
@@ -177,6 +180,46 @@ def _ensure_wrappers(args, ctx) -> None:
     if getattr(args, 'sink_wrappers', False):
         print(SinkWrapperInferer.report(wrappers_of(ctx)))
         print()
+
+
+def _reach_filter(args, ctx, findings, site_attr: str):
+    """Label findings with reachability / registration / config-gate facts (arm64) and
+    split off the suppressed ones (unreachable code, branches gated on a never-written
+    global). Suppressed findings are counted with reasons, listed with --show-suppressed:
+    never dropped silently. Returns the findings to report."""
+    if ctx.arch != 'arm64' or not findings:
+        return findings
+    from collections import Counter
+    from ablation.analyzers.reachability_arm64 import Reachability
+    R = Reachability(ctx)
+    shown, hidden = [], []
+    for f in findings:
+        label, suppressed, reg = R.classify(f.func_va, getattr(f, site_attr))
+        for k, v in (("reach", label), ("registered", reg)):
+            if not v:
+                continue
+            if hasattr(f, 'details'):
+                f.details[k] = v
+            elif hasattr(f, 'note'):
+                f.note = "; ".join(x for x in (f.note, v) if x)
+            elif hasattr(f, 'description'):
+                f.description += f" [{v}]"
+        (hidden if suppressed else shown).append(f)
+    if hidden:
+        why = Counter(("unreachable" if "unreachable" in (getattr(f, 'details', {}) or {}).get('reach', '')
+                       or "unreachable" in getattr(f, 'note', '') + getattr(f, 'description', '')
+                       else "gated on a never-written global") for f in hidden)
+        reasons = ", ".join(f"{n} {k}" for k, n in why.items())
+        msg = f"[*] {len(hidden)} finding(s) suppressed ({reasons})"
+        if getattr(args, 'show_suppressed', False):
+            print(msg + ": listed with their reasons (marked SUPPRESSED)", file=sys.stderr)
+            for f in hidden:
+                if hasattr(f, 'severity'):
+                    f.severity = f"SUPPRESSED {f.severity}"
+            return shown + hidden
+        print(msg + "; --show-suppressed lists them", file=sys.stderr)
+        print(msg + "; --show-suppressed lists them")
+    return shown
 
 
 def _add_raw_args(p) -> None:
@@ -266,6 +309,7 @@ def cmd_taint(args):
         tracker = ARM64TaintTracker.from_context(ctx)
         _apply_taint_args(args, tracker)
         findings = tracker.run_interprocedural(depth=getattr(args, 'depth', 4))
+        findings = _reach_filter(args, ctx, findings, 'sink_va')
         if not findings:
             print("No taint paths found.")
             return
@@ -364,7 +408,7 @@ def cmd_lengths(args):
     conv = ARM64ConversionLengthScanner.from_context(ctx)
     conv.snprintf_rejects_huge = rejects
     _apply_taint_args(args, conv)
-    conv_found = conv.scan(depth=args.depth)
+    conv_found = _reach_filter(args, ctx, conv.scan(depth=args.depth), 'site_va')
     under = ARM64LengthUnderflowScanner.from_context(ctx)
     under.snprintf_rejects_huge = rejects
     _apply_taint_args(args, under)
@@ -394,6 +438,26 @@ def cmd_wrappers(args):
     from ablation.analyzers.sink_wrappers import SinkWrapperInferer, wrappers_of
     if not getattr(args, 'sink_wrappers', False):
         print(SinkWrapperInferer.report(wrappers_of(ctx)))
+
+
+def cmd_reach(args):
+    """ARM64 reachability: registered handlers, unreachable functions."""
+    p = str(_require_binary(args.binary))
+    ctx = _load_ctx(args, p)
+    if ctx.arch != 'arm64':
+        print(f"reach supports ARM64 (binary arch: {ctx.arch})")
+        return
+    from ablation.analyzers.reachability_arm64 import Reachability
+    R = Reachability(ctx)
+    regs = R.registrations()
+    print(f"registrations: {len(regs)}")
+    for r in sorted(regs, key=lambda r: r.key):
+        print(f"  {r.key!r:<32} -> {ctx.name(r.handler)} (0x{r.handler:x})  via {r.how}")
+    dead = [f for f in ctx.func_starts if f not in R.live()]
+    print(f"\nlive functions: {len(R.live())}; unreachable: {len(dead)} "
+          f"(no path from an entry, export or address-taken function)")
+    for f in dead[:args.limit]:
+        print(f"  0x{f:x}  {ctx.name(f):<32} {R.function_status(f)}")
 
 
 def cmd_window(args):
@@ -829,6 +893,7 @@ def cmd_fmtstr(args):
     else:
         scanner = FormatStringScanner.from_context(ctx)
     findings = scanner.scan()
+    findings = _reach_filter(args, ctx, findings, 'call_va')
 
     if args.json:
         import json
@@ -855,6 +920,7 @@ def cmd_heap(args):
     else:
         scanner = HeapVulnScanner.from_context(ctx)
     findings = scanner.scan()
+    findings = _reach_filter(args, ctx, findings, 'site_va')
 
     if args.json:
         import json
@@ -1362,6 +1428,13 @@ def main():
     p_wr.add_argument('binary')
     _add_raw_args(p_wr)
     p_wr.set_defaults(func=cmd_wrappers)
+
+    p_reach = sub.add_parser('reach', help='ARM64 reachability: handler registrations (setter / '
+                                            'table), unreachable functions')
+    p_reach.add_argument('binary')
+    _add_raw_args(p_reach)
+    p_reach.add_argument('--limit', type=int, default=50)
+    p_reach.set_defaults(func=cmd_reach)
 
     p_window = sub.add_parser('window', help='annotated disassembly window around a VA')
     p_window.add_argument('binary')

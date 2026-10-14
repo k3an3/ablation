@@ -650,3 +650,70 @@ def test_path_sensitive_slot_resolution(path_so):
     assert f.provenance == "unresolved" and f.details["bucket"] == "unresolved"
     assert "ret(calloc)" in f.description and "lit %d" in f.description
     assert t["same_lit"] not in fs                          # same literal on both paths
+
+
+# ── round 2: reachability, registrations, config gates ───────────────────────
+
+_REACH_SRC = r'''
+typedef unsigned long size_t;
+extern int printf(const char *, ...);
+extern long recv(int, void *, size_t, int);
+extern void http_register(const char *path, void (*h)(int));
+struct cfg { char pad[0x50]; const char *errlog; };
+extern struct cfg *g_cfg;
+int g_debug;
+#define H __attribute__((noinline, used, visibility("hidden")))
+H void h_live(int fd) { char r[64]; recv(fd, r, 63, 0); r[63] = 0; printf(r); }
+H void h_dead(int fd) { char r[64]; recv(fd, r, 63, 0); r[63] = 0; printf(r); }
+H void h_dead2(int fd) { h_dead(fd); }
+H void h_table(int fd) { char r[64]; recv(fd, r, 63, 0); r[63] = 0; printf(r); }
+struct route { const char *k; void (*h)(int); };
+const struct route routes[] = { { "/tbl", h_table } };
+H void err_log(int fd) { char r[64]; recv(fd, r, 63, 0); r[63] = 0; if (g_cfg->errlog) printf(r); }
+H void dbg_log(int fd) { char r[64]; recv(fd, r, 63, 0); r[63] = 0; if (g_debug) printf(r); }
+void set_debug(int v) { g_debug = v; }
+void init(void) { http_register("/live", h_live); }
+__attribute__((visibility("hidden"))) struct cfg *g_local;
+H void err_local(int fd) { char r[64]; recv(fd, r, 63, 0); r[63] = 0; if (g_local->errlog) printf(r); }
+void serve(int fd) { err_log(fd); dbg_log(fd); err_local(fd); }
+'''
+
+
+@pytest.fixture(scope="module")
+def reach_so(tmp_path_factory):
+    return build_variants(tmp_path_factory, src_text=_REACH_SRC,
+                          variants={"O2": ["-O2", "-Wno-format-security"]})["O2"]
+
+
+def test_reachability_and_gates(reach_so):
+    from ablation.analyzers.reachability_arm64 import Reachability
+    ctx, t = _wctx(reach_so)
+    R = Reachability(ctx)
+    regs = {(r.handler, r.key) for r in R.registrations()}
+    assert (t["h_live"], "/live") in regs and (t["h_table"], "/tbl") in regs
+    assert R.function_status(t["h_dead2"]) == "unreachable: no callers, address never taken"
+    assert R.function_status(t["h_dead"]).startswith("unreachable: only called from unreachable code")
+    assert R.function_status(t["h_live"]) is None and R.function_status(t["h_table"]) is None
+
+    def site(fn):
+        from ablation.analyzers.format_string_scanner_arm64 import ARM64FormatStringScanner
+        return next(f.call_va for f in ARM64FormatStringScanner.from_context(ctx).scan() if f.func_va == t[fn])
+
+    label, sup, _ = R.classify(t["dbg_log"], site("dbg_log"))
+    assert not sup and "is non-zero" in label and "written at" in label         # set_debug writes it
+    label, sup, _ = R.classify(t["err_log"], site("err_log"))
+    assert not sup and "[g_cfg]->+0x50" in label and "imported global" in label   # may be set elsewhere
+    label, sup, _ = R.classify(t["err_local"], site("err_local"))
+    assert sup and "->+0x50" in label and "dead unless set from outside" in label
+    label, sup, note = R.classify(t["h_dead"], site("h_dead"))
+    assert sup and label.startswith("unreachable")
+    assert "registered as '/live'" in R.classify(t["h_live"], site("h_live"))[2]
+
+
+def test_cli_show_suppressed(reach_so):
+    r = _cli("fmtstr", reach_so)
+    assert "2 finding(s) suppressed (1 unreachable, 1 gated on a never-written global)" in r.stdout
+    r = _cli("fmtstr", reach_so, "--show-suppressed")
+    assert r.stdout.count("SUPPRESSED") == 2 and "unreachable: only called" in r.stdout
+    r = _cli("reach", reach_so)
+    assert "'/live'" in r.stdout and "'/tbl'" in r.stdout
