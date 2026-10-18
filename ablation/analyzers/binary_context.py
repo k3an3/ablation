@@ -2658,10 +2658,12 @@ class BinaryContext:
             starts.update(scanner.bl_targets() if pdata else scanner.scan())
             self._extract_pe_arm64_thunks(regions)
         if self.arch == 'x86_64':
+            # the sweep finds boundaries without .pdata too (after ret / jmp + padding);
+            # the prologue byte scan below would add starts at every mid-function
+            # `sub rsp, N` / `push rbx`
             starts |= self._x64_pe_sweep(binary, starts, bool(pdata))
-            if pdata:
-                self.func_starts = sorted(starts)
-                return
+            self.func_starts = sorted(starts)
+            return
 
         _PROLOGUES: Dict[str, List[bytes]] = {
             'x86_64': [
@@ -3048,7 +3050,7 @@ class BinaryContext:
 
     def _save_json(self, path: Path) -> None:
         payload = {
-            "cache_version": 5,
+            "cache_version": 6,
             "path": self.path,
             "sha256": self.sha256,
             "base_va": self.base_va,
@@ -3077,8 +3079,9 @@ class BinaryContext:
             # v3 and older: PE arch read as x86_64 for every machine (lief enum moved),
             # no PE arm64 paths, no GOT/IAT-indirect call edges
             raise ValueError("stale cache: built before PE machine detection fix; rebuild required")
-        if payload["cache_version"] < 5 and payload.get("arch") == "x86_64":
-            # v4: x86-64 PE function starts from a prologue byte scan, unlabelled IAT calls
+        if payload["cache_version"] < 6 and payload.get("arch") == "x86_64":
+            # v4: x86-64 PE function starts from a prologue byte scan, unlabelled IAT calls;
+            # v5: the byte scan still ran on PE images without .pdata
             raise ValueError("stale cache: x86-64 built before the .pdata / IAT sweep; rebuild required")
         ctx = cls()
         ctx.path = orig_path or payload.get("path", "")

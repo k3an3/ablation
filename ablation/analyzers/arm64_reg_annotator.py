@@ -548,7 +548,8 @@ class ARM64RegAnnotator:
 
     @staticmethod
     def _drop_slots(regs: Dict, base: str) -> None:
-        for k in [k for k in regs if isinstance(k, tuple) and k[1] == base]:
+        # regs also holds 1-tuple markers (('prol',), ('spd',)) for lifted x86: slots only
+        for k in [k for k in regs if isinstance(k, tuple) and len(k) == 3 and k[0] == 'slot' and k[1] == base]:
             del regs[k]
 
     def _store(self, insn: Insn, regs: Dict) -> None:

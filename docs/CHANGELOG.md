@@ -2,6 +2,26 @@
 
 ---
 
+## v2.90.1
+
+**Fix: every x86-64 analyzer died with `tuple index out of range`.**
+
+- `ARM64RegAnnotator._drop_slots` indexed `k[1]` on every tuple key in the register
+  state, but the x86-64 lift keeps 1-tuple markers there (`('prol',)`, `('spd',)`). Any
+  instruction that moves sp or x29 after the prologue (`leave`, `mov rsp, rbp`, MSVC
+  `lea rsp, [rbp+N]`) raised, which took down reach, taint, lengths, wrappers, heap,
+  fmtstr and overflow on x86-64. Only `('slot', base, off)` keys are dropped now.
+- x86-64 PE without `.pdata`: function starts come from the linear sweep only; the
+  prologue byte scan invented starts at mid-function `sub rsp, N`, which made real
+  functions look caller-less (findings suppressed as unreachable). Cache version 6
+  (x86-64 caches rebuild).
+- `--debug` works after the subcommand (`ablation reach x.dll --debug`); argparse
+  rejected it before the traceback switch could run.
+- Regression tests: an assembly PE with all three frame-pointer epilogues through every
+  x86-64 command, and `--debug` after the subcommand.
+
+---
+
 ## v2.90.0
 
 **PE vuln hunting: x86-64 PE (and ELF) through the same passes as AArch64; Windows API

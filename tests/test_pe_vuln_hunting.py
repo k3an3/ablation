@@ -309,6 +309,92 @@ def test_heap_overflow_egress_windows(win, arch):
     assert em.readers[path] == {e["serve_log"]}
 
 
+# frame-pointer epilogues that move sp from rbp after the prologue: leave, mov rsp, rbp,
+# and MSVC's lea rsp, [rbp+N]
+_FRAMED_ASM = r"""
+    .intel_syntax noprefix
+    .text
+    .globl fp_leave
+fp_leave:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 0x60
+    mov r9d, 0
+    mov r8d, 0x40
+    lea rdx, [rbp-0x40]
+    call qword ptr [rip+__imp_recv]
+    lea rcx, [rbp-0x40]
+    call qword ptr [rip+__imp_system]
+    leave
+    ret
+    .globl fp_movrsp
+fp_movrsp:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 0x48
+    lea rcx, [rbp-0x30]
+    call fp_leave
+    mov rsp, rbp
+    pop rbp
+    ret
+    .globl fp_learsp
+fp_learsp:
+    push rbp
+    push rsi
+    sub rsp, 0x38
+    lea rbp, [rsp+0x30]
+    lea rcx, [rbp-0x10]
+    call fp_movrsp
+    lea rsp, [rbp+0x8]
+    pop rsi
+    pop rbp
+    ret
+"""
+
+
+@pytest.fixture(scope="module")
+def framed(tmp_path_factory):
+    if not all(shutil.which(t) for t in ("clang", "lld-link", "llvm-dlltool")):
+        pytest.skip("clang + lld-link + llvm-dlltool required for PE fixtures")
+    d = tmp_path_factory.mktemp("peframed")
+    (d / "f.s").write_text(_FRAMED_ASM)
+    libs = []
+    for lib in ("msvcrt", "ws2_32"):
+        (d / f"{lib}.def").write_text(_DEFS[lib])
+        subprocess.run(["llvm-dlltool", "-m", "i386:x86-64", "-d", str(d / f"{lib}.def"),
+                        "-l", str(d / f"{lib}.lib")], check=True)
+        libs.append(str(d / f"{lib}.lib"))
+    obj, dll = d / "f.obj", d / "f.dll"
+    subprocess.run(["clang", "--target=x86_64-pc-windows-msvc", "-c", str(d / "f.s"), "-o", str(obj)], check=True)
+    subprocess.run(["lld-link", "/dll", "/noentry", "/nodefaultlib", "/machine:x64", "/export:fp_learsp",
+                    "/export:fp_movrsp", "/export:fp_leave", str(obj), *libs, f"/out:{dll}"], check=True)
+    return dll
+
+
+def test_x64_frame_pointer_epilogues_all_commands(framed):
+    """`mov rsp, rbp` / `leave` after the prologue moves sp from x29: dropping the frame
+    slots must skip the annotator's 1-tuple markers (('prol',), ('spd',))."""
+    from ablation.analyzers.arm64_reg_annotator import ARM64RegAnnotator
+    ctx = _ctx(framed)
+    ra = ARM64RegAnnotator.from_context(ctx)
+    starts = ctx.func_starts
+    for i, fva in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else fva + 0x400
+        ra.annotate_calls(fva, end)
+        ra.annotate_calls_cfg(fva, end)
+    for c in ("reach", "taint", "lengths", "wrappers", "heap", "fmtstr", "overflow", "egress"):
+        r = _cli(c, framed)
+        assert r.returncode == 0 and "error:" not in r.stderr, (c, r.stderr[-400:])
+    r = _cli("taint", framed)
+    assert "system" in r.stdout                           # recv -> system through the rbp frame
+
+
+def test_cli_debug_flag_after_subcommand(framed):
+    r = _cli("reach", framed, "--debug")
+    assert r.returncode == 0 and "unrecognized arguments" not in r.stderr
+
+
 def test_cli_x64_pe_names_x86_registers(core):
     r = _cli("wrappers", core["x64"])
     assert "body_read" in r.stdout and "[length r8 (derived)]" in r.stdout

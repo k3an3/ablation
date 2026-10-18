@@ -1736,7 +1736,9 @@ def main():
     p_sigs.add_argument('--list', action='store_true', help='list all signatures in the library')
     p_sigs.set_defaults(func=cmd_sigs)
 
-    args = parser.parse_args()
+    # --debug is accepted anywhere (argparse would reject it after the subcommand)
+    debug = '--debug' in sys.argv[1:]
+    args = parser.parse_args([a for a in sys.argv[1:] if a != '--debug'])
     out = sys.stdout
     try:
         args.func(args)
@@ -1744,7 +1746,7 @@ def main():
         sys.exit(0)
     except Exception as e:
         print(f"error: {e}", file=sys.stderr)
-        if '--debug' in sys.argv:
+        if debug:
             raise
         sys.exit(1)
     finally:
