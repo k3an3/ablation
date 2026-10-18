@@ -2,6 +2,43 @@
 
 ---
 
+## v2.90.0
+
+**PE vuln hunting: x86-64 PE (and ELF) through the same passes as AArch64; Windows API
+and UCRT knowledge for both.** See `docs/module-reference/pe-vuln-hunting.md`.
+
+- `lift_x86_64.X64Lifter`: x86-64 -> the AArch64 Insn model (Win64 and SysV register
+  maps, return-address slot, IAT calls as direct calls, flags only where read, `__chkstk`
+  frames, conditional tail calls). `decode.decoder_for(ctx)` picks the front end; every
+  Insn-model pass (taint, tag scanners, fmtstr, lengths, frame layout, call annotation,
+  wrappers, reachability, egress, libc roles, path solver) uses it.
+- CLI: `lengths`, `wrappers`, `reach`, `egress`, `overflow` run on x86-64 (PE and ELF);
+  `taint`, `fmtstr`, `heap` use the Insn-model passes on x86-64 PE (ELF keeps the older
+  x86 engines). Reports print x86 register names and "saved return address".
+- ABI awareness: stack arguments behind the Win64 home area, 4 / 6 / 8 argument registers
+  in width-less `%s` destinations and slot maps, Win64 / SysV varargs save areas.
+- x86-64 PE loader: `.pdata` (chained fragments dropped) + leaf functions from the gaps +
+  call targets, replacing the prologue byte scan; `call / jmp [rip+IAT]` edges labelled;
+  `jmp [rip+IAT]` thunks named. Cache version 5.
+- AArch64 PE: the taint tracker maps the image at imagebase (it read sections at their
+  RVAs); dllimport `adrp ; ldr ; blr` through the IAT resolves to the import.
+- `winapi.py`: Windows sources (ReadFile, InternetReadFile, WinHttpReadData, ...), exec /
+  DLL-load sinks (WinExec, CreateProcess, ShellExecute, LoadLibrary), copies (lstrcpy,
+  wcscpy, RtlMoveMemory, ...), formats (wsprintf, _snprintf, swprintf, *_s), allocators
+  (HeapAlloc, LocalAlloc, VirtualAlloc, MSVC new) and frees (HeapFree's pointer is its
+  third argument), egress (CreateFile access bits, MSVC `_open` flags, WSASend, ...).
+- UCRT: inline `sprintf` / `sscanf` are wrappers of `__stdio_common_vsprintf` /
+  `__stdio_common_vsscanf`; new wrapper kinds `dest` (only for count -1, so `snprintf` is
+  not a width-less finding) and `scanfmt`. Wrapper version 7.
+- PE literals: `.rdata` is read-only data, writable sections are writable; wide (`L"..."`)
+  literals are read as UTF-16LE. `%n` notes follow the MSVC CRT / user32.
+- Egress accepts Windows paths (`C:\...`, `\\server\share`).
+- Underflow scanner: `add r, -N` is a header-size subtraction.
+- `tests/test_pe_vuln_hunting.py`: two PE corpora (abl_repro shapes; Windows API + UCRT
+  shapes) built for x64 and arm64, the SysV corpus, and lifter idioms.
+
+---
+
 ## v2.89.2
 
 **The reporter's own `abl_repro.c` (cases 1-6) is now the corpus test, verbatim.**

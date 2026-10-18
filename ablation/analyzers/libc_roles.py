@@ -158,6 +158,8 @@ class LibcRoleInferer:
 
     def __init__(self, ctx, max_callers: int = 4000, min_sites: int = 3):
         self._ctx = ctx
+        from .decode import decoder_for
+        self._decode = decoder_for(ctx)
         self._max_callers = max_callers
         self._min_sites = min_sites
         self._regions = ctx.image_regions()
@@ -200,7 +202,7 @@ class LibcRoleInferer:
             end = starts[i + 1] if i + 1 < len(starts) else fva + _MAX_BODY
             if end - fva > _MAX_BODY:
                 continue
-            insns = list(from_capstone(self._code(fva, end), fva))
+            insns = self._decode(self._code(fva, end), fva)
             role = body_role(analyse_body(insns))
             if role:
                 roles[fva] = role

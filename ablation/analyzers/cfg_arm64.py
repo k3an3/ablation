@@ -82,7 +82,9 @@ def build_cfg(insns: Sequence[Insn], entry: Optional[int] = None) -> CFG:
     insns = sorted(insns, key=lambda i: i.address)
     if not insns:
         raise ValueError("no instructions")
-    by_addr = {i.address: i for i in insns}
+    by_addr: Dict[int, Insn] = {}
+    for i in insns:
+        by_addr.setdefault(i.address, i)     # lifted x86: micro-ops share one address
     entry = insns[0].address if entry is None else entry
 
     leaders: Set[int] = {entry, insns[0].address}
@@ -91,13 +93,17 @@ def build_cfg(insns: Sequence[Insn], entry: Optional[int] = None) -> CFG:
             t = _branch_target(insn)
             if t is not None and t in by_addr:
                 leaders.add(t)
-            if idx + 1 < len(insns):
-                leaders.add(insns[idx + 1].address)
+            nxt = next((j for j in insns[idx + 1:] if j.address != insn.address), None)
+            if nxt is not None:
+                leaders.add(nxt.address)
 
     blocks: Dict[int, Block] = {}
     cur: Optional[Block] = None
+    prev = None
     for insn in insns:
-        if insn.address in leaders or cur is None:
+        new = insn.address != prev
+        prev = insn.address
+        if (insn.address in leaders and new) or cur is None:
             cur = Block(insn.address)
             blocks[cur.start] = cur
         cur.insns.append(insn)

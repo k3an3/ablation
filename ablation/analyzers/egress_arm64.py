@@ -32,6 +32,7 @@ What it computes
 from __future__ import annotations
 
 import bisect
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
@@ -54,6 +55,14 @@ EGRESS = frozenset({"send", "sendto", "sendmsg", "sendfile", "sendfile64", "SSL_
 _O_WRITE = 0x1 | 0x2 | 0x40 | 0x400            # O_WRONLY | O_RDWR | O_CREAT | O_APPEND
 
 
+_WIN_PATH = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
+
+
+def is_path(text: str) -> bool:
+    """An absolute file path: /var/log/x, C:\\ProgramData\\x, \\\\server\\share\\x."""
+    return text.startswith("/") or bool(_WIN_PATH.match(text))
+
+
 @dataclass
 class OpenSite:
     func: int
@@ -67,6 +76,8 @@ class EgressMap:
     def __init__(self, ctx, extra_egress: Optional[Set[str]] = None):
         from .reachability_arm64 import Reachability
         self._ctx = ctx
+        from .decode import decoder_for
+        self._decode = decoder_for(ctx)
         self._egress = EGRESS | set(extra_egress or ())
         self._R = Reachability(ctx)
         self._starts = ctx.func_starts
@@ -90,7 +101,7 @@ class EgressMap:
         end = self._end(fva)
         for va, data in self._regions:
             if 0 <= fva - va < len(data):
-                return list(from_capstone(data[fva - va:end - va], fva))
+                return self._decode(data[fva - va:end - va], fva)
         return []
 
     def build(self) -> "EgressMap":
@@ -125,7 +136,7 @@ class EgressMap:
                         preg, mreg, kind = OPEN_FUNCS[name]
                         path = self._text(c.args.get(preg))
                         write = self._is_write(kind, c.args.get(mreg) if mreg else None)
-                    if not path or not path.startswith("/"):
+                    if not path or not is_path(path):
                         continue
                     self.opens.append(OpenSite(fva, c.site_va, path, write, name))
                     (self.writers if write else self.readers)[path].add(fva)
@@ -163,6 +174,9 @@ class EgressMap:
         for base, data in self._regions:
             off = v.int_val - base
             if 0 <= off < len(data):
+                from .format_string_scanner_arm64 import ARM64FormatStringScanner
+                if ARM64FormatStringScanner._looks_wide(data, off):
+                    return ARM64FormatStringScanner._wstr(data, off)      # L"C:\\..." / L"w"
                 end = data.find(b"\0", off, off + 256)
                 raw = data[off:end] if end > off else b""
                 return raw.decode() if raw and all(32 <= ch < 127 for ch in raw) else None
@@ -187,11 +201,12 @@ class EgressMap:
             return True
         if v is None:
             return False
-        if kind == "mode":
+        if kind in ("mode", "wmode"):
             mode = self._text(v)
             return bool(mode) and any(ch in mode for ch in "wa+")
         if v.kind == "const":
-            return bool(v.int_val & _O_WRITE)
+            from .winapi import WRITE_MASK
+            return bool(v.int_val & WRITE_MASK.get(kind, _O_WRITE))
         return False
 
     def _stored_global(self, insns, call_site: int) -> Optional[int]:
@@ -266,7 +281,7 @@ class EgressMap:
         out: Dict[str, Set[int]] = defaultdict(set)
         for va, sites in ctx._str_xref_idx.items():
             text = ctx.strings.get(va, "")
-            if len(text) > 1 and text.startswith("/") and " " not in text and "%" not in text:
+            if len(text) > 1 and is_path(text) and " " not in text and "%" not in text:
                 for site in sites:
                     f = ctx.func_containing(site)
                     if f is not None:

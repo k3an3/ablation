@@ -76,6 +76,8 @@ class Registration:
 class Reachability:
     def __init__(self, ctx):
         self._ctx = ctx
+        from .decode import decoder_for
+        self._decode = decoder_for(ctx)
         self._regions = ctx.image_regions()
         self._starts = list(ctx.func_starts)
         self._start_set = set(self._starts)
@@ -310,7 +312,7 @@ class Reachability:
         end = self._starts[i] if i < len(self._starts) and self._starts[i] - fva <= _MAX_FUNC else fva + _MAX_FUNC
         for va, data in self._regions:
             if 0 <= fva - va < len(data):
-                return list(from_capstone(data[fva - va:end - va], fva))
+                return self._decode(data[fva - va:end - va], fva)
         return []
 
     def gate(self, fva: int, site: int) -> Optional[Tuple[str, bool]]:

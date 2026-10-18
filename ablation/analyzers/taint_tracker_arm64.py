@@ -978,6 +978,21 @@ def _name_at(symbols: Dict[int, str], va: int, tol: int = _PLT_TOL) -> Optional[
     return None
 
 
+def _flat_pe(ctx):
+    """(image bytes from imagebase, imagebase, code start, code end) of a PE: sections
+    copied to their RVAs, so data[va - base] is the loaded byte."""
+    regions = ctx.image_regions()
+    base = ctx.base_va
+    size = max((va + len(d) for va, d in regions), default=base) - base
+    img = bytearray(size)
+    for va, d in regions:
+        img[va - base:va - base + len(d)] = d
+    starts = [s for s in ctx.func_starts if base <= s < base + size]
+    lo = min(starts, default=base)
+    hi = max((va + len(d) for va, d in regions if va <= lo < va + len(d)), default=base + size)
+    return bytes(img), base, lo, hi
+
+
 def _load_elf(path: str):
     try:
         import lief
@@ -1051,6 +1066,8 @@ class ARM64TaintTracker:
         self._user_sources: Dict[str, str] = {}               # name -> "ret" | "val" | "xN"
         self._user_sink_args: Dict[str, Tuple[str, ...]] = {}  # name -> arg regs (() = all)
         self.summarise_opaque = False
+        from .lift_x86_64 import AAPCS64
+        self._abi = AAPCS64                                    # lifted x86-64: Win64 / SysV
         self._wrappers: Dict[int, object] = {}                 # va -> sink_wrappers.SinkWrapper
         # name -> VA of functions defined here (a PLT call to one of them is followed)
         self._local_funcs: Dict[str, int] = {
@@ -1124,10 +1141,15 @@ class ARM64TaintTracker:
     def from_context(cls, ctx, custom_sinks: Optional[Set[str]] = None,
                      custom_sources: Optional[Set[str]] = None) -> "ARM64TaintTracker":
         """Build from a BinaryContext: file layout from the ELF (or the raw image), names from ctx."""
+        from .decode import decoder_for
+        from .lift_x86_64 import is_pe
         if getattr(ctx, "raw", None):
             data = Path(ctx.path).read_bytes()
             base_va = text_start = ctx.base_va
             text_end, syms = base_va + len(data), {}
+        elif is_pe(ctx):
+            data, base_va, text_start, text_end = _flat_pe(ctx)
+            syms = {}
         else:
             data, base_va, text_start, text_end, syms = _load_elf(ctx.path)
         syms.update(ctx.plt)                                   # stub VA -> import name
@@ -1138,6 +1160,9 @@ class ARM64TaintTracker:
             if text_start <= fva < text_end and fva not in syms:
                 syms[fva] = f"fn_{fva:x}"
         inst = cls(data, base_va, text_start, text_end, syms, custom_sinks, custom_sources)
+        inst._decode = decoder_for(ctx)
+        from .lift_x86_64 import abi_of
+        inst._abi = abi_of(ctx)
         # vendor wrappers (sink_wrappers): exec / format wrappers are sinks at their call
         # sites; length wrappers are looked up by the length scanners (_wrapper_regs)
         from .sink_wrappers import wrappers_of
@@ -1235,7 +1260,8 @@ class ARM64TaintTracker:
         if offset < 0 or offset + length > len(self._data):
             return []
         snippet = self._data[offset:offset + length]
-        return list(from_capstone(snippet, func_va))
+        dec = getattr(self, "_decode", None)
+        return dec(snippet, func_va) if dec else list(from_capstone(snippet, func_va))
 
     def _scan_func_binary(self, func_va: int, func_end: int,
                           init_labels: Optional[Set[str]] = None) -> List[TaintFindingARM64]:
@@ -1268,6 +1294,17 @@ class ARM64TaintTracker:
 
         for insn in self._insns_for_func(fva, fend):
             m = insn.mnemonic
+            if m.startswith("b.") and insn.imm(0) is not None and not fva <= insn.imm(0) < fend:
+                # conditional tail call (x86 `jne other_function`): the callee sees this
+                # state on one path; the fall-through path keeps it
+                tgt = insn.imm(0)
+                callee = _name_at(self._syms, tgt)
+                saved = eng.state.copy()
+                self._chk_site = None
+                self._on_call(eng, insn, tgt, CHK_BASE.get(callee, callee), fva, func_name,
+                              findings, depth, enqueue)
+                eng.state = saved
+                continue
             target = insn.imm(0) if m in ("bl", "b") else None
             if m == "b" and (target is None or fva <= target < fend):
                 eng.step(insn)          # intra-function branch

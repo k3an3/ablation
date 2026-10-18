@@ -32,6 +32,25 @@ from .insn_arm64 import Insn, from_capstone
 _STACK_ADDR = re.compile(r"^(sp|x29)(?:([+-])0x([0-9a-f]+))?$")
 
 
+def x86_prologue_op(insn: Insn) -> bool:
+    """A lifted x86-64 prologue instruction: push / callee-save or home-area spill to
+    [sp, #k], sub sp, frame-pointer setup. The first other instruction ends the prologue;
+    pushes after it (outgoing arguments, SysV) move sp inside the body."""
+    m = insn.mnemonic
+    mem = insn.first_mem()
+    rd, rn = insn.reg(0), insn.reg(1)
+    if m in ("str", "stp") and mem is not None and mem.base == "sp" and mem.writeback != "post":
+        return True
+    if m == "sub" and rd is not None and rd.name == "sp" and rn is not None and rn.name == "sp":
+        return True
+    return m in ("mov", "add") and rd is not None and rd.name == "x29" and rn is not None and rn.name == "sp"
+
+
+def is_lifted(insns: Sequence[Insn]) -> bool:
+    """The stream comes from lift_x86_64 (it opens with the size-0 return-address push)."""
+    return bool(insns) and insns[0].size == 0 and insns[0].mnemonic == "str"
+
+
 @dataclass
 class FrameLayout:
     fva: int
@@ -45,18 +64,20 @@ class FrameLayout:
         return -self.sp_body
 
     @classmethod
-    def of(cls, code: bytes, fva: int) -> "FrameLayout":
+    def of(cls, code: bytes, fva: int, decode=None) -> "FrameLayout":
         lay = cls(fva)
-        insns = list(from_capstone(code, fva))
+        insns = decode(code, fva) if decode else list(from_capstone(code, fva))
         sp = 0
         fp = None
         in_prologue = True
         objects = set()
+        lifted = is_lifted(insns)
         for insn in insns:
             m = insn.mnemonic
             mem = insn.first_mem()
             if in_prologue:
-                if m in ("bl", "blr", "b", "ret", "br") or m.startswith("b.") or m in ("cbz", "cbnz", "tbz", "tbnz"):
+                if m in ("bl", "blr", "b", "ret", "br") or m.startswith("b.") or m in ("cbz", "cbnz", "tbz", "tbnz") \
+                        or (lifted and not x86_prologue_op(insn)):
                     in_prologue = False
                 elif m == "sub" and insn.reg(0) is not None and insn.reg(0).name == "sp" \
                         and insn.reg(1) is not None and insn.reg(1).name == "sp" and insn.imm(2) is not None:
@@ -123,6 +144,13 @@ class FrameLayout:
         return nxt - off, what, None, note
 
 
+def _reg_label(reg: str, abi) -> str:
+    """'x19' -> 'x19', or the x86-64 register it stands for on a lifted image ('rbx')."""
+    if abi is None or not abi.regmap:
+        return reg
+    return next((x for x, a in abi.regmap.items() if a == reg), reg)
+
+
 def _slot_class(v, code_lo: int, code_hi: int, base: int) -> Tuple[str, str]:
     """(class, text) of a stale register value."""
     while v is not None and v.kind == "copy":
@@ -141,16 +169,18 @@ def _slot_class(v, code_lo: int, code_hi: int, base: int) -> Tuple[str, str]:
 def conversion_map(layout: FrameLayout, args: Dict, fmt_index: int, gp_slots: Optional[int],
                    ret_sites: Sequence[int], image: Tuple[int, int], base: int,
                    tainted_slots: Optional[Dict[int, Iterable[str]]] = None,
-                   max_conv: int = 64) -> Tuple[List[str], Dict]:
+                   max_conv: int = 64, abi=None) -> Tuple[List[str], Dict]:
     """What conversion i (1-based, the same for %i$) of a controllable format reads at a
     variadic call whose format is argument x<fmt_index> of the callee, made from a function
     with `layout`. args: the call site's register values. gp_slots: GP registers in the
     callee's save area (default 7 - fmt_index). Returns (lines, leak summary)."""
-    n_gp = gp_slots if gp_slots is not None else 7 - fmt_index
+    arg_regs = abi.arg_regs if abi is not None else tuple(f"x{i}" for i in range(8))
+    sbase = abi.stack_arg_base if abi is not None else 0
+    n_gp = gp_slots if gp_slots is not None else len(arg_regs) - 1 - fmt_index
     lo, hi = image
     out: List[Tuple[int, str, str]] = []                # (index, class, text)
     for i in range(1, n_gp + 1):
-        reg = f"x{fmt_index + i}"
+        reg = arg_regs[fmt_index + i] if fmt_index + i < len(arg_regs) else f"x{fmt_index + i}"
         cls, text = _slot_class(args.get(reg), lo, hi, base)
         out.append((i, cls, f"{reg} {text}"))
     lr = layout.lr_slot()
@@ -158,26 +188,28 @@ def conversion_map(layout: FrameLayout, args: Dict, fmt_index: int, gp_slots: Op
     j = 0
     while n_gp + j + 1 <= max_conv:
         i = n_gp + j + 1
-        o = layout.sp_body + 8 * j
+        k = sbase + 8 * j                                # sp-relative slot at the call
+        o = layout.sp_body + k
         if o >= 16:
             break
         reg = layout.saved.get(o)
         if reg == "x30":
             ks = (", ".join(f"base+{r - base:#x}" for r in sorted(set(ret_sites))[:4])
                   or "base+K, K unknown: no direct caller in the binary")
-            out.append((i, "code", f"[sp+{8 * j:#x}] saved x30: return address into the caller ({ks}): "
+            what = "saved x30" if abi is None or abi.name == "aapcs64" else "saved return address"
+            out.append((i, "code", f"[sp+{k:#x}] {what}: return address into the caller ({ks}): "
                                    f"code pointer disclosure, defeats PIE"))
         elif reg == "x29":
-            out.append((i, "stack", f"[sp+{8 * j:#x}] saved x29: stack address disclosure (defeats stack ASLR)"))
+            out.append((i, "stack", f"[sp+{k:#x}] saved x29: stack address disclosure (defeats stack ASLR)"))
         elif reg:
-            out.append((i, "saved", f"[sp+{8 * j:#x}] saved {reg} (the caller's callee-saved register)"))
+            out.append((i, "saved", f"[sp+{k:#x}] saved {_reg_label(reg, abi)} (the caller's callee-saved register)"))
         elif j in tainted_slots:
-            out.append((i, "attacker", f"[sp+{8 * j:#x}] attacker bytes ({','.join(sorted(tainted_slots[j]))}): "
+            out.append((i, "attacker", f"[sp+{k:#x}] attacker bytes ({','.join(sorted(tainted_slots[j]))}): "
                                        f"a %n / %s target can be placed here"))
         elif o >= 0:
-            out.append((i, "unknown", f"[sp+{8 * j:#x}] caller's caller frame (unknown)"))
+            out.append((i, "unknown", f"[sp+{k:#x}] caller's caller frame (unknown)"))
         else:
-            out.append((i, "local", f"[sp+{8 * j:#x}] local slot (stale data)"))
+            out.append((i, "local", f"[sp+{k:#x}] local slot (stale data)"))
         j += 1
         if lr is not None and o > lr + 8:
             break

@@ -2600,10 +2600,18 @@ class BinaryContext:
             return starts
         raw = self._pe_read(binary, self.base_va + int(d.rva), int(d.size)) or b""
         step = 12 if self.arch == 'x86_64' else 8
+        self._pdata_ranges = []
         for off in range(0, len(raw) - step + 1, step):
             begin = struct.unpack_from("<I", raw, off)[0]
-            if begin:
-                starts.add(self.base_va + (begin & ~1 if self.arch == 'arm32' else begin))
+            if not begin:
+                continue
+            if self.arch == 'x86_64':
+                end, unwind = struct.unpack_from("<II", raw, off + 4)
+                self._pdata_ranges.append((self.base_va + begin, self.base_va + end))
+                info = self._pe_read(binary, self.base_va + (unwind & ~1), 1)
+                if unwind & 1 or (info and info[0] >> 3 & 4):
+                    continue                    # chained unwind info: a fragment, not a start
+            starts.add(self.base_va + (begin & ~1 if self.arch == 'arm32' else begin))
         return starts
 
     def _extract_pe_arm64_thunks(self, regions) -> None:
@@ -2649,6 +2657,11 @@ class BinaryContext:
             # ARM64 leaf functions may have no .pdata entry; BL targets recover them
             starts.update(scanner.bl_targets() if pdata else scanner.scan())
             self._extract_pe_arm64_thunks(regions)
+        if self.arch == 'x86_64':
+            starts |= self._x64_pe_sweep(binary, starts, bool(pdata))
+            if pdata:
+                self.func_starts = sorted(starts)
+                return
 
         _PROLOGUES: Dict[str, List[bytes]] = {
             'x86_64': [
@@ -2685,9 +2698,105 @@ class BinaryContext:
 
         self.func_starts = sorted(starts)
 
+    def _x64_pe_sweep(self, binary, known: Set[int], have_pdata: bool) -> Set[int]:
+        """One linear Capstone sweep of x64 PE code. Returns extra function starts:
+        direct call targets, tail-jump targets that land on a .pdata function, and leaf
+        functions (no .pdata entry) at the first non-padding instruction of each stretch
+        .pdata does not cover / after each ret or jmp in such a stretch. Records call
+        edges (labelled with the import for call / jmp [rip+IAT] and IAT thunks) and
+        names `jmp [rip+IAT]` thunks in self.plt."""
+        import capstone
+        md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+        md.skipdata = True
+        iat = dict(self.plt)
+        ranges = sorted(getattr(self, "_pdata_ranges", []))
+        rbeg = [b for b, _e in ranges]
+        import bisect as _bs
+
+        def covered(va: int) -> bool:
+            i = _bs.bisect_right(rbeg, va) - 1
+            return i >= 0 and ranges[i][0] <= va < ranges[i][1]
+
+        extra: Set[int] = set()
+        sites: List[Tuple[int, int, str]] = []          # (site, target, kind)
+        code = self._pe_code_regions(binary)
+        lo_hi = [(va, va + len(d)) for va, d in code]
+
+        def in_code(t: int) -> bool:
+            return any(a <= t < b for a, b in lo_hi)
+
+        pad = ("int3", "nop", ".byte")
+        for sec_va, sec in code:
+            boundary = True                              # next real insn may start a leaf
+            after_exit = False                           # previous real insn was ret / jmp
+            padded = False
+            local: Set[int] = set()                      # branch targets inside the current leaf
+            for ins in md.disasm(sec, sec_va):
+                m = ins.mnemonic
+                if m in pad:
+                    padded = padded or m != ".byte"
+                    continue
+                cov = covered(ins.address)
+                if after_exit and not cov and ins.address not in local and (padded or ins.address % 16 == 0):
+                    boundary = True
+                if boundary and not cov:
+                    extra.add(ins.address)
+                    local = set()
+                boundary = after_exit = padded = False
+                ops = ins.op_str
+                if m.startswith("j") and ops.startswith("0x"):
+                    try:
+                        local.add(int(ops, 16))
+                    except ValueError:
+                        pass
+                if m in ("call", "jmp") or m.startswith("notrack"):
+                    tgt = None
+                    if ops.startswith("0x"):
+                        try:
+                            tgt = int(ops, 16)
+                        except ValueError:
+                            tgt = None
+                    elif "rip" in ops and "[" in ops:
+                        try:
+                            disp = ops.split("rip", 1)[1].split("]")[0].replace(" ", "")
+                            tgt = ins.address + ins.size + (int(disp, 16) if disp else 0)
+                        except ValueError:
+                            tgt = None
+                        if tgt is not None and tgt not in iat:
+                            tgt = None
+                    if tgt is not None:
+                        sites.append((ins.address, tgt, m))
+                        if m == "call" and tgt not in iat and in_code(tgt):
+                            extra.add(tgt)
+                if m in ("ret", "jmp") and not cov:
+                    after_exit = True
+        # IAT thunks: a function that is just `jmp [rip+IAT]`
+        for site, tgt, kind in sites:
+            if kind == "jmp" and tgt in iat and (site in known or site in extra):
+                self.plt[site] = iat[tgt]
+        self._x64_sites = sites
+        return extra
+
     def _build_call_graph_pe(self, data: bytes, binary) -> None:
-        """Call graph for PE: vectorized 0xe8 scan (x86_64/x86_32) or BL/B + IAT-call
-        scan (arm64) on executable sections."""
+        """Call graph for PE: vectorized 0xe8 scan (x86_32), linear sweep with IAT
+        labels (x86_64), or BL/B + IAT-call scan (arm64) on executable sections."""
+        if self.arch == 'x86_64' and getattr(self, "_x64_sites", None) is not None:
+            starts = set(self.func_starts)
+            edges: List[Tuple[int, int, str]] = []
+            va_to_export = {va: nm for nm, va in self.exports.items()}
+            for site, tgt, kind in self._x64_sites:
+                owner = self.func_containing(site) or site
+                if kind == "jmp":
+                    if tgt not in self.plt and tgt not in starts:
+                        continue                 # intra-function jump
+                    if owner == site and site in self.plt:
+                        continue                 # the thunk itself
+                    if self.func_containing(tgt) == owner and tgt != owner:
+                        continue
+                label = self.plt.get(tgt, "") or va_to_export.get(tgt, "")
+                edges.append((owner, tgt, label))
+            self.call_edges = edges
+            return
         if self.arch == 'arm64':
             if _NUMPY_OK:
                 self._build_call_graph_arm64(data, binary, regions=self._pe_code_regions(binary),
@@ -2939,7 +3048,7 @@ class BinaryContext:
 
     def _save_json(self, path: Path) -> None:
         payload = {
-            "cache_version": 4,
+            "cache_version": 5,
             "path": self.path,
             "sha256": self.sha256,
             "base_va": self.base_va,
@@ -2968,6 +3077,9 @@ class BinaryContext:
             # v3 and older: PE arch read as x86_64 for every machine (lief enum moved),
             # no PE arm64 paths, no GOT/IAT-indirect call edges
             raise ValueError("stale cache: built before PE machine detection fix; rebuild required")
+        if payload["cache_version"] < 5 and payload.get("arch") == "x86_64":
+            # v4: x86-64 PE function starts from a prologue byte scan, unlabelled IAT calls
+            raise ValueError("stale cache: x86-64 built before the .pdata / IAT sweep; rebuild required")
         ctx = cls()
         ctx.path = orig_path or payload.get("path", "")
         ctx.sha256 = payload["sha256"]

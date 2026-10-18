@@ -101,7 +101,24 @@ class ARM64RegAnnotator:
             inst = cls(binary, ctx.strings, ctx.plt, ctx.exports, ctx.func_starts)
         for va, role in getattr(ctx, "roles", {}).items():   # inferred libc roles
             inst._exports_by_va.setdefault(va, role)
+        from .decode import decoder_for
+        from .lift_x86_64 import abi_of
+        inst._decode = decoder_for(ctx)
+        inst._abi = abi_of(ctx)
         return inst
+
+    def _insns(self, code: bytes, func_va: int, func_end_va: int) -> List[Insn]:
+        """Decoded instructions up to func_end_va or a PLT stub / import thunk (past the
+        function's end)."""
+        out: List[Insn] = []
+        dec = getattr(self, "_decode", None)
+        seq = dec(code, func_va) if dec else (make_insn(ci.address, ci.mnemonic, ci.op_str, size=ci.size)
+                                              for ci in self._md.disasm(code, func_va))
+        for insn in seq:
+            if insn.address >= func_end_va or (insn.address in self._plt and insn.address != func_va):
+                break
+            out.append(insn)
+        return out
 
     @classmethod
     def from_path(cls, path: str) -> "ARM64RegAnnotator":
@@ -138,12 +155,7 @@ class ARM64RegAnnotator:
             for i, r in enumerate(ARG_REGS):
                 regs[r] = RegVal.arg(i, r)
 
-        for ci in self._md.disasm(code, func_va):
-            if ci.address >= func_end_va:
-                break
-            if ci.address in self._plt and ci.address != func_va:
-                break       # ran into a PLT stub / import thunk: past the function's end
-            insn = make_insn(ci.address, ci.mnemonic, ci.op_str, size=ci.size)
+        for insn in self._insns(code, func_va, func_end_va):
             self._step(insn, regs, result)
         return result
 
@@ -170,11 +182,7 @@ class ARM64RegAnnotator:
         code = self._read(func_va, func_end_va - func_va)
         if not code:
             return result
-        insns = []
-        for ci in self._md.disasm(code, func_va):
-            if ci.address >= func_end_va or (ci.address in self._plt and ci.address != func_va):
-                break
-            insns.append(make_insn(ci.address, ci.mnemonic, ci.op_str, size=ci.size))
+        insns = self._insns(code, func_va, func_end_va)
         try:
             cfg = build_cfg(insns, entry=func_va)
         except (ValueError, IndexError):
@@ -267,14 +275,75 @@ class ARM64RegAnnotator:
 
     # ── forward pass step ─────────────────────────────────────────────────────
 
+    def _lifted(self) -> bool:
+        abi = getattr(self, "_abi", None)
+        return abi is not None and abi.name != "aapcs64"
+
+    @staticmethod
+    def _spd(regs: Dict) -> int:
+        """sp now minus sp after the prologue (lifted x86: pushes / pops in the body)."""
+        v = regs.get(('spd',))
+        return v.int_val if v is not None and v.kind == 'const' else 0
+
+    def _x86_sp(self, insn: Insn, regs: Dict) -> bool:
+        """Lifted x86-64: sp moves inside the body (push / pop of outgoing arguments,
+        add rsp after a call). Slots stay keyed by the current sp, stack addresses by the
+        post-prologue sp. True when the instruction was fully handled here."""
+        from .frame_layout_arm64 import x86_prologue_op
+        if regs.get(('prol',)) is None:
+            if x86_prologue_op(insn):
+                return False
+            regs[('prol',)] = RegVal.const(0)
+        mn = insn.mnemonic
+        mem = insn.first_mem()
+        d = None
+        if mn == 'str' and mem is not None and mem.base == 'sp' and mem.writeback == 'pre':
+            d = mem.offset
+        elif mn == 'ldr' and mem is not None and mem.base == 'sp' and mem.writeback == 'post':
+            d = mem.wb_amount or mem.offset
+        elif mn in ('add', 'sub') and insn.reg(0) is not None and insn.reg(0).name == 'sp' \
+                and insn.reg(1) is not None and insn.reg(1).name == 'sp' and insn.imm(2) is not None:
+            d = insn.imm(2) if mn == 'add' else -insn.imm(2)
+        if d is None:
+            return False
+        popped = regs.get(('slot', 'sp', 0)) if mn == 'ldr' else None
+        moved = {('slot', 'sp', k[2] - d): v for k, v in regs.items()
+                 if isinstance(k, tuple) and len(k) == 3 and k[0] == 'slot' and k[1] == 'sp'}
+        for k in [k for k in regs if isinstance(k, tuple) and len(k) == 3 and k[0] == 'slot' and k[1] == 'sp']:
+            del regs[k]
+        regs.update(moved)
+        regs[('spd',)] = RegVal.const(self._spd(regs) + d)
+        if mn == 'str':
+            r = insn.reg(0)
+            if r is not None and r.bits == 64:
+                regs[('slot', 'sp', 0)] = self._reg_val(r, regs)
+        elif mn == 'ldr' and insn.reg(0) is not None:
+            regs[insn.reg(0).name] = popped if popped is not None else RegVal.unknown()
+        return True
+
     def _step(self, insn: Insn, regs: Dict[str, RegVal], result: AnnotationResult) -> None:
         mn = insn.mnemonic
         ops = insn.ops
+        if self._lifted() and self._x86_sp(insn, regs):
+            return
 
         if mn == 'bl':
             target = insn.imm(0)
             if target is not None:
                 self._call(insn.address, target & _MASK64, regs, result)
+                result.calls[-1].next_va = insn.address + insn.size
+            return
+
+        if mn.startswith('b.'):
+            # conditional tail call (x86 `jne other_function`): a call on one path only
+            target = insn.imm(0)
+            if target is not None and (target in self._plt or (
+                    target in self._func_starts and target != result.func_va)
+                    or not (result.func_va <= target < result.func_end_va)):
+                saved = dict(regs)
+                self._call(insn.address, target & _MASK64, regs, result)
+                regs.clear()
+                regs.update(saved)
             return
 
         if mn == 'blr' or mn.startswith('blra'):
@@ -352,6 +421,8 @@ class ARM64RegAnnotator:
             if bval is not None and bval.kind == 'const':
                 val = self._const_or_string((bval.int_val + imm) & _MASK64)
             elif base in ('sp', 'x29'):
+                if base == 'sp':
+                    imm += self._spd(regs)               # lifted x86: relative to the body's sp
                 val = RegVal.stack_addr(f"{base}+0x{imm:x}" if imm >= 0 else f"{base}-0x{-imm:x}")
             elif rd.name == 'sp':
                 return
@@ -394,7 +465,8 @@ class ARM64RegAnnotator:
         if src.name == 'xzr':
             return RegVal.zero()
         if src.name == 'sp':
-            return RegVal.stack_addr('sp')
+            d = self._spd(regs)
+            return RegVal.stack_addr('sp' if not d else f"sp+0x{d:x}" if d > 0 else f"sp-0x{-d:x}")
         sv = regs.get(src.name)
         if sv is None or sv.kind == 'unknown':
             return RegVal.unknown()
@@ -519,10 +591,12 @@ class ARM64RegAnnotator:
             target_name=name,
             args={r: regs.get(r, RegVal.unknown()) for r in ARG_REGS},
         ))
-        # arguments past x7 (varargs, large signatures) are stored to [sp, #8k] before the
-        # call: exposed as 'stack+0x8k' when a 64-bit store to that slot is known
+        # arguments past the register ones (x7 on AAPCS64, r9 on Win64 behind its 0x20-byte
+        # home area) are stored to [sp, #base + 8k] before the call: exposed as
+        # 'stack+0x8k' when a 64-bit store to that slot is known
+        sbase = getattr(self, "_abi", None).stack_arg_base if getattr(self, "_abi", None) else 0
         for k in range(0, 0x80, 8):
-            v = regs.get(('slot', 'sp', k))
+            v = regs.get(('slot', 'sp', sbase + k))
             if v is not None and v.kind != 'unknown':
                 result.calls[-1].args[f"stack+{k:#x}"] = v
         for r in CALLER_SAVED:

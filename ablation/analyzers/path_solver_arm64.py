@@ -151,11 +151,15 @@ class ARM64PathSolver(PathSolver):
                 break
         if not code:
             raise ValueError(f"0x{func_va:x} is not mapped from {ctx.path}")
-        arch = getattr(capstone, 'CS_ARCH_AARCH64', None) or getattr(capstone, 'CS_ARCH_ARM64')
-        md = capstone.Cs(arch, capstone.CS_MODE_ARM)
-        md.skipdata = True
-        insns = [make_insn(i.address, i.mnemonic, i.op_str, size=i.size)
-                 for i in md.disasm(code, func_va)]
+        from .decode import decoder_for
+        if ctx.arch == "x86_64":
+            insns = decoder_for(ctx)(code, func_va)
+        else:
+            arch = getattr(capstone, 'CS_ARCH_AARCH64', None) or getattr(capstone, 'CS_ARCH_ARM64')
+            md = capstone.Cs(arch, capstone.CS_MODE_ARM)
+            md.skipdata = True
+            insns = [make_insn(i.address, i.mnemonic, i.op_str, size=i.size)
+                     for i in md.disasm(code, func_va)]
         kw.setdefault("plt", ctx.plt)
         return cls.from_insns(insns, entry=func_va, **kw)
 

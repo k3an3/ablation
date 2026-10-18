@@ -252,7 +252,9 @@ class ARM64HeapScanner(ARM64TaintTracker):
         name = callee or f"0x{target:x}"
 
         # free / realloc of a pointer
-        freed_reg = "x0" if callee in _FREES else _ALLOCS.get(callee or "", ((), None))[1]
+        from .winapi import FREE_PTR_ARG
+        freed_reg = (FREE_PTR_ARG.get(callee, "x0") if callee in _FREES
+                     else _ALLOCS.get(callee or "", ((), None))[1])
         if freed_reg:
             region = self._region(st, freed_reg)
             if callee not in _FREES:

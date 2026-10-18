@@ -40,6 +40,10 @@ Task-to-tool lookup. For constructor patterns and key methods, see `docs/module-
 | "Why is (or isn't) this printf call site reported?" | `ablation fmtstr <bin> --explain 0xSITE` |
 | "Is this finding's code reachable / registered / gated on unset config?" | `Reachability(ctx).classify(func, site)` / `ablation reach <bin>` / `--show-suppressed` |
 | "Stripped / static / raw image: which function is memcpy, sprintf, sscanf?" | `LibcRoleInferer(ctx).infer()` (automatic in the CLI when no sink resolves; `--sink-map` to name by hand) |
+| "x86-64 PE (or AArch64 PE): taint / fmtstr / lengths / wrappers / heap / overflow / reach / egress" | the same commands and classes as ARM64: `BinaryContext` picks the decoder (`decode.decoder_for`: x86-64 is lifted to the AArch64 Insn model, Win64 ABI); see [pe-vuln-hunting](module-reference/pe-vuln-hunting.md) |
+| "PE: ReadFile / InternetReadFile -> lstrcpyA / CreateProcessA / LoadLibraryA / WinExec" | `ablation taint <dll>` (Windows API tables in `winapi.py`, merged automatically) |
+| "MSVC binary: sprintf / sscanf are local __stdio_common_* wrappers" | automatic: inferred as format / `dest` / `scanfmt` wrappers; `ablation wrappers <dll>` |
+| "x86-64 instructions as the passes see them" | `decoder_for(ctx)(code, va)` or `X64Lifter('win64', ctx.plt).lift(code, va)` |
 | "ARM64: length checked signed / masked / byte-wide but used wider" | `ARM64ConversionLengthScanner.from_context(ctx).scan()` (or `ablation lengths <bin> --libc musl`) |
 | "Taint through an embedded HTTP / MQTT framework (recv is too deep)" | `tracker.add_sources(['http_get_param', '0xVA:xN'])` (or `ablation taint --sources ... --summarise-opaque`) |
 | "Read a pointer table with relocations applied (ABS64 / RELATIVE / GLOB_DAT)" | `ctx.read_ptr(va)`; `ctx.reloc_stats` |

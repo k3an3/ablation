@@ -42,19 +42,21 @@ from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
 from .fortify import FMT_CHK_FLAG
+from .decode import arm64_decode as _arm64, decoder_for
+from .lift_x86_64 import abi_of
 from .insn_arm64 import from_capstone
 
 _MAX_FUNC = 8192
 # bump when inference changes: older inferred records in a cached context are ignored and
 # re-inferred (sink-map records are kept)
-WRAPPERS_VERSION = 4
+WRAPPERS_VERSION = 7
 
 _EXEC_ARGS: Dict[str, Tuple[str, ...]] = {
     "system": ("x0",), "popen": ("x0",), "execve": ("x0", "x1"), "execv": ("x0", "x1"),
     "execvp": ("x0", "x1"), "execvpe": ("x0", "x1"), "execl": ("x0", "x1", "x2"),
     "execlp": ("x0", "x1", "x2"), "execle": ("x0", "x1", "x2"),
 }
-KINDS = ("format", "exec", "length", "copy", "open")
+KINDS = ("format", "exec", "length", "copy", "open", "dest", "scanfmt")
 
 
 def base_sink_args(name: str) -> Dict[str, Tuple[str, ...]]:
@@ -81,6 +83,11 @@ def base_sink_args(name: str) -> Dict[str, Tuple[str, ...]]:
     from .egress_arm64 import OPEN_FUNCS
     if name in OPEN_FUNCS:
         out["open"] = (OPEN_FUNCS[name][0],)
+    from .format_string_scanner_arm64 import _UNBOUNDED
+    if name in _UNBOUNDED and _UNBOUNDED[name][3] == "print" and _UNBOUNDED[name][2]:
+        out["dest"] = (_UNBOUNDED[name][2],)        # sprintf's destination (width-less %s)
+    if name in _UNBOUNDED and _UNBOUNDED[name][3] == "scan":
+        out["scanfmt"] = (_UNBOUNDED[name][0],)     # sscanf's format (width-less %s / %[)
     return out
 
 
@@ -182,21 +189,28 @@ def _arg_index(v) -> int:
 _STP = re.compile(r"^(stp|str)$")
 
 
-def varargs_layout(code: bytes, va: int) -> Tuple[bool, Optional[int], Optional[int]]:
+def varargs_layout(code: bytes, va: int, decode=None, abi=None) -> Tuple[bool, Optional[int], Optional[int]]:
     """(is_varargs, gr_offs, vr_offs) from the prologue: x(n)..x7 saved to consecutive
     slots (with x7 among them) is the GP register save area; q-register saves are the FP
-    area; `mov wN, #-k` constants matching their sizes are gr_offs / vr_offs."""
+    area; `mov wN, #-k` constants matching their sizes are gr_offs / vr_offs.
+
+    Lifted x86-64 (abi): the last argument register (r9) and the ones before it spilled
+    to the stack are the save area: the Win64 home area (rdx / r8 / r9 to [rsp+0x10..]),
+    or the SysV register save area (rsi..r9). gr_offs keeps the AAPCS64 shape
+    (-8 * GP slots saved) so callers read one representation."""
+    arg_regs = abi.arg_regs if abi is not None else tuple(f"x{i}" for i in range(8))
+    last = arg_regs[-1]
     saved: Dict[str, int] = {}
     qsaved: Set[str] = set()
     consts: List[int] = []
-    for i, insn in enumerate(from_capstone(code[:4 * 48], va)):
+    for i, insn in enumerate((decode or _arm64)(code[:4 * 48], va)):
         m = insn.mnemonic
         mem = insn.first_mem()
         if _STP.match(m) and mem is not None and mem.base in ("sp", "x29", "x8", "x9", "x10"):
             for k, r in enumerate(insn.regs()):
                 if r.name == mem.base:
                     continue
-                if re.fullmatch(r"x[1-7]", r.name) and r.bits == 64:
+                if r.name in arg_regs[1:] and r.bits == 64:
                     saved[r.name] = mem.offset + 8 * k
                 elif re.fullmatch(r"q[0-7]", r.name) or re.fullmatch(r"v[0-7]", r.name):
                     qsaved.add(r.name)
@@ -206,12 +220,13 @@ def varargs_layout(code: bytes, va: int) -> Tuple[bool, Optional[int], Optional[
                 consts.append(v if v < 0 else v - (1 << 32))
         if m in ("bl", "blr", "ret", "b"):
             break
-    if "x7" not in saved:
+    if last not in saved:
         return False, None, None
-    n = 7
-    while n >= 1 and f"x{n}" in saved:
+    top = len(arg_regs) - 1
+    n = top
+    while n >= 1 and arg_regs[n] in saved:
         n -= 1
-    gp = 7 - n                                       # x(n+1)..x7 saved
+    gp = top - n                                     # x(n+1)..x7 saved
     if gp < 1:
         return False, None, None
     gr = -8 * gp
@@ -227,6 +242,8 @@ class SinkWrapperInferer:
 
     def __init__(self, ctx, max_rounds: int = 6):
         self._ctx = ctx
+        self._bounded: Set[int] = set()            # count-taking print calls with a real count
+        self._decode = decoder_for(ctx)
         self._max_rounds = max_rounds
 
     @staticmethod
@@ -284,7 +301,7 @@ class SinkWrapperInferer:
                 continue                       # libc functions themselves are not wrappers
             end = starts[i + 1] if i + 1 < len(starts) and starts[i + 1] - fva <= _MAX_FUNC else fva + _MAX_FUNC
             rows = []
-            insns = list(from_capstone(self._code(regions, fva, end), fva))
+            insns = self._decode(self._code(regions, fva, end), fva)
             dm_all = derived_param_args(insns, fva, end)
             for c in ra.annotate_calls(fva, end).calls:
                 pm = {r: _arg_index(v) for r, v in c.args.items() if _arg_index(v) >= 0}
@@ -298,6 +315,11 @@ class SinkWrapperInferer:
                     if fv is not None and fv.kind in ("const", "zero"):
                         flag = fv.int_val if fv.kind == "const" else 0
                     flag = self._open_mode(c, regions) if flag is None else flag
+                    from .winapi import COUNT_ARG
+                    if c.target_name in COUNT_ARG:            # UCRT: unbounded only for count -1
+                        cv = c.args.get(COUNT_ARG[c.target_name])
+                        if cv is None or cv.kind != "const" or cv.int_val not in (-1, (1 << 64) - 1):
+                            self._bounded.add(c.site_va)
                     rows.append((tva, c.target_name, c.site_va, pm, flag, dm))
             if rows:
                 compact[fva] = rows
@@ -318,6 +340,8 @@ class SinkWrapperInferer:
                     else:
                         sargs = base_sink_args(tname or names.get(tva, ""))
                         wraps = via = tname or names.get(tva, "")
+                        if site in self._bounded:
+                            sargs.pop("dest", None)
                     for kind, regs in sargs.items():
                         mapped = sorted({f"x{pm[r]}" for r in regs if r in pm})
                         derived = False
@@ -353,7 +377,7 @@ class SinkWrapperInferer:
                 if 0 <= w.va - rva < len(data):
                     code = data[w.va - rva:w.va - rva + 4 * 48]
                     break
-            w.varargs, w.gr_offs, w.vr_offs = varargs_layout(code, w.va)
+            w.varargs, w.gr_offs, w.vr_offs = varargs_layout(code, w.va, self._decode, abi_of(ctx))
 
         if apply:
             merged = {va: SinkWrapper.from_dict(d) for va, d in getattr(ctx, "wrappers", {}).items()

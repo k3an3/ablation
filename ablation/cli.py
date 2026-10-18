@@ -75,7 +75,40 @@ def _load_ctx(args, path: str):
     if sink_map:
         n = ctx.apply_sink_map(sink_map)
         print(f"[*] sink map: {n} function(s) named from {sink_map}", file=sys.stderr)
+    if ctx.arch in ('arm64', 'x86_64'):
+        from ablation.analyzers.winapi import merge
+        merge()                                  # Windows API names in the Insn-model tables
+    if ctx.arch == 'x86_64' and not isinstance(sys.stdout, _X86Out):
+        from ablation.analyzers.lift_x86_64 import abi_of
+        sys.stdout = _X86Out(sys.stdout, abi_of(ctx))
     return ctx
+
+
+class _X86Out:
+    """stdout filter for x86-64 images: reports from the lifted passes name x86 registers
+    (rcx, r8, eax ...) instead of the AArch64 names the lift uses internally."""
+
+    def __init__(self, inner, abi):
+        self._inner, self._abi = inner, abi
+
+    def write(self, s):
+        from ablation.analyzers.lift_x86_64 import x86_names
+        return self._inner.write(x86_names(s, self._abi))
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def _insn_model(ctx, legacy_ok: bool = False) -> bool:
+    """Whether a command runs on the Insn-model passes: AArch64 natively, x86-64 through
+    the lifter (lift_x86_64). legacy_ok: x86-64 ELF keeps its older dedicated engine for
+    this command (taint / fmtstr / heap); x86-64 PE always uses the Insn model."""
+    if ctx.arch == 'arm64':
+        return True
+    if ctx.arch == 'x86_64':
+        from ablation.analyzers.lift_x86_64 import is_pe
+        return not legacy_ok or is_pe(ctx)
+    return False
 
 
 def _oracles(engine: str, arch: str):
@@ -109,13 +142,14 @@ def _oracles(engine: str, arch: str):
 def _check_oracles(args, ctx, engine: str) -> None:
     """Infer libc roles when no sink name resolves (arm64), then warn loudly when an engine
     would still run with zero resolved sinks / sources: a vacuous pass is not a clean one."""
-    sinks, sources = _oracles(engine, ctx.arch)
+    sinks, sources = _oracles(engine, 'arm64' if _insn_model(ctx, engine in ('taint', 'fmtstr', 'heap'))
+                              else ctx.arch)
     if not sinks:
         return
     extra = {n for n in (getattr(args, 'sinks', None) or '').split(',') if n and not n.startswith('0x')}
     resolved, _ = ctx.sink_coverage(sinks | extra)
     want = getattr(args, 'infer_sinks', None)
-    if ctx.arch == 'arm64' and want is not False and (want or not resolved) and not ctx.roles:
+    if _insn_model(ctx) and want is not False and (want or not resolved) and not ctx.roles:
         print(f"[*] {len(resolved)} of {len(sinks)} {engine} sink names resolved; inferring libc "
               f"roles from behaviour ...", file=sys.stderr)
         from ablation.analyzers.libc_roles import LibcRoleInferer
@@ -170,7 +204,7 @@ def _add_taint_args(p) -> None:
 
 def _ensure_wrappers(args, ctx) -> None:
     """Infer vendor sink wrappers (arm64) unless disabled; print them with --sink-wrappers."""
-    if ctx.arch != 'arm64' or getattr(args, 'infer_sinks', None) is False:
+    if not _insn_model(ctx) or getattr(args, 'infer_sinks', None) is False:
         return
     from ablation.analyzers.sink_wrappers import SinkWrapperInferer, wrappers_of
     inferred = [w for w in (ctx.wrappers or {}).values() if w.get('source') == 'inferred']
@@ -189,7 +223,7 @@ def _reach_filter(args, ctx, findings, site_attr: str):
     split off the suppressed ones (unreachable code, branches gated on a never-written
     global). Suppressed findings are counted with reasons, listed with --show-suppressed:
     never dropped silently. Returns the findings to report."""
-    if ctx.arch != 'arm64' or not findings:
+    if not _insn_model(ctx) or not findings:
         return findings
     from collections import Counter
     from ablation.analyzers.reachability_arm64 import Reachability
@@ -306,7 +340,7 @@ def cmd_taint(args):
     ctx = _load_ctx(args, p)
     _check_oracles(args, ctx, 'taint')
 
-    if ctx.arch == 'arm64':
+    if _insn_model(ctx, legacy_ok=True):
         from ablation.analyzers.taint_tracker_arm64 import ARM64TaintTracker
         tracker = ARM64TaintTracker.from_context(ctx)
         _apply_taint_args(args, tracker)
@@ -379,14 +413,14 @@ def cmd_overflow(args):
     ctx = _load_ctx(args, p)
     _check_oracles(args, ctx, 'overflow')
 
-    if ctx.arch == 'arm64':
+    if _insn_model(ctx):
         from ablation.analyzers.intoverflow_scanner_arm64 import ARM64IntOverflowScanner
         scanner = ARM64IntOverflowScanner.from_context(ctx)
         _apply_taint_args(args, scanner)
         print(scanner.report(scanner.scan()))
         return
     if ctx.arch != 'arm32':
-        print(f"overflow scan supports ARM32 and ARM64 (binary arch: {ctx.arch})")
+        print(f"overflow scan supports ARM32, ARM64 and x86-64 (binary arch: {ctx.arch})")
         return
 
     from ablation.analyzers.intoverflow_scanner_arm32 import ARM32IntOverflowScanner
@@ -399,8 +433,8 @@ def cmd_lengths(args):
     """ARM64 length bugs: header-size underflow + width / signedness conversions."""
     p = str(_require_binary(args.binary))
     ctx = _load_ctx(args, p)
-    if ctx.arch != 'arm64':
-        print(f"lengths supports ARM64 (binary arch: {ctx.arch})")
+    if not _insn_model(ctx):
+        print(f"lengths supports ARM64 and x86-64 (binary arch: {ctx.arch})")
         return
     _check_oracles(args, ctx, 'lengths')
     from ablation.analyzers.conversion_length_arm64 import (
@@ -448,8 +482,8 @@ def cmd_wrappers(args):
     """Vendor wrappers of format / exec / length sinks (arm64)."""
     p = str(_require_binary(args.binary))
     ctx = _load_ctx(args, p)
-    if ctx.arch != 'arm64':
-        print(f"wrappers supports ARM64 (binary arch: {ctx.arch})")
+    if not _insn_model(ctx):
+        print(f"wrappers supports ARM64 and x86-64 (binary arch: {ctx.arch})")
         return
     _check_oracles(args, ctx, 'fmtstr')
     from ablation.analyzers.sink_wrappers import SinkWrapperInferer, wrappers_of
@@ -461,8 +495,8 @@ def cmd_reach(args):
     """ARM64 reachability: registered handlers, unreachable functions."""
     p = str(_require_binary(args.binary))
     ctx = _load_ctx(args, p)
-    if ctx.arch != 'arm64':
-        print(f"reach supports ARM64 (binary arch: {ctx.arch})")
+    if not _insn_model(ctx):
+        print(f"reach supports ARM64 and x86-64 (binary arch: {ctx.arch})")
         return
     from ablation.analyzers.reachability_arm64 import Reachability
     R = Reachability(ctx)
@@ -481,8 +515,8 @@ def cmd_egress(args):
     """ARM64: file paths written and read back to a peer (egress coupling)."""
     p = str(_require_binary(args.binary))
     ctx = _load_ctx(args, p)
-    if ctx.arch != 'arm64':
-        print(f"egress supports ARM64 (binary arch: {ctx.arch})")
+    if not _insn_model(ctx):
+        print(f"egress supports ARM64 and x86-64 (binary arch: {ctx.arch})")
         return
     from ablation.analyzers.egress_arm64 import EgressMap
     extra = {n for n in (args.egress or '').split(',') if n}
@@ -915,7 +949,7 @@ def cmd_fmtstr(args):
     p = str(_require_binary(args.binary))
     ctx = _load_ctx(args, p)
     _check_oracles(args, ctx, 'fmtstr')
-    if ctx.arch == 'arm64':
+    if _insn_model(ctx, legacy_ok=True):
         from ablation.analyzers.format_string_scanner_arm64 import ARM64FormatStringScanner
         scanner = ARM64FormatStringScanner.from_context(ctx)
         _apply_taint_args(args, scanner)
@@ -923,7 +957,7 @@ def cmd_fmtstr(args):
         scanner = FormatStringScanner.from_context(ctx)
     findings = scanner.scan()
     findings = _reach_filter(args, ctx, findings, 'call_va')
-    if getattr(args, 'explain', None) and ctx.arch == 'arm64':
+    if getattr(args, 'explain', None) and _insn_model(ctx, legacy_ok=True):
         site = int(args.explain, 16)
         print(scanner.explain(site))
         from ablation.analyzers.reachability_arm64 import Reachability
@@ -952,7 +986,7 @@ def cmd_heap(args):
     p = str(_require_binary(args.binary))
     ctx = _load_ctx(args, p)
     _check_oracles(args, ctx, 'heap')
-    if ctx.arch == 'arm64':
+    if _insn_model(ctx, legacy_ok=True):
         from ablation.analyzers.heap_scanner_arm64 import ARM64HeapScanner
         scanner = ARM64HeapScanner.from_context(ctx)
         _apply_taint_args(args, scanner)
@@ -1441,14 +1475,14 @@ def main():
     p_taint.set_defaults(func=cmd_taint)
 
     # overflow
-    p_overflow = sub.add_parser('overflow', help='ARM32/ARM64 integer overflow scan: MUL -> alloc without check')
+    p_overflow = sub.add_parser('overflow', help='ARM32/ARM64/x86-64 integer overflow scan: MUL -> alloc without check')
     p_overflow.add_argument('binary')
     _add_raw_args(p_overflow)
     _add_taint_args(p_overflow)
     p_overflow.set_defaults(func=cmd_overflow)
 
     # window
-    p_len = sub.add_parser('lengths', help='ARM64 length bugs: len - N underflow, sign / width '
+    p_len = sub.add_parser('lengths', help='ARM64 / x86-64 length bugs: len - N underflow, sign / width '
                                            'conversions (sxtw after a signed check, masked check '
                                            'with full-width use, byte loop counters)')
     p_len.add_argument('binary')
@@ -1462,20 +1496,20 @@ def main():
     p_len.add_argument('--json', metavar='PATH', help='write findings as JSON')
     p_len.set_defaults(func=cmd_lengths)
 
-    p_wr = sub.add_parser('wrappers', help='ARM64 vendor sink wrappers: log(fmt, ...) -> vsnprintf, '
+    p_wr = sub.add_parser('wrappers', help='ARM64 / x86-64 vendor sink wrappers: log(fmt, ...) -> vsnprintf, '
                                             'run(cmd) -> system, put(d, s, n) -> memcpy')
     p_wr.add_argument('binary')
     _add_raw_args(p_wr)
     p_wr.set_defaults(func=cmd_wrappers)
 
-    p_reach = sub.add_parser('reach', help='ARM64 reachability: handler registrations (setter / '
+    p_reach = sub.add_parser('reach', help='ARM64 / x86-64 reachability: handler registrations (setter / '
                                             'table), unreachable functions')
     p_reach.add_argument('binary')
     _add_raw_args(p_reach)
     p_reach.add_argument('--limit', type=int, default=50)
     p_reach.set_defaults(func=cmd_reach)
 
-    p_eg = sub.add_parser('egress', help='ARM64 egress coupling: paths written by one function and '
+    p_eg = sub.add_parser('egress', help='ARM64 / x86-64 egress coupling: paths written by one function and '
                                          'read back to a peer (send / sendfile / SSL_write) by another')
     p_eg.add_argument('binary')
     _add_raw_args(p_eg)
@@ -1703,6 +1737,7 @@ def main():
     p_sigs.set_defaults(func=cmd_sigs)
 
     args = parser.parse_args()
+    out = sys.stdout
     try:
         args.func(args)
     except KeyboardInterrupt:
@@ -1712,6 +1747,8 @@ def main():
         if '--debug' in sys.argv:
             raise
         sys.exit(1)
+    finally:
+        sys.stdout = out
 
 
 if __name__ == '__main__':

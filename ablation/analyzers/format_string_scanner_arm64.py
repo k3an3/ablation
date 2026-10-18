@@ -245,6 +245,9 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
         # inferred / sink-map format wrappers: log_event(kind, fmt, ...) -> vsnprintf
         from .sink_wrappers import wrappers_of
         self._fwraps = {va: w for va, w in wrappers_of(ctx).items() if w.fmt_reg}
+        # wrappers of sscanf & co. / sprintf: checked for width-less %s through their callers
+        self._uwraps = {va: w for va, w in wrappers_of(ctx).items()
+                        if w.fmt_reg or w.kinds.get("scanfmt")}
         for va, w in self._fwraps.items():
             self._watch.setdefault(va, set()).add(w.fmt_reg)
         internal: Dict[int, Tuple[int, str, str]] = {}            # wrapper -> its forwarding call
@@ -258,9 +261,10 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
                 tva = ctx.exports.get(call.target_name, call.target_va)
                 self._callers.setdefault(tva, []).append((fva, call))
                 self._site_calls[call.site_va] = (fva, call)
-                uw = self._fwraps.get(call.target_va) or self._fwraps.get(tva)
+                uw = self._uwraps.get(call.target_va) or self._uwraps.get(tva)
                 if call.target_name in _UNBOUNDED or (
-                        uw is not None and uw.wraps in _UNBOUNDED and _UNBOUNDED[uw.wraps][3] == "scan"):
+                        uw is not None and uw.wraps in _UNBOUNDED
+                        and (_UNBOUNDED[uw.wraps][3] == "scan" or "dest" in uw.kinds)):
                     self._unb_sites.append((fva, call))
                     self._watch_calls.add(call.site_va)
                 wrap = self._fwraps.get(call.target_va) or self._fwraps.get(tva)
@@ -288,7 +292,7 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
                 if prov == "arg_passthrough":
                     self._wrapper_arg[call.site_va] = self._arg_index(call.args.get(reg))
                 out.append(FmtStringFinding(fva, call.site_va, call.target_name, reg, prov, sev, desc,
-                                            {"fortify": percent_n_note(sink, flag)}))
+                                            {"fortify": self._n_note(sink, flag)}))
         for wva, (site, callee, reg) in internal.items():
             if not self._callers.get(wva):
                 w = self._fwraps[wva]
@@ -376,13 +380,22 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
                 freg, first, io_reg, family = _UNBOUNDED[name]
                 shown = name
             else:                                         # a vendor wrapper of sscanf & co.
-                w = self._fwraps.get(call.target_va) or self._fwraps.get(exports.get(name, -1))
-                freg, family, io_reg = w.fmt_reg, "scan", None
+                w = self._uwraps.get(call.target_va) or self._uwraps.get(exports.get(name, -1))
+                family = _UNBOUNDED[w.wraps][3]
+                freg = w.fmt_reg or w.kinds["scanfmt"][0]
+                io_reg = w.kinds["dest"][0] if family == "print" and w.kinds.get("dest") else None
+                if family == "print" and io_reg is None:
+                    continue
                 first = int(freg[1:]) + 1 if w.varargs else None
                 shown = f"{w.name} (wrapper of {w.wraps})"
             fmt = self._literal(call.args.get(freg))
             if fmt is None:
                 continue                                  # non-literal: the fmt check covers it
+            from .winapi import COUNT_ARG
+            if name in COUNT_ARG:                         # UCRT: bounded unless count == -1
+                cv = call.args.get(COUNT_ARG[name])
+                if cv is None or cv.kind != "const" or cv.int_val not in (-1, (1 << 64) - 1, 0xFFFFFFFF):
+                    continue
             convs = unbounded_conversions(fmt, family)
             if not convs:
                 continue
@@ -393,12 +406,14 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
                     continue
                 hits = [(io_reg, convs[0][1])]
                 for idx, _spec in convs:
-                    if first is not None and first + idx < 8:
-                        labels |= self._arg_taint.get((call.site_va, f"x{first + idx}"), set())
+                    if first is not None and first + idx < len(self._abi.arg_regs):
+                        labels |= self._arg_taint.get((call.site_va, self._abi.arg_regs[first + idx]), set())
             else:
+                regs_n = len(self._abi.arg_regs)
+
                 def where_arg(idx: int) -> str:
                     n = first + idx                      # GP argument number
-                    return f"x{n}" if n < 8 else f"stack+{8 * (n - 8):#x}"
+                    return self._abi.arg_regs[n] if n < regs_n else f"stack+{8 * (n - regs_n):#x}"
                 hits = [(where_arg(idx), spec) for idx, spec in convs
                         if first is not None and self._on_stack(call.args.get(where_arg(idx)))]
                 if not hits:
@@ -447,7 +462,7 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
             starts = self._ctx.func_starts
             i = bisect.bisect_right(starts, fva)
             end = starts[i] if i < len(starts) and starts[i] - fva <= _MAX_FUNC_BYTES else fva + _MAX_FUNC_BYTES
-            lay = self._layouts[fva] = FrameLayout.of(self._code(fva, end), fva)
+            lay = self._layouts[fva] = FrameLayout.of(self._code(fva, end), fva, self._decode)
         return lay
 
     def _code(self, va: int, end: int) -> bytes:
@@ -512,9 +527,9 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
                 cfva, site = ofva, ocall.site_va       # frameless: the stack is the caller's
             else:
                 site = ccall.site_va
-            rets = [c.site_va + 4 for _caller, c in self._callers.get(cfva, [])]
+            rets = [getattr(c, "next_va", 0) or c.site_va + 4 for _caller, c in self._callers.get(cfva, [])]
             lines, leak = conversion_map(self._layout(cfva), ccall.args, k, gp, rets, (lo, hi), base,
-                                         self._slot_taint.get(site))
+                                         self._slot_taint.get(site), abi=self._abi)
             lay = self._layout(cfva)
             frame = (f"{self._fn(cfva)} frame {lay.size:#x} bytes" if lay.lr_slot() is not None else
                      f"{self._fn(cfva)} keeps no frame record (tail call / leaf): the conversions "
@@ -592,6 +607,18 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
         text = f"{v.display()}: {n} bytes to the {what}{tail}"
         return (text, lr) if budget else text
 
+    def _pe(self) -> bool:
+        from .lift_x86_64 import is_pe
+        return self._ctx is not None and not getattr(self._ctx, "raw", None) and is_pe(self._ctx)
+
+    def _n_note(self, sink: str, flag) -> str:
+        """%n liveness: FORTIFY / Bionic on ELF, the MSVC CRT on PE."""
+        from .lift_x86_64 import is_pe
+        if self._ctx is not None and is_pe(self._ctx) and sink not in FMT_CHK_FLAG:
+            from .winapi import percent_n_note as win_note
+            return win_note(sink, set(self._ctx.plt.values()))
+        return percent_n_note(sink, flag)
+
     def _literal(self, v) -> Optional[str]:
         while v is not None and v.kind == "copy":
             v = v.chain
@@ -612,11 +639,34 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
         for base, data in regions:
             off = va - base
             if 0 <= off < len(data):
+                if self._looks_wide(data, off):
+                    return self._wstr(data, off)         # L"..." (wprintf, swprintf, ...)
                 end = data.find(b"\0", off, off + 512)
                 raw = data[off:end] if end >= 0 else b""
                 if raw and all(32 <= c < 127 or c in (9, 10, 13) for c in raw):
                     return raw.decode()
                 return None
+        return None
+
+    @staticmethod
+    def _looks_wide(data: bytes, off: int) -> bool:
+        """UTF-16LE text starts at off: 'c\\0c\\0' or a one-character L"c" ('c\\0\\0\\0').
+        A one-character narrow string ("a\\0" then the next string) is not wide."""
+        b = data[off:off + 4]
+        return (len(b) == 4 and b[1] == 0 and 32 <= b[0] < 127
+                and ((b[3] == 0 and 32 <= b[2] < 127) or b[2:] == b"\0\0"))
+
+    @staticmethod
+    def _wstr(data: bytes, off: int) -> Optional[str]:
+        """NUL-terminated UTF-16LE text at off, if it is printable."""
+        out = []
+        for i in range(off, min(len(data) - 1, off + 1024), 2):
+            c = data[i] | data[i + 1] << 8
+            if c == 0:
+                return "".join(out) if out else None
+            if not (32 <= c < 127 or c in (9, 10, 13)):
+                return None
+            out.append(chr(c))
         return None
 
     @staticmethod
@@ -667,6 +717,9 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
     def _writable(self, va: int) -> bool:
         """va is in a writable ELF section (.data / .bss ...), not read-only data."""
         ranges = getattr(self, "_rw", None)
+        if ranges is None and self._pe():
+            from .winapi import pe_sections
+            ranges = self._rw = [(lo, hi) for lo, hi, w, _x in pe_sections(self._ctx.path) if w]
         if ranges is None:
             ranges = []
             if not getattr(self._ctx, "raw", None):
@@ -718,6 +771,9 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
         if ranges is None and getattr(self._ctx, "raw", None):
             # raw image: no sections; any address inside the image is a literal
             ranges = self._rodata = [(self._base_va, self._base_va + len(self._data))]
+        if ranges is None and self._pe():
+            from .winapi import pe_sections            # .rdata & co.: neither writable nor code
+            ranges = self._rodata = [(lo, hi) for lo, hi, w, x in pe_sections(self._ctx.path) if not w and not x]
         if ranges is None:
             import lief
             ranges = []
@@ -756,7 +812,7 @@ class ARM64FormatStringScanner(ARM64TaintTracker):
             st = eng.state
             slots = {}
             for j in range(64):
-                t = st.mem_get("sp", 8 * j)
+                t = st.mem_get("sp", self._abi.stack_arg_base + 8 * j)
                 if t.labels:
                     slots[j] = set(t.labels)
             if slots:

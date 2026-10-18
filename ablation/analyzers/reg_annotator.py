@@ -172,6 +172,7 @@ class CallSite:
     target_va: int
     target_name: str
     args: Dict[str, RegVal] = field(default_factory=dict)
+    next_va: int = 0                    # return address (site + call size) when known
 
     def fmt(self) -> str:
         tname = self.target_name or f"0x{self.target_va:x}"
