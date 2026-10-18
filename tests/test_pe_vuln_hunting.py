@@ -451,3 +451,36 @@ def test_lifter_idioms():
     from ablation.analyzers.lift_x86_64 import X64Lifter
     first = X64Lifter().lift(bytes.fromhex("c3"), 0x1000)[0]
     assert (first.mnemonic, first.size, str(first.ops[1])) == ("str", 0, "[sp, #-0x8]!")
+
+
+# ── context queries ─────────────────────────────────────────────────────────────
+
+
+def test_callers_callees_same_shape_and_by_va(core):
+    ctx = _ctx(core["x64"])
+    e = ctx.exports
+    by_name = ctx.callers_of("body_read")
+    by_va = ctx.callers_of(e["body_read"])                # edges labelled with the export name
+    assert by_name and sorted(by_name) == sorted(by_va)
+    assert {n for _va, n in by_va} >= {"case1", "case3", "case4"}
+    assert ctx.callers_of(hex(e["body_read"])) == by_va
+    callees = ctx.callees_of(e["entry"])
+    assert all(isinstance(t, tuple) and isinstance(t[0], int) and isinstance(t[1], str) for t in callees)
+    first = callees[0]
+    assert ctx.callers_of(first)                           # a (va, name) pair feeds straight back
+    assert ctx.callees_of(by_va[0]) and ctx.func_containing(by_va[0]) == by_va[0][0]
+    assert {va for va, _ in ctx.callers_of("recv")} >= {e["body_read"], e["under"]}
+
+
+def test_where_and_cli(core):
+    ctx = _ctx(core["x64"])
+    e = ctx.exports
+    assert ctx.where(e["case5"]) == f"0x{e['case5']:x} is the start of case5"
+    inner = e["case5"] + 5
+    assert ctx.where(inner).startswith(f"0x{inner:x} is inside case5 (0x{e['case5']:x} +0x5)")
+    slot = next(va for va, n in ctx.plt.items() if n == "recv")
+    assert "import recv" in ctx.where(slot)
+    r = _cli("where", core["x64"], hex(inner), "--callers")
+    assert "is inside case5" in r.stdout and "callers of case5: entry" in r.stdout
+    r = _cli("profile", core["x64"], hex(inner))
+    assert "is inside case5" in r.stdout and "profiling the containing function case5" in r.stdout

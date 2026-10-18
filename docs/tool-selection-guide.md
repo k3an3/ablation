@@ -16,6 +16,7 @@ Task-to-tool lookup. For constructor patterns and key methods, see `docs/module-
 | "Which functions reference this string?" | `ctx.funcs_referencing_string(string_va)` |
 | "strings_in_func() returns almost nothing on a stripped i386 ELF32" | `I386AbsoluteXrefScanner.from_context(ctx).inject(ctx)` |
 | "What is this function?" | `ctx.name(va)` |
+| "Is this address a function start, or inside which function?" | `ctx.where(va)` / `ctx.func_containing(va)` / `ablation where <bin> 0xVA [--callers]` (window / profile print it too; profile of an interior VA profiles its function unless `--exact`) |
 | "Show disassembly around address" | `WindowAnalyzer.dump_text(va, window=1536)` |
 | "Find functions matching vulnerability pattern" | `SemanticSearcher.query(description)` (ALWAYS first on new binary) |
 | "What values are passed to this sink?" | `FuncProfiler.profile(va).fmt()` |

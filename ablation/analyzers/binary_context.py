@@ -483,30 +483,47 @@ class BinaryContext:
 
     # ── query API ─────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _as_va(x) -> int:
+        """A VA from an int, a '0x..' string, or a (va, name) pair as callers_of /
+        callees_of return them, so their output can be fed straight back in."""
+        if isinstance(x, tuple):
+            x = x[0]
+        if isinstance(x, str):
+            return int(x, 16)
+        return int(x)
+
     def callers_of(self, symbol_or_va) -> List[Tuple[int, str]]:
         """
         Return [(caller_va, caller_name_or_hex), ...] for all callers of a
-        symbol name (string) or VA (int).
+        symbol name (string), a VA (int / '0x..'), or a (va, name) pair.
 
-        If symbol: looks up by PLT name.
-        If int: looks up by target VA directly.
-        Caller names use the overlay when available.
+        By name: edges labelled with it (import / export), plus calls to the VA the
+        name resolves to. By VA: every edge whose target is that VA, whatever its label.
+        Same shape as callees_of. Caller names use the overlay when available.
         """
-        if isinstance(symbol_or_va, str):
-            raw = self._callers_idx.get(symbol_or_va, [])
+        if not hasattr(self, "_edges_by_va"):
+            self._build_indices()
+        edges: List[int] = []                     # call_edges indices: one entry per call edge
+        if isinstance(symbol_or_va, str) and not symbol_or_va.lower().startswith("0x"):
+            edges += self._edges_by_label.get(symbol_or_va, [])
+            vas = [va for va, n in self.plt.items() if n == symbol_or_va]
+            if symbol_or_va in self.exports:
+                vas.append(self.exports[symbol_or_va])
         else:
-            va = symbol_or_va
-            sym = self.plt.get(va) or f"0x{va:x}"
-            raw = self._callers_idx.get(sym, [])
-        return [(cva, self.name(cva)) for cva, _ in raw]
+            vas = [self._as_va(symbol_or_va)]
+        for va in vas:
+            edges += self._edges_by_va.get(va, [])
+        return [(self.call_edges[i][0], self.name(self.call_edges[i][0])) for i in sorted(set(edges))]
 
-    def callees_of(self, func_va: int) -> List[Tuple[int, str]]:
-        """Return [(target_va, label), ...] for all calls from func_va.
+    def callees_of(self, func_va) -> List[Tuple[int, str]]:
+        """Return [(target_va, label), ...] for all calls from func_va (an int, '0x..',
+        or a (va, name) pair). Same shape as callers_of.
 
         Labels use overlay names when available (hex fallback replaced by
         discovered name if one has been registered).
         """
-        raw = self._callees_idx.get(func_va, [])
+        raw = self._callees_idx.get(self._as_va(func_va), [])
         return [(tva, self.name(tva)) for tva, _ in raw]
 
     def strings_near(self, va: int, radius: int = 128) -> List[Tuple[int, str]]:
@@ -555,11 +572,12 @@ class BinaryContext:
         self._build_string_xref_index(data, binary)
         return sum(len(v) for v in self._str_xref_idx.values())
 
-    def func_containing(self, va: int) -> Optional[int]:
+    def func_containing(self, va) -> Optional[int]:
         """
         Return the function start VA that most likely contains va.
         Uses largest start <= va heuristic.
         """
+        va = self._as_va(va)
         starts = self.func_starts
         lo, hi = 0, len(starts) - 1
         result = None
@@ -571,6 +589,26 @@ class BinaryContext:
             else:
                 hi = mid - 1
         return result
+
+    def where(self, va) -> str:
+        """One line placing va: a function start, inside a function (start, offset), an
+        import slot / thunk, or a string. 'Is this address the function I think it is?'"""
+        va = self._as_va(va)
+        if va in self.plt:
+            return f"0x{va:x} is the import {self.plt[va]} (IAT slot / PLT stub)"
+        if va in self.strings:
+            return f"0x{va:x} is the string {self.strings[va][:60]!r}"
+        fva = self.func_containing(va)
+        if fva is None:
+            return f"0x{va:x} is before the first known function start"
+        if fva == va:
+            return f"0x{va:x} is the start of {self.name(va)}"
+        import bisect as _bs
+        i = _bs.bisect_right(self.func_starts, va)
+        nxt = self.func_starts[i] if i < len(self.func_starts) else None
+        tail = (f"; next function at 0x{nxt:x}" if nxt is not None else
+                "; past the last known function start: may be outside code")
+        return f"0x{va:x} is inside {self.name(fva)} (0x{fva:x} +0x{va - fva:x}){tail}"
 
     def export_va(self, name: str) -> Optional[int]:
         """Return VA for an exported function by name, or None."""
@@ -2523,6 +2561,7 @@ class BinaryContext:
         ctx._build_call_graph_pe(data, binary)
         ctx._build_indices()
         ctx._build_string_xref_index_pe(data, binary)
+        ctx._pe_secs = None                       # section copies used while building
         return ctx
 
     def _extract_plt_pe(self, binary) -> None:
@@ -2575,14 +2614,28 @@ class BinaryContext:
         return out
 
     def _pe_read(self, binary, va: int, size: int) -> Optional[bytes]:
+        # section bytes are copied out of lief once per binary: .pdata reads one unwind
+        # byte per RUNTIME_FUNCTION, and re-copying every section each time was
+        # O(entries x sections x section size)
+        cache = getattr(self, "_pe_secs", None)
+        if cache is None or cache[0] is not binary:
+            secs = []
+            try:
+                for sec in binary.sections:
+                    secs.append((int(sec.virtual_address), bytes(sec.content)))
+            except Exception:
+                pass
+            secs.sort()
+            cache = self._pe_secs = (binary, secs, [r for r, _ in secs])
+        _b, secs, rvas = cache
         rva = va - self.base_va
-        try:
-            for sec in binary.sections:
-                off = rva - int(sec.virtual_address)
-                if 0 <= off and off + size <= len(sec.content):
-                    return bytes(sec.content)[off: off + size]
-        except Exception:
-            pass
+        import bisect as _bs
+        i = _bs.bisect_right(rvas, rva) - 1
+        if i >= 0:
+            srva, data = secs[i]
+            off = rva - srva
+            if off + size <= len(data):
+                return data[off: off + size]
         return None
 
     def _pdata_starts(self, binary) -> Set[int]:
@@ -3024,8 +3077,12 @@ class BinaryContext:
         # Rebuild callers_idx: sym_name -> [(caller_va, label)]
         callers_idx: Dict[str, List[Tuple[int, str]]] = {}
         callees_idx: Dict[int, List[Tuple[int, str]]] = {}
+        by_va: Dict[int, List[int]] = {}
+        by_label: Dict[str, List[int]] = {}
 
-        for from_va, to_va, label in self.call_edges:
+        for i, (from_va, to_va, label) in enumerate(self.call_edges):
+            by_va.setdefault(to_va, []).append(i)
+            by_label.setdefault(label or self.plt.get(to_va) or f"0x{to_va:x}", []).append(i)
             # Callers by symbol name
             sym = label or self.plt.get(to_va) or f"0x{to_va:x}"
             callers_idx.setdefault(sym, []).append((from_va, self._va_name(from_va)))
@@ -3034,6 +3091,8 @@ class BinaryContext:
 
         self._callers_idx = callers_idx
         self._callees_idx = callees_idx
+        self._edges_by_va = by_va
+        self._edges_by_label = by_label
 
     def _va_name(self, va: int) -> str:
         # Overlay takes priority over exports in all display contexts.

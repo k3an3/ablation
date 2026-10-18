@@ -533,6 +533,10 @@ def cmd_window(args):
     window = args.window
 
     wa = WindowAnalyzer.from_path(p)
+    try:
+        print(_load_ctx(args, p).where(va))       # "0x.. is inside fn 0x.. +0x.."
+    except Exception:
+        pass
     text = wa.dump_text(va=va, window=window, align_back=back, header=True)
     print(text)
 
@@ -560,6 +564,12 @@ def cmd_profile(args):
     p = str(_require_binary(args.binary))
     va = int(args.va, 16)
     ctx = _load_ctx(args, p)
+    print(ctx.where(va))
+    fva = ctx.func_containing(va)
+    if fva is not None and fva != va and not getattr(args, 'exact', False):
+        print(f"[*] profiling the containing function {ctx.name(fva)} (0x{fva:x}); "
+              f"--exact profiles from 0x{va:x} itself")
+        va = fva
 
     fp = FuncProfiler.from_context(ctx)
     profile = fp.profile(va=va)
@@ -569,6 +579,20 @@ def cmd_profile(args):
         print(f"\nSink calls ({len(profile.sink_calls)}):")
         for sc in profile.sink_calls:
             print(f"  0x{sc.site.site_va:x}  {sc.site.target_name}  [SINK]")
+
+
+def cmd_where(args):
+    """Place addresses: function start, inside which function (+offset), import, string."""
+    p = str(_require_binary(args.binary))
+    ctx = _load_ctx(args, p)
+    for v in args.va:
+        print(ctx.where(int(v, 16)))
+        if getattr(args, 'callers', False):
+            fva = ctx.func_containing(int(v, 16))
+            if fva is not None:
+                cs = ctx.callers_of(fva)
+                print(f"    callers of {ctx.name(fva)}: " +
+                      (", ".join(f"{n} (0x{c:x})" for c, n in cs[:12]) or "none in the call graph"))
 
 
 def cmd_cfg(args):
@@ -1529,8 +1553,19 @@ def main():
     p_profile = sub.add_parser('profile', help='full function profile: strings + call args + sinks')
     p_profile.add_argument('binary')
     _add_raw_args(p_profile)
-    p_profile.add_argument('va', help='function VA in hex, e.g. 0x1234')
+    p_profile.add_argument('va', help='function VA in hex, e.g. 0x1234 (an interior address '
+                                      'profiles its containing function)')
+    p_profile.add_argument('--exact', action='store_true',
+                           help='profile from the given VA even when it is inside a function')
     p_profile.set_defaults(func=cmd_profile)
+
+    p_where = sub.add_parser('where', help='place addresses: function start, inside which function '
+                                           '(+offset), import slot, string')
+    p_where.add_argument('binary')
+    _add_raw_args(p_where)
+    p_where.add_argument('va', nargs='+', help='VA(s) in hex')
+    p_where.add_argument('--callers', action='store_true', help='also list callers of the containing function')
+    p_where.set_defaults(func=cmd_where)
 
     # cfg
     p_cfg = sub.add_parser('cfg', help='control-flow graph for one function')

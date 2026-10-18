@@ -2,6 +2,24 @@
 
 ---
 
+## v2.90.2
+
+- `callers_of(va)` returned `[]` for any target whose edges carry a name (an export or
+  import label): the index was keyed by label and the VA lookup only tried the PLT name
+  or hex. Callers are now indexed by target VA too; a name also resolves to the
+  import / export VA. `callers_of` and `callees_of` both return `[(va, name)]` and both
+  accept an int, a `'0x..'` string or a `(va, name)` pair (their own output), as does
+  `func_containing`.
+- `ctx.where(va)`: function start / inside `<fn>` (start, +offset, next function) /
+  import slot / string. New `ablation where <bin> VA... [--callers]`; `window` and
+  `profile` print it, and `profile` of an interior address profiles the containing
+  function (`--exact` keeps the old behaviour).
+- PE build: `_pe_read` copied every section out of lief on every call, and `.pdata`
+  reads one unwind byte per RUNTIME_FUNCTION: O(entries x sections x section size).
+  Sections are copied once per build (4000 functions + a 16 MB section: 6.4 s -> 0.8 s).
+
+---
+
 ## v2.90.1
 
 **Fix: every x86-64 analyzer died with `tuple index out of range`.**
